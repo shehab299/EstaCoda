@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ModelProfile, ProviderResponse, ResolvedAuxiliaryRoute, ResolvedModelRoute } from "../contracts/provider.js";
-import { DEFAULT_WORKFLOW_EVENT_SUMMARY_CONFIG } from "../workflow/workflow-event-summary-service.js";
 import { TrajectoryRecorder } from "../trajectory/trajectory-recorder.js";
 import {
   DEFAULT_MEMORY_FILE_COMPACTION_CONFIG,
@@ -280,10 +279,6 @@ describe("MemoryFileCompactionService", () => {
     expect(service.automaticEnabled).toBe(false);
   });
 
-  it("does not change workflow event summary defaults", () => {
-    expect(DEFAULT_WORKFLOW_EVENT_SUMMARY_CONFIG.enabled).toBe(false);
-  });
-
   it("records a memory-file compaction trajectory and session event when applied", async () => {
     const root = await makeTempDir();
     const store = new MemoryStore();
@@ -455,6 +450,8 @@ function fakeProviderExecutor(content: string, ok: boolean) {
         {
           provider: "test",
           model: "memory-compact",
+          state: "dispatched" as const,
+          dispatchedAt: "2030-01-01T00:00:00.000Z",
           ok,
           content,
           errorClass: ok ? undefined : "server"

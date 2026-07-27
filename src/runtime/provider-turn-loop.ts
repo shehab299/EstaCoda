@@ -5,6 +5,7 @@ import type { MemoryPromptContext } from "../contracts/memory.js";
 import type {
   ModelProfile,
   ProviderFinishReason,
+  ProviderAttemptState,
   ProviderLoopRuntimeMetadata,
   ProviderMessage,
   ProviderRequest,
@@ -15,6 +16,7 @@ import type {
 } from "../contracts/provider.js";
 import type { RuntimeEvent, RuntimeEventSink } from "../contracts/runtime-event.js";
 import type { SecurityDecision } from "../contracts/security.js";
+import type { ProviderUsageContext } from "../contracts/provider-usage.js";
 import type {
   ReplacementSessionMessage,
   SessionContextWindowUsage,
@@ -36,10 +38,17 @@ import {
 import { deriveSessionHistoryBudget, packSessionHistory } from "../prompt/history-packer.js";
 import type { CompactResult } from "../prompt/session-compression-service.js";
 import { SUMMARY_FORMAT_VERSION } from "../prompt/semantic-compressor.js";
-import type { ActiveTaskState } from "./active-task-state.js";
+import type { ConversationContinuationState } from "./conversation-continuation-state.js";
 import { normalizeProviderMessagesStrict } from "../providers/provider-message-normalizer.js";
 import type { PromptBudgetReport, PromptSemanticCompressionReport } from "../contracts/prompt.js";
-import type { ProviderAttempt, ProviderExecutionResult, ProviderExecutor, ProviderRuntimeEvent } from "../providers/provider-executor.js";
+import {
+  assertProviderAttemptState,
+  type ProviderAttempt,
+  type ProviderExecutionResult,
+  type ProviderExecutor,
+  type ProviderRuntimeEvent
+} from "../providers/provider-executor.js";
+import type { ProviderUsageTaskAttribution } from "../providers/provider-usage-ledger.js";
 import type { OpenAICompatibleToolSchema } from "../tools/tool-schema.js";
 import type { ToolExecutionRecord } from "../tools/tool-executor.js";
 import { stableToolCallId } from "../tools/tool-call-planner.js";
@@ -94,6 +103,7 @@ export type ProviderTurnLoopOptions = {
   budgets: ProviderTurnLoopBudgets;
   providerRequestDefaults?: ProviderTurnLoopRequestDefaults;
   initialContextWindowUsage?: SessionContextWindowUsage;
+  taskExecution?: ProviderUsageTaskAttribution;
 };
 
 export class ProviderTurnLoop {
@@ -115,6 +125,9 @@ export class ProviderTurnLoop {
   readonly #agentProfile: ProviderTurnLoopOptions["agentProfile"];
   readonly #budgets: ProviderTurnLoopBudgets;
   readonly #providerRequestDefaults: ProviderTurnLoopRequestDefaults;
+  readonly #profileId: string;
+  readonly #taskExecution: ProviderUsageTaskAttribution | undefined;
+  #providerRequestSequence = 0;
   #lastPromptTokens = 0;
   #lastActualPromptTokens: number | undefined;
 
@@ -137,6 +150,8 @@ export class ProviderTurnLoop {
     this.#agentProfile = options.agentProfile;
     this.#budgets = options.budgets;
     this.#providerRequestDefaults = options.providerRequestDefaults ?? {};
+    this.#profileId = options.profileId;
+    this.#taskExecution = options.taskExecution;
     this.#lastActualPromptTokens = options.initialContextWindowUsage?.usedTokens;
   }
 
@@ -147,6 +162,7 @@ export class ProviderTurnLoop {
   }
 
   async run(input: {
+    visibleTurnId?: string;
     userText: string;
     routedText: string;
     selectedSkill: LoadedSkill | SkillDefinition | undefined;
@@ -163,7 +179,7 @@ export class ProviderTurnLoop {
     memoryPromptContext: MemoryPromptContext | undefined;
     providerTools: OpenAICompatibleToolSchema[];
     preflightCompression?: PromptSemanticCompressionReport;
-    activeTaskState?: ActiveTaskState;
+    conversationContinuationState?: ConversationContinuationState;
     fallbackText: string;
     onEvent?: RuntimeEventSink;
     onDelta?: (text: string) => void;
@@ -177,6 +193,7 @@ export class ProviderTurnLoop {
     toolExecutions: ToolExecutionRecord[];
     iterations: number;
   }> {
+    this.#providerRequestSequence = 0;
     this.#toolPlanRunner.resetPerTurnBudgets?.();
     const providerToolExecutions: ToolExecutionRecord[] = [];
     let effectiveProviderExecution: ProviderExecutionResult | undefined;
@@ -356,6 +373,7 @@ export class ProviderTurnLoop {
         providerExecution: execution,
         toolPlans: input.toolPlans,
         trustedWorkspace: input.trustedWorkspace,
+        visibleTurnId: input.visibleTurnId,
         remainingToolCalls: Math.max(0, this.#budgets.maxProviderToolCalls - providerToolExecutions.length),
         riskBaseline: maxObservedRisk,
         signal: input.signal,
@@ -524,6 +542,7 @@ export class ProviderTurnLoop {
   }
 
   async #completeWithProvider(input: {
+    visibleTurnId?: string;
     userText: string;
     routedText: string;
     selectedSkill: LoadedSkill | SkillDefinition | undefined;
@@ -540,7 +559,7 @@ export class ProviderTurnLoop {
     memoryPromptContext: MemoryPromptContext | undefined;
     providerTools: OpenAICompatibleToolSchema[];
     preflightCompression?: PromptSemanticCompressionReport;
-    activeTaskState?: ActiveTaskState;
+    conversationContinuationState?: ConversationContinuationState;
     fallbackText: string;
     onEvent?: RuntimeEventSink;
     onDelta?: (text: string) => void;
@@ -566,7 +585,7 @@ export class ProviderTurnLoop {
       nativeHistoryRouteRole: "primary",
       compactionNotice: sessionHistory.compactionNotice,
       compression: input.preflightCompression ?? sessionHistory.compression,
-      activeTaskState: input.activeTaskState,
+      conversationContinuationState: input.conversationContinuationState,
       soul: this.#soul,
       memoryPromptContext: input.memoryPromptContext,
       skillsIndex: this.#skillsIndex,
@@ -609,7 +628,8 @@ export class ProviderTurnLoop {
       signal: input.signal,
       onEvent: input.onEvent,
       onDelta: input.onDelta,
-      onSegmentBreak: input.onSegmentBreak
+      onSegmentBreak: input.onSegmentBreak,
+      visibleTurnId: input.visibleTurnId
     });
     if (execution.response?.usage?.inputTokens !== undefined) {
       await this.#recordContextWindowUsage(execution, prompt.budget, input.onEvent);
@@ -642,6 +662,7 @@ export class ProviderTurnLoop {
   }
 
   async #continueProviderAfterTools(input: {
+    visibleTurnId?: string;
     userText: string;
     routedText: string;
     selectedSkill: LoadedSkill | SkillDefinition | undefined;
@@ -659,7 +680,7 @@ export class ProviderTurnLoop {
     providerTools: OpenAICompatibleToolSchema[];
     providerExecution: ProviderExecutionResult | undefined;
     toolPlans: ToolCallPlan[];
-    activeTaskState?: ActiveTaskState;
+    conversationContinuationState?: ConversationContinuationState;
     fallbackText: string;
     onEvent?: RuntimeEventSink;
     onDelta?: (text: string) => void;
@@ -692,7 +713,7 @@ export class ProviderTurnLoop {
       nativeHistoryRouteRole: "primary",
       compactionNotice: sessionHistory.compactionNotice,
       compression: sessionHistory.compression,
-      activeTaskState: input.activeTaskState,
+      conversationContinuationState: input.conversationContinuationState,
       soul: this.#soul,
       memoryPromptContext: input.memoryPromptContext,
       skillsIndex: this.#skillsIndex,
@@ -741,7 +762,8 @@ export class ProviderTurnLoop {
       signal: input.signal,
       onEvent: input.onEvent,
       onDelta: input.onDelta,
-      onSegmentBreak: input.onSegmentBreak
+      onSegmentBreak: input.onSegmentBreak,
+      visibleTurnId: input.visibleTurnId
     });
     if (execution.response?.usage?.inputTokens !== undefined) {
       await this.#recordContextWindowUsage(execution, prompt.budget, input.onEvent);
@@ -803,6 +825,7 @@ export class ProviderTurnLoop {
     onEvent?: RuntimeEventSink;
     onDelta?: (text: string) => void;
     onSegmentBreak?: (reason?: string) => void | Promise<void>;
+    visibleTurnId?: string;
   }): Promise<ProviderExecutionResult> {
     const initial = await this.#completeProviderRequestWithTruncatedToolRetry(input);
     return await this.#continueLengthTruncatedTextResponse({
@@ -823,6 +846,7 @@ export class ProviderTurnLoop {
     onEvent?: RuntimeEventSink;
     onDelta?: (text: string) => void;
     onSegmentBreak?: (reason?: string) => void | Promise<void>;
+    visibleTurnId?: string;
   }): Promise<ProviderExecutionResult> {
     const primaryRoute = input.primaryRoute ?? this.#primaryModelRoute;
     const fallbackChain = input.fallbackChain ?? this.#modelFallbackRoutes;
@@ -837,6 +861,7 @@ export class ProviderTurnLoop {
       signal: input.signal,
       primaryRoute,
       fallbackChain,
+      usage: await this.#nextProviderUsageContext(input.visibleTurnId),
       onEvent: initialEvents.onEvent
     });
 
@@ -898,6 +923,7 @@ export class ProviderTurnLoop {
       signal: input.signal,
       primaryRoute: retryPrimaryRoute,
       fallbackChain: retryChain.slice(1),
+      usage: await this.#nextProviderUsageContext(input.visibleTurnId),
       onEvent: retryEvents.onEvent
     });
     const retryExecution = rebaseRetryRouteIdentity(retryExecutionRaw, retryChain, originalRouteChain);
@@ -928,6 +954,7 @@ export class ProviderTurnLoop {
     onEvent?: RuntimeEventSink;
     onDelta?: (text: string) => void;
     onSegmentBreak?: (reason?: string) => void | Promise<void>;
+    visibleTurnId?: string;
   }): Promise<ProviderExecutionResult> {
     if (!isLengthTruncatedTextExecution(input.initial)) {
       return input.initial;
@@ -1109,6 +1136,29 @@ export class ProviderTurnLoop {
 
   #currentSessionId(): string {
     return this.#sessionRuntimeContext?.currentSessionId() ?? this.#sessionId;
+  }
+
+  async #nextProviderUsageContext(visibleTurnId: string | undefined): Promise<ProviderUsageContext> {
+    const sessionId = this.#currentSessionId();
+    const session = await this.#sessionDb.getSession(sessionId);
+    const task = this.#taskExecution;
+    const effectiveVisibleTurnId = task === undefined ? visibleTurnId : task.originTurnId;
+    return {
+      requestKey: [sessionId, effectiveVisibleTurnId ?? "session", String(this.#providerRequestSequence++)].join("\0"),
+      sourceKind: task === undefined ? "main" : "task",
+      executionSessionId: sessionId,
+      ...(session?.spendingScopeSessionId === undefined
+        ? {}
+        : { sessionBudgetScopeId: session.spendingScopeSessionId }),
+      ...(effectiveVisibleTurnId === undefined ? {} : { visibleTurnId: effectiveVisibleTurnId }),
+      ...(task === undefined ? {} : {
+        taskId: task.taskId,
+        rootTaskId: task.rootTaskId,
+        planRevisionId: task.planRevisionId,
+        stepId: task.stepId,
+        attemptId: task.attemptId
+      })
+    };
   }
 
   async #recordNativeHistoryDiagnostics(prompt: ProviderPromptAssembly, routeRole: string): Promise<void> {
@@ -1482,7 +1532,7 @@ function estimateProviderToolFeedbackTokens(executions: ToolExecutionRecord[]): 
   }, 0);
 }
 
-function providerAttemptEventPayload(attempt: ProviderAttempt): {
+function providerAttemptEventPayload(attempt: ProviderAttempt): ProviderAttemptState & {
   provider: string;
   model: string;
   credentialId?: string;
@@ -1494,9 +1544,13 @@ function providerAttemptEventPayload(attempt: ProviderAttempt): {
   reasoningMetadata?: ProviderAttempt["reasoningMetadata"];
   streamDiagnostics?: ProviderAttempt["streamDiagnostics"];
 } {
+  assertProviderAttemptState(attempt);
   return {
     provider: attempt.provider,
     model: attempt.model,
+    ...(attempt.state === "preflight"
+      ? { state: "preflight" as const }
+      : { state: "dispatched" as const, dispatchedAt: attempt.dispatchedAt }),
     ok: attempt.ok,
     ...(attempt.credentialId === undefined ? {} : { credentialId: attempt.credentialId }),
     ...(attempt.errorClass === undefined ? {} : { errorClass: attempt.errorClass }),
@@ -1924,6 +1978,15 @@ function normalizeProviderRequest(request: Omit<ProviderRequest, "model"> & { mo
 
 function mapProviderRuntimeEvent(event: ProviderRuntimeEvent): RuntimeEvent {
   switch (event.kind) {
+    case "provider-spending-warning":
+      return {
+        kind: "provider-spending-warning",
+        warningId: event.warning.id,
+        scopeKind: event.warning.scopeKind,
+        warningThresholdPercent: event.warning.warningThresholdPercent,
+        maxEstimatedCostUsd: event.warning.maxEstimatedCostUsd,
+        committedCostUsd: event.warning.committedCostUsd
+      };
     case "provider-attempt-start":
       return {
         kind: "provider-attempt",

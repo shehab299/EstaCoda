@@ -72,7 +72,7 @@ It creates or resolves:
 | Browser infrastructure | Browser backend, supervised local CDP lifecycle, emergency cleanup |
 | Voice infrastructure | Local Whisper worker when configured |
 | Prompt infrastructure | Project context loader, context reference expander, session compression service |
-| Delegation substrate | `FileStateTracker`, parent routes, shared provider/tool substrate |
+| Delegation substrate | Durable Task store/service, parent routes, shared provider/tool substrate |
 | Trajectory | `TrajectoryRecorder` for the active session |
 
 Approval control is injected into runtime creation and used by runtime methods that grant, inspect, or revoke approvals.
@@ -107,24 +107,11 @@ Tool registration happens in phases so tools receive the right runtime and sessi
 
 MCP-discovered tools are added to the session-visible tool registry during session construction, alongside built-in tool registration phases.
 
-### Phase C: workflow wiring
+### Phase C: durable Task foundation
 
-After `AgentLoopBuilder.buildSession()` returns, `createRuntime()` wires workflow support when the session DB is `SQLiteSessionDB`.
+`SQLiteSessionDB` installs the profile-owned Task schema and `SQLiteTaskStore` provides transactional graph storage. SQLite runtimes also create a profile-local `TaskResultService`: result bodies remain outside SQLite, carry verified hashes and opaque handles, and are available to linked sessions through bounded `task.result.read` pages. Binary results are never injected through that text tool. `createRuntime()` now exposes a production `AgentStepExecutor` for profile-backed SQLite runtimes. The executor rechecks profile, exact workspace binding and trust, narrows the child to read-only capabilities, checkpoints worker ownership under the Attempt fence, captures complete results, and accounts for every provider attempt.
 
-Workflow wiring includes:
-
-| Component | Role |
-|---|---|
-| `SQLiteWorkflowStore` | Persists workflow runs, steps, events, locks, and artifacts |
-| `WorkflowLockService` | Coordinates workflow locks |
-| `WorkflowEngine` | Executes workflow plans |
-| `WorkflowProcessRegistry` | Tracks workflow-related processes |
-| `WorkflowEventSummaryService` | Compacts workflow event history |
-| `WorkflowCommandDispatcher` | Handles workflow commands |
-| `WorkflowAgentLoopAdapter` | Routes active workflow turns through the agent loop |
-| `WorkflowRestartRecovery` | Marks interrupted runs and recovers stale locks |
-
-Workflow wiring is best effort. If workflow setup fails, runtime creation can continue without workflow support, and workflow-specific commands should report the missing capability.
+The profile gateway supervisor runs the deterministic scheduler beside cron, including startup lease reconciliation, disconnect/restart survival, and graceful drain. It creates the full Task executor runtime only when runnable work exists. Terminal completion is sent through a session-linked delivery outbox; ambiguous in-flight external sends are marked failed after restart instead of being retried and duplicated. Status surfaces show bounded Task host/count information. `delegate_task`, `estacoda task`, and `/task` create or control fixed durable Task graphs, while `task.status` and `task.result.read` expose bounded authorized reads.
 
 ---
 
@@ -278,29 +265,13 @@ Runtime cache entries are keyed by `sessionId`. Session rows are scoped by `prof
 
 ## Delegation runtime
 
-`delegate_task` builds child agent loops through `DefaultChildAgentLoopFactory`, which uses the shared `AgentLoopBuilder`.
+`AgentLoopBuilder` receives an optional `DurableDelegationService`. The service is installed only for profile-bound SQLite Task runtimes, so `delegate_task` is omitted rather than falling back to an in-memory execution owner.
 
-Parent-owned substrate is reused:
+The tool adapter validates and normalizes single or batch input, requires the stable provider tool-call ID, and asks the service to create a fixed Task graph. The service derives exact Step tool authority from the current filtered registry, persists the provider-call idempotency key, and returns without constructing a worker session.
 
-| Reused from parent | Examples |
-|---|---|
-| Provider substrate | Provider registry, provider executor, routes |
-| Stores | Session DB, memory provider, artifact store |
-| Runtime substrate | Process manager, browser backend, trust store |
-| MCP substrate | MCP tool registrations |
-| Delegation state | `SubagentRegistry`, `FileStateTracker` |
+When the call originates inside a running orchestrator Attempt, the child Task records `parentTaskId` and `parentAttemptId`. Parent Attempt activity, creator worker identity, workspace equality, authority monotonicity, budget monotonicity, and graph persistence are checked in one SQLite transaction.
 
-Session-bound child components are fresh per child session. Child sessions have their own tool registry, tool executor, provider turn loop, runtime router, and agent loop.
-
-Child sessions are persisted with parent session ID, role/depth, effective tool access, stripped or blocked diagnostics, model override metadata where present, and runtime suppression metadata.
-
-Child tool access is resolved before provider schemas are built. The default child profile keeps parent-visible `read-only-local` and `read-only-network` tools only, strips exact/prefix blocked tools, and excludes browser, media, and MCP toolsets. `terminal.run` remains excluded.
-
-Child approvals are non-interactive and fail closed. Hardline denies run first. Any action that would ask, use parent grants, use pending approval queues, or depend on persisted/session approvals is denied in the child runtime.
-
-File-state tracking snapshots parent reads before delegation and emits advisory stale-file warnings when tracked child writes touch those paths. Delegation outcomes are recorded as operational telemetry in session events and trajectory records. They are not written into canonical prompt memory.
-
----
+`DefaultChildAgentLoopFactory` remains the isolated worker constructor used by `AgentStepExecutor` after the scheduler leases a Step. It no longer creates a delegation manager. `SubagentRegistry` describes currently running Attempts for operator visibility; it is not Task ownership or authorization state.
 
 ## Memory prompt assembly
 
@@ -316,7 +287,7 @@ The prompt assembly pipeline includes:
 6. Live user message
 7. Channel attachments
 8. Intent, skill instructions, skill setup, and skill resources
-9. Workflow plan
+9. Skill playbook plan
 10. Tool menu
 11. Explicit reference context
 12. Tool results or continuation feedback
@@ -355,8 +326,7 @@ Gateway cached runtimes are disposed through `RuntimeCache.safeDispose()`, which
 | Missing auxiliary route | Calling subsystem falls back where supported | `estacoda model show` |
 | MCP server unreachable | MCP tools are not registered; runtime continues | `estacoda gateway diagnose` |
 | Browser backend unavailable | Browser tools report connection errors | `estacoda doctor` |
-| SQLite lock or corruption | Session or workflow operations fail | Check `~/.estacoda/sessions.sqlite` permissions |
-| Workflow wiring unavailable | Runtime continues without workflow support | Workflow-related commands and runtime logs |
+| SQLite lock or corruption | Session or Task persistence operations fail | Check `~/.estacoda/sessions.sqlite` permissions |
 
 ---
 

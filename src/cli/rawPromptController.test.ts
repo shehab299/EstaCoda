@@ -20,7 +20,13 @@ import type {
   TypeaheadProviderRouter,
   TypeaheadProviderSelection,
 } from "../ui/papyrus/input/typeaheadProviderRouter.js";
-import type { AttachmentCardState } from "../ui/papyrus/operator-console/index.js";
+import {
+  createOperatorConsoleStyle,
+  type ApprovalCardState,
+  type AttachmentCardState,
+  type TaskCardState,
+} from "../ui/papyrus/operator-console/index.js";
+import { resolveTokens } from "../theme/token-resolver.js";
 
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
@@ -94,6 +100,7 @@ function fakeOutput(): RawPromptOutput & { writes: string[] } {
 function fakeLifecycle(overrides: Partial<TerminalLifecycle> = {}) {
   const calls: string[] = [];
   let started = false;
+  let mouseTracking = false;
   const lifecycle: TerminalLifecycle = {
     start: vi.fn(() => {
       calls.push("start");
@@ -102,9 +109,13 @@ function fakeLifecycle(overrides: Partial<TerminalLifecycle> = {}) {
     stop: vi.fn(() => {
       calls.push("stop");
       started = false;
+      mouseTracking = false;
       return { errors: [] };
     }),
     isStarted: vi.fn(() => started),
+    setMouseTracking: vi.fn((enabled: boolean) => (mouseTracking = enabled)),
+    resetMouseTracking: vi.fn(() => { mouseTracking = false; }),
+    isMouseTrackingEnabled: vi.fn(() => mouseTracking),
     ...overrides,
   };
   return { lifecycle, calls };
@@ -211,6 +222,251 @@ function startPendingOperatorConsoleRead(options: Partial<RawPromptControllerOpt
 }
 
 describe("raw prompt controller", () => {
+  it("writes durable asynchronous output and restores the active input draft", async () => {
+    const input = new FakeInput();
+    const output = fakeOutput();
+    const lifecycle = fakeLifecycle();
+    const controller = new RawPromptController({ input, output, lifecycle: lifecycle.lifecycle });
+    const pending = controller.read("> ");
+
+    input.send("unfinished draft");
+    expect(controller.writeDurable("Settled Task answer.")).toBe(true);
+    const rendered = output.writes.join("");
+    expect(rendered).toContain("Settled Task answer.\n");
+    expect(rendered.lastIndexOf("> unfinished draft")).toBeGreaterThan(rendered.indexOf("Settled Task answer.\n"));
+    input.send("\r");
+
+    await expect(pending).resolves.toEqual({ type: "submit", text: "unfinished draft" });
+    expect(controller.writeDurable("too late")).toBe(false);
+    expect(output.writes.join("")).not.toMatch(forbiddenManagedRegionOutput);
+  });
+
+  it("gives the modal Task inspector first input priority and returns safely to the prompt", async () => {
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+        getTasks: () => [promptTaskCard()],
+      },
+    });
+
+    expect(read.output.writes.join("")).toContain("Retained Task card");
+    read.input.send("\t");
+    read.input.send("\r");
+    read.input.send("ignored while modal");
+    read.input.send("\t");
+    read.input.send("ok\r");
+
+    expect(await read.pending).toEqual({ type: "submit", text: "ok" });
+    expect(read.output.writes.join("")).toContain("Activity trace");
+  });
+
+  it("edits normally after Escape returns from Task inspection to the main session", async () => {
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+        getTasks: () => [promptTaskCard()],
+      },
+    });
+
+    read.input.send("\t");
+    read.input.send("\r");
+    read.input.send("\u001b");
+    await flushKeypressTimers();
+    read.input.send("ab\u007f\r");
+
+    await expect(read.pending).resolves.toEqual({ type: "submit", text: "a" });
+  });
+
+  it("keeps Ctrl-C global while Task inspection owns focus", async () => {
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+        getTasks: () => [promptTaskCard()],
+      },
+    });
+
+    read.input.send("\t");
+    read.input.send("\r");
+    read.input.send("\u0003");
+
+    await expect(read.pending).resolves.toEqual({ type: "cancel" });
+  });
+
+  it("opens Subagent cards and breadcrumbs from SGR mouse input while idle", async () => {
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 18, isTty: true },
+        getTasks: () => [promptTaskCardWithSubagentTrace(["Read first file"])],
+      },
+    });
+
+    read.input.send("\u0007");
+    await Promise.resolve();
+    expect(read.output.writes.join("")).toContain("Mouse Mode");
+    read.input.send("\x1b[<0;2;2M\x1b[<0;2;2m");
+    await Promise.resolve();
+    expect(read.output.writes.join("")).toContain("Retained safe activity");
+
+    read.input.send("\x1b[<0;2;1M\x1b[<0;2;1m");
+    await Promise.resolve();
+    expect(read.output.writes.join("")).toContain("Plan Steps");
+
+    read.input.send("\x1b[<0;2;1M\x1b[<0;2;1m");
+    read.input.send("\t");
+    read.input.send("ok\r");
+    await expect(read.pending).resolves.toEqual({ type: "submit", text: "ok" });
+  });
+
+  it("keeps native mouse behavior until Ctrl-G and releases capture before typing", async () => {
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 18, isTty: true },
+        getTasks: () => [promptTaskCard()],
+      },
+    });
+
+    expect(read.lifecycle.lifecycle.resetMouseTracking).toHaveBeenCalledOnce();
+    expect(read.lifecycle.lifecycle.setMouseTracking).not.toHaveBeenCalled();
+
+    read.input.send("\u0007");
+    expect(read.lifecycle.lifecycle.setMouseTracking).toHaveBeenLastCalledWith(true);
+    expect(read.output.writes.join("")).toContain("[Mouse Mode]");
+
+    read.input.send("\u001b");
+    await flushKeypressTimers();
+    expect(read.lifecycle.lifecycle.setMouseTracking).toHaveBeenLastCalledWith(false);
+    expect(read.isResolved()).toBe(false);
+
+    read.input.send("\u0007");
+    read.input.send("x");
+    expect(read.lifecycle.lifecycle.setMouseTracking).toHaveBeenLastCalledWith(false);
+    read.input.send("\r");
+
+    await expect(read.pending).resolves.toEqual({ type: "submit", text: "x" });
+  });
+
+  it("releases an active Mouse Mode when the raw prompt is closed", async () => {
+    const input = new FakeInput();
+    const output = fakeOutput();
+    const lifecycle = fakeLifecycle();
+    const controller = new RawPromptController({
+      input,
+      output,
+      lifecycle: lifecycle.lifecycle,
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 18, isTty: true },
+        getTasks: () => [promptTaskCard()],
+      },
+    });
+    const pending = controller.read("> ");
+
+    input.send("\u0007");
+    expect(lifecycle.lifecycle.isMouseTrackingEnabled()).toBe(true);
+    controller.close();
+
+    await expect(pending).resolves.toEqual({ type: "cancel" });
+    expect(lifecycle.lifecycle.stop).toHaveBeenCalledOnce();
+    expect(lifecycle.lifecycle.isMouseTrackingEnabled()).toBe(false);
+  });
+
+  it("preserves historical Task trace selection while live Task projections refresh", async () => {
+    let card = promptTaskCardWithTrace(["First event", "Second event"]);
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+        getTasks: () => [card],
+      },
+    });
+
+    read.input.send("\t");
+    read.input.send("\r");
+    read.input.send("\u001b[D");
+    await flushKeypressTimers();
+    card = promptTaskCardWithTrace(["First event", "Second event", "New live event"]);
+    const refreshStart = read.output.writes.length;
+    read.input.send("\u001b[A");
+    await flushKeypressTimers();
+    const refreshedOutput = read.output.writes.slice(refreshStart).join("");
+
+    expect(refreshedOutput).toContain("First event");
+    expect(refreshedOutput).toContain("Return to live");
+    expect(refreshedOutput).not.toContain("New live event");
+    read.input.send("\t");
+    read.input.send("ok\r");
+    await expect(read.pending).resolves.toEqual({ type: "submit", text: "ok" });
+  });
+
+  it("uses current terminal dimensions without losing historical Task selection", async () => {
+    let terminal = { width: 72, height: 16, isTty: true };
+    const card = promptTaskCardWithTrace(["First event", "Second event"]);
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal,
+        getTerminal: () => terminal,
+        getTasks: () => [card],
+      },
+    });
+
+    read.input.send("\t");
+    read.input.send("\r");
+    read.input.send("\u001b[D");
+    await flushKeypressTimers();
+    terminal = { width: 44, height: 12, isTty: true };
+    const resizeStart = read.output.writes.length;
+    read.input.send("\u001b[A");
+    await flushKeypressTimers();
+    const resizedOutput = read.output.writes.slice(resizeStart).join("");
+
+    expect(resizedOutput).toContain("First event");
+    expect(resizedOutput).toContain("Return to live");
+    read.input.send("\t");
+    read.input.send("ok\r");
+    await expect(read.pending).resolves.toEqual({ type: "submit", text: "ok" });
+  });
+
+  it("keeps Subagent inspection anchored by Step ID while its safe activity refreshes", async () => {
+    let card = promptTaskCardWithSubagentTrace(["Read first file", "Summarized first file"]);
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 18, isTty: true },
+        getTasks: () => [card],
+      },
+    });
+
+    read.input.send("\t");
+    read.input.send("\r");
+    read.input.send("\r");
+    read.input.send("\u001b[D");
+    await flushKeypressTimers();
+    card = promptTaskCardWithSubagentTrace([
+      "Read first file",
+      "Summarized first file",
+      "New live Subagent event",
+    ], "Reading the newly discovered file");
+    const refreshStart = read.output.writes.length;
+    read.input.send("\u001b[A");
+    await flushKeypressTimers();
+    const refreshedOutput = read.output.writes.slice(refreshStart).join("");
+
+    expect(refreshedOutput).toContain("Main session / Task");
+    expect(refreshedOutput).toContain("Subagent 1");
+    expect(refreshedOutput).toContain("Reading the newly discovered file");
+    expect(refreshedOutput).toContain("Return to live");
+    read.input.send("\u001b");
+    read.input.send("\t");
+    read.input.send("ok\r");
+    await expect(read.pending).resolves.toEqual({ type: "submit", text: "ok" });
+  });
+
   it("submits ASCII text", async () => {
     const { result, output, lifecycle } = await readWithFakeInput("hello\r");
 
@@ -243,11 +499,107 @@ describe("raw prompt controller", () => {
       await expect(pending).resolves.toEqual({ type: "submit", text: "" });
       const rendered = output.writes.join("");
       expect(rendered).toContain("live-model");
-      expect(rendered).toContain("42%");
+      expect(rendered).toContain("42/100");
       expect(rendered).toContain("01:01");
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps Task projection refresh out of prompt editing and animates the prepared snapshot", async () => {
+    vi.useFakeTimers();
+    try {
+      const refreshTasks = vi.fn(() => true);
+      const tokens = resolveTokens("standard", "dark", "kemetBlue");
+      const { input, output, pending } = startPendingOperatorConsoleRead({
+        operatorConsole: {
+          enabled: true,
+          terminal: { width: 72, height: 16, isTty: true },
+          refreshTasks,
+          getTasks: () => [promptTaskCardWithSubagentTrace(["Inspecting the repository"])],
+          style: createOperatorConsoleStyle({
+            tokens,
+            capabilities: { supportsColor: true, supportsTrueColor: true },
+          }),
+        },
+      });
+
+      expect(refreshTasks).toHaveBeenCalledTimes(1);
+      expect(stripAnsi(output.writes.join(""))).toContain("• Subagent 1");
+      input.send("ab");
+      input.send("\u007f");
+      expect(refreshTasks).toHaveBeenCalledTimes(1);
+
+      output.writes.length = 0;
+      vi.advanceTimersByTime(tokens.contract.motion.worker.cadenceMs);
+      expect(refreshTasks).toHaveBeenCalledTimes(2);
+      expect(stripAnsi(output.writes.join(""))).toContain("● Subagent 1");
+
+      input.send("\r");
+      await expect(pending).resolves.toEqual({ type: "submit", text: "a" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("requires explicit approval focus before normal Enter can resolve a Task approval", async () => {
+    const onApprovalIntent = vi.fn();
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+        getApprovals: () => [promptApprovalCard()],
+        onApprovalIntent
+      }
+    });
+
+    expect(read.output.writes.join("")).toContain("Approval required");
+    read.input.send("\r");
+
+    await expect(read.pending).resolves.toEqual({ type: "submit", text: "" });
+    expect(onApprovalIntent).not.toHaveBeenCalled();
+  });
+
+  it("routes explicit approve-once and rejection controls without submitting the prompt", async () => {
+    let approvals: readonly ApprovalCardState[] = [promptApprovalCard()];
+    const onApprovalIntent = vi.fn(async () => {
+      approvals = [];
+    });
+    const approved = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+        getApprovals: () => approvals,
+        onApprovalIntent
+      }
+    });
+
+    approved.input.send("\t");
+    approved.input.send("\r");
+    await flushPromises();
+    expect(approved.isResolved()).toBe(false);
+    expect(onApprovalIntent).toHaveBeenCalledWith({ type: "approve", approvalId: "approval-raw-1" });
+    approved.input.send("continue\r");
+    await expect(approved.pending).resolves.toEqual({ type: "submit", text: "continue" });
+
+    approvals = [promptApprovalCard()];
+    onApprovalIntent.mockClear();
+    const rejected = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+        getApprovals: () => approvals,
+        onApprovalIntent
+      }
+    });
+    rejected.input.send("\t");
+    rejected.input.send("\x1b[C");
+    rejected.input.send("\r");
+    await flushPromises();
+    expect(rejected.isResolved()).toBe(false);
+    expect(onApprovalIntent).toHaveBeenCalledWith({ type: "reject", approvalId: "approval-raw-1" });
+    rejected.input.send("done\r");
+    await expect(rejected.pending).resolves.toEqual({ type: "submit", text: "done" });
   });
 
   it("captures input that becomes readable immediately on resume", async () => {
@@ -690,6 +1042,26 @@ describe("raw prompt controller", () => {
     });
   });
 
+  it("returns attachment focus to the prompt before editing text", async () => {
+    const read = startPendingOperatorConsoleRead({
+      operatorConsole: {
+        enabled: true,
+        terminal: { width: 72, height: 16, isTty: true },
+      },
+    });
+
+    read.input.send(`${PASTE_START}source material${PASTE_END}`);
+    await Promise.resolve();
+    read.input.send("\t");
+    read.input.send("ab\u007f\r");
+
+    await expect(read.pending).resolves.toEqual({
+      type: "submit",
+      text: ["a", "", "[Pasted text 1]", "source material"].join("\n"),
+      displayText: ["a", "", "Pasted text · 1 line · 15 chars", "source material"].join("\n"),
+    });
+  });
+
   it("keeps Operator Console attachments when Ctrl-U clears non-empty prompt text", async () => {
     const attachmentsSeen: Array<readonly AttachmentCardState[]> = [];
     const read = startPendingOperatorConsoleRead({
@@ -884,7 +1256,8 @@ describe("raw prompt controller", () => {
     expect(await read.pending).toEqual({ type: "submit", text: "review the Papyrus rollout plan" });
     const output = read.output.writes.join("");
     expect(output).toContain("› review the Papyrus rollout plan");
-    expect(output).toContain("kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k 7% │ ◷ 01:12");
+    expect(output).toContain("kimi-k2.7-code ● · ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k");
+    expect(output).toContain("· ◷ 01:12");
     expect(output).not.toMatch(/\b(tool|approval|workspace|trust|steering|setup|channel)\b/iu);
     expect(output).not.toMatch(forbiddenManagedRegionOutput);
   });
@@ -1862,6 +2235,120 @@ describe("raw prompt controller", () => {
     expect(output.writes.join("")).toContain("Slash suggestions unavailable: provider failed");
   });
 });
+
+function promptTaskCard(): TaskCardState {
+  return {
+    taskId: "T-raw-1",
+    objective: "Retained Task card",
+    status: "completed",
+    executionPreference: "auto",
+    execution: "waiting",
+    foregroundOwnerActive: false,
+    backgroundContinuation: "available",
+    progress: { completed: 1, skipped: 0, total: 1 },
+    planRevision: { revision: 1, status: "active" },
+    steps: [{
+      stepId: "step-1",
+      position: 0,
+      title: "Finish work",
+      objective: "Finish work",
+      executorRole: "worker",
+      status: "completed",
+      dependsOn: [],
+      childTaskPolicy: "forbid",
+      usage: { providerCalls: 1, totalTokens: 10, estimatedCostUsd: 0.001, usageComplete: true, pricingComplete: true },
+      attempts: []
+    }],
+    subagents: [],
+    trace: { events: [], hasEarlierEvents: false },
+    childTasks: [],
+    phase: { name: "completed" },
+    recentActivity: [{ eventId: "event-completed", kind: "attempt-completed", label: "Attempt completed", category: "finish", timestamp: "2026-07-20T10:00:00.000Z" }],
+    elapsedMs: 1_000,
+    usage: {
+      providerCalls: 1,
+      totalTokens: 10,
+      estimatedCostUsd: 0.001,
+      usageComplete: true,
+      pricingComplete: true,
+    },
+    results: [],
+    createdAt: "2026-07-20T09:59:59.000Z",
+    updatedAt: "2026-07-20T10:00:00.000Z",
+  };
+}
+
+function promptTaskCardWithTrace(labels: readonly string[]): TaskCardState {
+  const card = promptTaskCard();
+  return {
+    ...card,
+    status: "running",
+    phase: { name: "running" },
+    trace: {
+      events: labels.map((label, index) => ({
+        eventId: `event-${index}`,
+        kind: "attempt-progressed",
+        label,
+        category: index % 2 === 0 ? "read" : "answer",
+        timestamp: `2026-07-20T10:00:0${index}.000Z`,
+      })),
+      hasEarlierEvents: false,
+    },
+  };
+}
+
+function promptTaskCardWithSubagentTrace(
+  labels: readonly string[],
+  currentActivity = "Reading the first file"
+): TaskCardState {
+  const card = promptTaskCardWithTrace(labels);
+  const trace = labels.map((label, index) => ({
+    eventId: `subagent-event-${index}`,
+    kind: "attempt-progressed",
+    label,
+    category: index % 2 === 0 ? "read" as const : "answer" as const,
+    timestamp: `2026-07-20T10:00:0${index}.000Z`,
+    stepId: "step-1",
+    attemptId: "attempt-1",
+    subagentIndex: 1,
+  }));
+  return {
+    ...card,
+    subagents: [{
+      stepId: "step-1",
+      position: 0,
+      displayIndex: 1,
+      displayLabel: "Subagent 1",
+      title: "Finish work",
+      objective: "Finish work",
+      role: "worker",
+      status: "running",
+      dependsOn: [],
+      elapsedMs: 2_000,
+      currentActivity,
+      currentToolCategory: "read",
+      usage: { total: card.usage, currentAttempt: card.usage },
+      attempts: [],
+      trace,
+      results: [],
+    }],
+  };
+}
+
+function promptApprovalCard(): ApprovalCardState {
+  return {
+    id: "approval-raw-1",
+    status: "pending",
+    action: "Write file",
+    target: "write the reviewed artifact",
+    risk: "workspace-write",
+    summary: "Task task-raw-1 · approve once only"
+  };
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/gu, "");
+}
 
 function providerFor(
   id: string,

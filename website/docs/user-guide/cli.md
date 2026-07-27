@@ -64,6 +64,8 @@ Workspace trust is required before EstaCoda can run in a workspace. If trust is 
 
 Existing users who run the Setup Editor get a different post-apply path. The final review prompt is titled `Finalize configuration`, shows `Confirm selected configuration`, and includes a dynamic selected area such as `Channels · Telegram` or `Security`. `Confirm` updates the selected profile configuration. `Cancel` keeps the existing configuration unchanged and writes no config or secret changes. The technical review manifest remains internal and is not printed as user-facing setup output.
 
+The Setup Editor has one `Budgets` entry for optional estimated provider-spending limits. Open it to choose the default Task or session limit; each setting shows `Off` or its configured USD amount and has its own review/apply step. Applying one returns to the refreshed Budgets submenu without changing the other. Limits are Off by default, while `$0.00` is an enabled zero-spend policy. See [Configuration](../reference/configuration.md#budgets) for scope and enforcement details.
+
 After an existing-user Setup Editor apply, EstaCoda reports the apply and verification result and exits the setup flow. It does not show `Setup next action`, does not output `Selected: Launch EstaCoda`, and does not hand off to `Launch EstaCoda`. First-run onboarding still owns the launch prompt after verified setup.
 
 The Setup Editor exposes `EstaCoda Doctor` as the read-only health action. Use it when you want setup health, required fixes, and provider route status without changing configuration. See [Doctor](./doctor.md) for the full command behavior and repair flags.
@@ -166,6 +168,7 @@ The live TTY frame is composed from these surfaces:
 - approvals
 - active work
 - queued steer
+- retained durable Task cards and modal Task inspection
 - attachments
 - prompt / steer input
 - slash menu
@@ -193,6 +196,21 @@ prompt; full pasted content is stored for submission and is not dumped into
 prompt chrome. Active work is uncapped in model storage and viewport-limited in
 rendering. Approval cards emit approve/reject/inspect intent only; approval and
 security policy remain authoritative.
+
+Durable Tasks linked to the active session remain visible as cards after their
+creating turn and after terminal settlement. Use `Ctrl+T` or an available `Tab`
+transition to focus them, arrow keys to select a Task, and `Enter` to inspect.
+The inspection page supports arrow scrolling, `Page Up`/`Page Down`,
+`Home`/`End`, and `Escape` to return. It shows bounded plan, Step, Attempt,
+elapsed-time, safe-activity, tool-category, usage/cost, result-handle, and
+wait/failure metadata. It does not show raw worker text, provider streams, raw
+event payloads, tool arguments/results, credentials, private paths, or result
+bodies. Plain, CI, dumb-terminal, and non-TTY sessions use the deterministic
+`task` and `/task` command output instead.
+
+Input ownership is deterministic: modal Task inspection, then approval prompts,
+then autocomplete/typeahead, then attachment selection, then ordinary prompt or
+steering input.
 
 Bracketed paste is enabled only for supported TTY prompts. Small single-line
 pastes remain inline. Multiline and large pastes become attachment cards. Secret
@@ -273,7 +291,7 @@ Environment variables that affect rendering:
 | `ESTACODA_MODE` | `plain` or `standard` |
 | `ESTACODA_SKIN` | `kemetBlue` |
 
-Standard mode uses Unicode box-drawing for panels, ANSI colors from the theme, and spinner frames for running tasks. Plain mode uses ASCII-only markers and semantic text labels.
+Standard mode uses Unicode box-drawing and a small semantic motion language: Braille for waits, soft arcs for thinking, chevrons for routing, quarter turns for tools, pulses for delegated workers, diamonds for finalizing, and an orbit for background maintenance. Each motion has its own theme color and cadence. Approval, queued, success, failure, cancellation, and blocked states remain static. Plain mode uses non-animated ASCII markers and semantic text labels.
 
 ---
 

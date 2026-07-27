@@ -5,6 +5,8 @@ export type ApprovalFocusControl = typeof APPROVAL_FOCUS_CONTROLS[number];
 export type FocusTarget =
   | { readonly kind: "prompt" }
   | { readonly kind: "attachment"; readonly attachmentId: string }
+  | { readonly kind: "taskCard"; readonly taskId: string }
+  | { readonly kind: "taskSubagent"; readonly taskId: string; readonly stepId: string }
   | { readonly kind: "activeWork"; readonly toolEventId: string }
   | {
       readonly kind: "approval";
@@ -66,6 +68,12 @@ function isSameFocusTarget(left: FocusTarget, right: FocusTarget): boolean {
       return true;
     case "attachment":
       return left.attachmentId === (right as Extract<FocusTarget, { kind: "attachment" }>).attachmentId;
+    case "taskCard":
+      return left.taskId === (right as Extract<FocusTarget, { kind: "taskCard" }>).taskId;
+    case "taskSubagent": {
+      const subagent = right as Extract<FocusTarget, { kind: "taskSubagent" }>;
+      return left.taskId === subagent.taskId && left.stepId === subagent.stepId;
+    }
     case "activeWork":
       return left.toolEventId === (right as Extract<FocusTarget, { kind: "activeWork" }>).toolEventId;
     case "approval": {

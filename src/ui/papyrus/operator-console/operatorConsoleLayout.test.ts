@@ -14,6 +14,7 @@ describe("Papyrus operator console layout", () => {
 
     expect(regionKinds(layout)).toEqual(["prompt", "statusRail"]);
     expect(region(layout, "prompt")?.visible).toBe(true);
+    expect(region(layout, "prompt")?.height).toBe(3);
     expect(region(layout, "statusRail")?.visible).toBe(true);
   });
 
@@ -124,6 +125,58 @@ describe("Papyrus operator console layout", () => {
         items: activeWork.items.map((item) => ({ ...item, status: "succeeded" as const })),
       },
     })))).not.toContain("activeWork");
+  });
+
+  it("places durable Subagent cards below streaming and suppresses the bordered delegation fallback", () => {
+    const activeWork = {
+      items: [
+        {
+          id: "delegate",
+          toolName: "delegate_task",
+          status: "running" as const,
+          summary: "preparing",
+          target: "starting subagents",
+        },
+        {
+          id: "subagent:child-1",
+          toolName: "delegate_task",
+          source: "subagent" as const,
+          taskId: "task-current",
+          status: "running" as const,
+          summary: "reading",
+        },
+      ],
+      scrollOffset: 0,
+      expanded: true,
+    };
+    const taskCard = { taskId: "task-current", subagents: [{}] } as unknown as OperatorConsoleState["tasks"]["cards"][number];
+    const layout = createOperatorConsoleLayout(createState({
+      activeWork,
+      streaming: streamingState({ tail: "" }),
+      tasks: { cards: [taskCard], scrollOffset: 0 },
+    }), { width: 100, height: 40, isTty: true });
+
+    expect(regionKinds(layout)).not.toContain("activeWork");
+    expect(regionKinds(layout)).toEqual(expect.arrayContaining(["streaming", "taskCards"]));
+    expect(region(layout, "streaming")!.y).toBeLessThan(region(layout, "taskCards")!.y);
+
+    const unrelatedTaskCard = { taskId: "task-earlier", subagents: [{}] } as unknown as OperatorConsoleState["tasks"]["cards"][number];
+    const unrelated = createOperatorConsoleLayout(createState({
+      activeWork,
+      tasks: { cards: [unrelatedTaskCard], scrollOffset: 0 },
+    }), { width: 100, height: 40, isTty: true });
+    expect(regionKinds(unrelated)).toContain("activeWork");
+  });
+
+  it("keeps two optional terminal rows between durable Task cards and the prompt", () => {
+    const taskCard = { taskId: "task-current", subagents: [] } as unknown as OperatorConsoleState["tasks"]["cards"][number];
+    const layout = createOperatorConsoleLayout(createState({
+      tasks: { cards: [taskCard], selectedTaskId: taskCard.taskId, scrollOffset: 0 },
+    }), { width: 100, height: 20, isTty: true });
+
+    expect(region(layout, "promptGap")).toMatchObject({ height: 2, visible: true });
+    expect(region(layout, "promptGap")!.y).toBe(region(layout, "taskCards")!.y + region(layout, "taskCards")!.height);
+    expect(region(layout, "prompt")!.y).toBe(region(layout, "promptGap")!.y + 2);
   });
 
   it("includes turn activity only when turn activity state exists", () => {
@@ -265,7 +318,7 @@ describe("Papyrus operator console layout", () => {
     expect(region(layout, "prompt")?.height).toBe(6);
   });
 
-  it("caps multiline prompt allocation at 8 input rows plus border", () => {
+  it("caps multiline prompt allocation at 8 content rows", () => {
     const value = numberedLines(14);
     const layout = createOperatorConsoleLayout(createState({
       prompt: {

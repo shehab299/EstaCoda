@@ -21,6 +21,7 @@ import { renderStatusRailSurface } from "./statusRailSurface.js";
 import { renderStreamingSurface } from "./streamingSurface.js";
 import { renderTranscriptSurface } from "./transcriptSurface.js";
 import { renderTurnActivitySurface } from "./turnActivitySurface.js";
+import { renderTaskCardSurface, renderTaskInspectionSurface } from "./taskSurface.js";
 
 export type OperatorConsoleRenderedLine = {
   readonly region: OperatorConsoleRegion["kind"];
@@ -46,6 +47,9 @@ function renderRegionLines(
   region: OperatorConsoleRegion
 ): readonly OperatorConsoleRenderedLine[] {
   if (!region.visible || region.height <= 0 || region.width <= 0) return [];
+  if (region.kind === "promptGap") {
+    return Array.from({ length: region.height }, () => ({ region: region.kind, text: "" }));
+  }
   if (region.kind === "startupDashboard") {
     return renderStartupDashboardSurface(state.startup, {
       width: region.width,
@@ -82,12 +86,42 @@ function renderRegionLines(
       focusedAttachmentId: state.focus.target.kind === "attachment" ? state.focus.target.attachmentId : undefined,
     }).map((text) => ({ region: region.kind, text }));
   }
+  if (region.kind === "taskCards") {
+    const focusTarget = state.focus.target;
+    const focusedTaskId = focusTarget.kind === "taskCard"
+      ? focusTarget.taskId
+      : focusTarget.kind === "taskSubagent" && state.tasks.cards.some((card) =>
+          card.taskId === focusTarget.taskId && card.presentation === "receipt"
+        )
+        ? focusTarget.taskId
+        : undefined;
+    return renderTaskCardSurface(state.tasks, {
+      width: region.width,
+      height: region.height,
+      locale: state.locale,
+      isTty: state.terminal.isTty,
+      focusedTaskId,
+      focusedSubagentStepId: state.focus.target.kind === "taskSubagent" ? state.focus.target.stepId : undefined,
+      style: state.style,
+      motionElapsedMs: state.motionElapsedMs,
+    }).map((text) => ({ region: region.kind, text }));
+  }
+  if (region.kind === "taskInspection") {
+    return renderTaskInspectionSurface(state.tasks, {
+      width: region.width,
+      height: region.height,
+      locale: state.locale,
+      isTty: state.terminal.isTty,
+      style: state.style,
+    }).map((text) => ({ region: region.kind, text }));
+  }
   if (region.kind === "activeWork") {
     return renderActiveWorkSurface(state.activeWork, {
       width: region.width,
       height: region.height,
       locale: state.locale,
       style: state.style,
+      motionElapsedMs: state.motionElapsedMs,
     }).map((text) => ({ region: region.kind, text }));
   }
   if (region.kind === "streaming") {
@@ -95,6 +129,7 @@ function renderRegionLines(
       width: region.width,
       height: region.height,
       style: state.style,
+      motionElapsedMs: state.motionElapsedMs,
     }).map((text) => ({ region: region.kind, text }));
   }
   if (region.kind === "transcript") {
@@ -110,6 +145,7 @@ function renderRegionLines(
       locale: state.locale,
       activeWork: state.activeWork,
       style: state.style,
+      motionElapsedMs: state.motionElapsedMs,
     }).map((text) => ({ region: region.kind, text }));
   }
   if (region.kind === "approvals") {
@@ -132,7 +168,7 @@ function renderRegionLines(
     }).map((text) => ({ region: region.kind, text }));
   }
   if (region.kind === "statusRail") {
-    return [{ region: region.kind, text: renderStatusRailSurface(state.status, { width: region.width, style: state.style }) }];
+    return [{ region: region.kind, text: renderStatusRailSurface(state.status, { width: region.width, style: state.style, locale: state.locale }) }];
   }
   const lines: OperatorConsoleRenderedLine[] = [];
   for (let row = 0; row < region.height; row += 1) {
@@ -165,14 +201,20 @@ function regionLabel(
       return `Turn activity: ${state.turnActivity?.phase ?? ""}`;
     case "queuedSteer":
       return `Queued steer: ${state.steer?.queued?.text ?? ""}`;
+    case "taskCards":
+      return `Tasks: ${state.tasks.cards.length}`;
+    case "taskInspection":
+      return `Task: ${state.tasks.inspectedTaskId ?? ""}`;
     case "attachments":
       return `Attachments: ${state.attachments.length}`;
+    case "promptGap":
+      return "";
     case "prompt":
       return `Prompt: ${state.prompt.value.length > 0 ? state.prompt.value : ">"}`;
     case "slashMenu":
       return `Slash menu: ${state.slash?.query ?? ""}`;
     case "statusRail":
-      return renderStatusRailSurface(state.status, { width: region.width, style: state.style });
+      return renderStatusRailSurface(state.status, { width: region.width, style: state.style, locale: state.locale });
     case "activeWork":
       return "";
   }

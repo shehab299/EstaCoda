@@ -12,6 +12,7 @@ import type { SkillDefinition } from "../contracts/skill.js";
 import type { ToolDefinition } from "../contracts/tool.js";
 import type { TrajectoryStore } from "../contracts/trajectory-store.js";
 import type { ProviderExecutionResult } from "../providers/provider-executor.js";
+import { providerSpendDenialMessage } from "../providers/provider-spend-policy.js";
 import type { ToolExecutionRecord } from "../tools/tool-executor.js";
 import { deriveAgentEvolutionPolicy } from "../contracts/agent-evolution.js";
 import { InMemorySessionDB } from "../session/in-memory-session-db.js";
@@ -159,6 +160,8 @@ function successfulProviderExecution(content: string): ProviderExecutionResult {
       {
         provider: model.provider,
         model: model.id,
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         ok: true,
         content
       }
@@ -174,6 +177,8 @@ function streamedProviderExecution(content: string, streamDiagnostics: ProviderS
       {
         provider: model.provider,
         model: model.id,
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         ok: true,
         content,
         streamDiagnostics
@@ -203,6 +208,8 @@ function failedProviderExecution(): ProviderExecutionResult {
       {
         provider: model.provider,
         model: model.id,
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         ok: false,
         errorClass: "network",
         content: "network unavailable"
@@ -226,6 +233,8 @@ function fallbackProviderExecution(content: string): ProviderExecutionResult {
       {
         provider: model.provider,
         model: model.id,
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         ok: false,
         errorClass: "rate-limit",
         credentialId: "PRIMARY_API_KEY",
@@ -234,6 +243,8 @@ function fallbackProviderExecution(content: string): ProviderExecutionResult {
       {
         provider: "fallback-provider",
         model: "fallback-model",
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:01.000Z",
         ok: true,
         credentialId: "FALLBACK_API_KEY",
         content
@@ -275,12 +286,14 @@ async function createAgentLoop(input: {
   sessionRecallService?: Pick<SessionRecallService, "recall">;
   failSessionRecallDecisionEvent?: boolean;
   failSessionEventKinds?: string[];
+  failProviderUsageRead?: boolean;
   sessionCompressionService?: Pick<SessionCompressionService, "compactIfNeeded">;
   memoryCurationService?: Pick<MemoryCurationService, "observeCompletedTurn" | "checkpoint">;
   compressionConfig?: SessionCompressionConfig;
   memoryProvider?: MemoryProvider;
   trajectoryStore?: Pick<TrajectoryStore, "saveTrajectory">;
   providerExecution?: ProviderExecutionResult;
+  providerUsageCostUsd?: number;
   skillLearningManager?: SkillLearningManager;
   skillRouteShadowReranker?: SkillRouteShadowReranker;
   agentEvolutionPolicy?: ReturnType<typeof deriveAgentEvolutionPolicy>;
@@ -293,9 +306,12 @@ async function createAgentLoop(input: {
     ...(input.failSessionRecallDecisionEvent ? ["session-recall-decision"] : []),
     ...(input.failSessionEventKinds ?? [])
   ]);
-  const runtimeSessionDb = failingEventKinds.size > 0
+  const runtimeSessionDb = failingEventKinds.size > 0 || input.failProviderUsageRead === true
     ? new Proxy(sessionDb, {
         get(target, property, receiver) {
+          if (property === "listProviderUsageEntries" && input.failProviderUsageRead === true) {
+            return async () => { throw new Error("provider usage unavailable"); };
+          }
           if (property === "appendEvent") {
             return async (eventSessionId: string, event: { kind: string }) => {
               if (failingEventKinds.has(event.kind)) {
@@ -343,11 +359,45 @@ async function createAgentLoop(input: {
     canRunProvider: vi.fn(() => input.canRunProvider),
     lastPromptTokens: vi.fn(() => 77),
     lastActualPromptTokens: vi.fn(() => 88),
-    run: vi.fn(async () => ({
-      providerExecution: input.providerExecution,
-      toolExecutions: [],
-      iterations: input.providerExecution === undefined ? 0 : 1
-    }))
+    run: vi.fn(async () => {
+      if (input.providerUsageCostUsd !== undefined) {
+        const currentSessionId = sessionRuntimeContext.currentSessionId();
+        const visibleTurn = [...await sessionDb.listMessages(currentSessionId)].reverse()
+          .find((message) => message.role === "user");
+        if (visibleTurn === undefined) throw new Error("Expected a visible user turn before provider execution.");
+        await sessionDb.recordProviderUsageEntries([{
+          id: `usage-${visibleTurn.id}`,
+          profileId: "default",
+          sessionId: currentSessionId,
+          visibleTurnId: visibleTurn.id,
+          requestKey: `request-${visibleTurn.id}`,
+          provider: "test-provider",
+          model: "test-model",
+          routeRole: "primary",
+          routeIndex: 0,
+          providerAttemptIndex: 0,
+          sourceKind: "main",
+          pricing: { currency: "USD", fingerprint: "test-pricing" },
+          pricingFingerprint: "test-pricing",
+          inputTokens: 100,
+          outputTokens: 20,
+          reasoningTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 120,
+          estimatedCostUsd: input.providerUsageCostUsd,
+          usageComplete: true,
+          pricingComplete: true,
+          incompleteReasons: [],
+          dispatchedAt: "2030-01-01T00:00:00.000Z",
+        }]);
+      }
+      return {
+        providerExecution: input.providerExecution,
+        toolExecutions: [],
+        iterations: input.providerExecution === undefined ? 0 : 1
+      };
+    })
   } as unknown as ProviderTurnLoop;
 
   const skillPlaybookRunner = {
@@ -401,6 +451,51 @@ async function createAgentLoop(input: {
 }
 
 describe("AgentLoop provider availability gating", () => {
+  it("projects persisted request accounting onto the delivered visible turn", async () => {
+    const { loop } = await createAgentLoop({
+      canRunProvider: true,
+      runSkillPlaybook: vi.fn(async () => []),
+      providerExecution: successfulProviderExecution("done"),
+      providerUsageCostUsd: 0.14,
+    });
+
+    const response = await loop.handle({
+      text: "use the test skill",
+      channel: "cli",
+      trustedWorkspace: true,
+    });
+
+    expect(response.turnUsage).toMatchObject({
+      mainAgent: { providerCalls: 1, estimatedCostUsd: 0.14, costComplete: true },
+      auxiliaryModels: { providerCalls: 0, estimatedCostUsd: 0, costComplete: true },
+      delegatedWork: { providerCalls: 0, estimatedCostUsd: 0, costComplete: true },
+      total: { providerCalls: 1, estimatedCostUsd: 0.14, costComplete: true },
+      provisional: false,
+    });
+  });
+
+  it("keeps a completed answer and reports unavailable cost when accounting cannot be read", async () => {
+    const { loop } = await createAgentLoop({
+      canRunProvider: true,
+      runSkillPlaybook: vi.fn(async () => []),
+      providerExecution: successfulProviderExecution("done"),
+      failProviderUsageRead: true,
+    });
+
+    const response = await loop.handle({
+      text: "use the test skill",
+      channel: "cli",
+      trustedWorkspace: true,
+    });
+
+    expect(response.text).toBe("done");
+    expect(response.turnUsage?.total).toMatchObject({
+      costComplete: false,
+      incompleteReasons: ["turn-usage-read-failed"],
+    });
+    expect(response.turnUsage?.total).not.toHaveProperty("estimatedCostUsd");
+  });
+
   it("emits staged context estimates", async () => {
     const { loop } = await createAgentLoop({
       canRunProvider: true,
@@ -524,58 +619,7 @@ describe("AgentLoop provider availability gating", () => {
     expect(rerank).not.toHaveBeenCalled();
   });
 
-  it("records workflow context on active workflow turns", async () => {
-    const { loop, sessionDb, sessionId, trajectoryRecorder } = await createAgentLoop({
-      canRunProvider: true,
-      runSkillPlaybook: vi.fn(async () => []),
-      providerExecution: successfulProviderExecution("done")
-    });
-
-    await loop.handle({
-      text: "continue workflow",
-      channel: "cli",
-      trustedWorkspace: true,
-      workflow: {
-        runId: "workflow-run-1",
-        stepId: "workflow-step-1",
-        activationReason: "explicit"
-      }
-    });
-
-    const messages = await sessionDb.listMessages(sessionId);
-    expect(messages[0]?.metadata?.workflow).toEqual({
-      runId: "workflow-run-1",
-      stepId: "workflow-step-1",
-      activationReason: "explicit"
-    });
-    const userInput = trajectoryRecorder.snapshot().events.find((event) => event.kind === "user-input");
-    expect(userInput?.data.workflow).toEqual({
-      runId: "workflow-run-1",
-      stepId: "workflow-step-1",
-      activationReason: "explicit"
-    });
-  });
-
-  it("does not record workflow context on normal non-workflow turns", async () => {
-    const { loop, sessionDb, sessionId, trajectoryRecorder } = await createAgentLoop({
-      canRunProvider: true,
-      runSkillPlaybook: vi.fn(async () => []),
-      providerExecution: successfulProviderExecution("done")
-    });
-
-    await loop.handle({
-      text: "normal turn",
-      channel: "cli",
-      trustedWorkspace: true
-    });
-
-    const messages = await sessionDb.listMessages(sessionId);
-    expect(messages[0]?.metadata).not.toHaveProperty("workflow");
-    const userInput = trajectoryRecorder.snapshot().events.find((event) => event.kind === "user-input");
-    expect(userInput?.data).not.toHaveProperty("workflow");
-  });
-
-  it("persists an active task when the assistant promises follow-up work", async () => {
+  it("persists conversation continuation when the assistant promises follow-up work", async () => {
     const { loop, sessionDb, sessionId } = await createAgentLoop({
       canRunProvider: true,
       runSkillPlaybook: vi.fn(async () => []),
@@ -589,7 +633,7 @@ describe("AgentLoop provider availability gating", () => {
     });
 
     const agent = (await sessionDb.listMessages(sessionId)).find((message) => message.role === "agent");
-    expect(agent?.metadata?.activeTaskState).toMatchObject({
+    expect(agent?.metadata?.conversationContinuationState).toMatchObject({
       status: "open",
       userRequest: "why did the model switch?",
       promisedAction: "inspect provider routing",
@@ -597,7 +641,7 @@ describe("AgentLoop provider availability gating", () => {
     });
   });
 
-  it("passes open active task state into an acknowledgement continuation turn", async () => {
+  it("passes open conversation continuation state into an acknowledgement turn", async () => {
     const { loop, sessionDb, sessionId, providerTurnLoop } = await createAgentLoop({
       canRunProvider: true,
       runSkillPlaybook: vi.fn(async () => []),
@@ -616,16 +660,43 @@ describe("AgentLoop provider availability gating", () => {
 
     expect(vi.mocked(providerTurnLoop.run).mock.calls[1]?.[0]).toMatchObject({
       userText: "okay",
-      activeTaskState: {
+      conversationContinuationState: {
         status: "open",
         promisedAction: "inspect provider routing"
       }
     });
     const latestAgent = [...await sessionDb.listMessages(sessionId)].reverse().find((message) => message.role === "agent");
-    expect(latestAgent?.metadata?.activeTaskState).toMatchObject({ status: "satisfied" });
+    expect(latestAgent?.metadata?.conversationContinuationState).toMatchObject({ status: "satisfied" });
   });
 
-  it("persists a superseded active task tombstone after an unrelated explicit new task", async () => {
+  it("ignores retired activeTaskState metadata", async () => {
+    const { loop, sessionDb, sessionId, providerTurnLoop } = await createAgentLoop({
+      canRunProvider: true,
+      runSkillPlaybook: vi.fn(async () => []),
+      providerExecution: successfulProviderExecution("Okay.")
+    });
+    await sessionDb.appendMessage({
+      sessionId,
+      role: "agent",
+      content: "Let me inspect provider routing.",
+      metadata: {
+        activeTaskState: {
+          id: "active-provider-routing",
+          status: "open",
+          userRequest: "Check provider routing.",
+          promisedAction: "inspect provider routing",
+          updatedAt: "2026-06-17T00:00:00.000Z",
+          source: "heuristic"
+        }
+      }
+    });
+
+    await loop.handle({ text: "okay", channel: "cli", trustedWorkspace: true });
+
+    expect(vi.mocked(providerTurnLoop.run).mock.calls.at(-1)?.[0].conversationContinuationState).toBeUndefined();
+  });
+
+  it("persists a superseded continuation tombstone after an unrelated explicit request", async () => {
     const { loop, sessionDb, sessionId, providerTurnLoop } = await createAgentLoop({
       canRunProvider: true,
       runSkillPlaybook: vi.fn(async () => []),
@@ -641,13 +712,13 @@ describe("AgentLoop provider availability gating", () => {
     await loop.handle({ text: "Can you review the README?", channel: "cli", trustedWorkspace: true });
 
     const latestAgent = [...await sessionDb.listMessages(sessionId)].reverse().find((message) => message.role === "agent");
-    expect(latestAgent?.metadata?.activeTaskState).toMatchObject({
+    expect(latestAgent?.metadata?.conversationContinuationState).toMatchObject({
       status: "superseded",
       promisedAction: "inspect provider routing"
     });
   });
 
-  it("does not resurrect an older open active task after a superseding explicit task", async () => {
+  it("does not resurrect an older open commitment after a superseding explicit request", async () => {
     const { loop, sessionDb, sessionId, providerTurnLoop } = await createAgentLoop({
       canRunProvider: true,
       runSkillPlaybook: vi.fn(async () => []),
@@ -671,12 +742,12 @@ describe("AgentLoop provider availability gating", () => {
     expect(vi.mocked(providerTurnLoop.run).mock.calls[2]?.[0]).toMatchObject({
       userText: "okay"
     });
-    expect(vi.mocked(providerTurnLoop.run).mock.calls[2]?.[0].activeTaskState).toBeUndefined();
+    expect(vi.mocked(providerTurnLoop.run).mock.calls[2]?.[0].conversationContinuationState).toBeUndefined();
     const latestAgent = [...await sessionDb.listMessages(sessionId)].reverse().find((message) => message.role === "agent");
-    expect(latestAgent?.metadata).not.toHaveProperty("activeTaskState");
+    expect(latestAgent?.metadata).not.toHaveProperty("conversationContinuationState");
   });
 
-  it("marks active task state cancelled", async () => {
+  it("marks conversation continuation state cancelled", async () => {
     const { loop, sessionDb, sessionId, providerTurnLoop } = await createAgentLoop({
       canRunProvider: true,
       runSkillPlaybook: vi.fn(async () => []),
@@ -692,10 +763,10 @@ describe("AgentLoop provider availability gating", () => {
     await loop.handle({ text: "stop", channel: "cli", trustedWorkspace: true });
 
     const latestAgent = [...await sessionDb.listMessages(sessionId)].reverse().find((message) => message.role === "agent");
-    expect(latestAgent?.metadata?.activeTaskState).toMatchObject({ status: "cancelled" });
+    expect(latestAgent?.metadata?.conversationContinuationState).toMatchObject({ status: "cancelled" });
   });
 
-  it("does not persist credentials or raw provider bodies in active task state", async () => {
+  it("does not persist credentials or raw provider bodies in conversation continuation state", async () => {
     const { loop, sessionDb, sessionId } = await createAgentLoop({
       canRunProvider: true,
       runSkillPlaybook: vi.fn(async () => []),
@@ -704,7 +775,7 @@ describe("AgentLoop provider availability gating", () => {
 
     await loop.handle({ text: "trace provider", channel: "cli", trustedWorkspace: true });
 
-    const serialized = JSON.stringify((await sessionDb.listMessages(sessionId)).find((message) => message.role === "agent")?.metadata?.activeTaskState);
+    const serialized = JSON.stringify((await sessionDb.listMessages(sessionId)).find((message) => message.role === "agent")?.metadata?.conversationContinuationState);
     expect(serialized).toContain("API_KEY=REDACTED");
     expect(serialized).not.toContain("secretsecret");
   });
@@ -1109,6 +1180,43 @@ describe("AgentLoop provider availability gating", () => {
         }
       ]
     });
+  });
+
+  it("returns a deterministic local spending denial without a provider-authored explanation", async () => {
+    const denialReason = "SESSION_LIMIT_EXHAUSTED" as const;
+    const providerExecution: ProviderExecutionResult = {
+      ok: false,
+      fallbackUsed: false,
+      attempts: [{
+        provider: model.provider,
+        model: model.id,
+        state: "preflight",
+        ok: false,
+        errorClass: "spend-denied",
+        content: providerSpendDenialMessage(denialReason)
+      }],
+      spendDenialReason: denialReason,
+      toolCalls: []
+    };
+    const { loop, sessionDb, sessionId } = await createAgentLoop({
+      canRunProvider: true,
+      runSkillPlaybook: vi.fn(async () => []),
+      providerExecution
+    });
+
+    const response = await loop.handle({
+      text: "use the test skill",
+      channel: "cli",
+      trustedWorkspace: true
+    });
+
+    expect(response.text).toBe(providerSpendDenialMessage(denialReason));
+    expect(response.text).not.toContain("Provider note:");
+    expect(response.text).not.toContain("I matched the test-skill skill");
+    const agentMessages = (await sessionDb.listMessages(sessionId)).filter((message) => message.role === "agent");
+    expect(agentMessages.map((message) => message.content)).toEqual([
+      providerSpendDenialMessage(denialReason)
+    ]);
   });
 
   it("persists the trajectory snapshot when a turn returns successfully", async () => {

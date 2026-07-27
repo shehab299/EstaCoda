@@ -1,10 +1,16 @@
 import type { Writable } from "node:stream";
 import type { TerminalCapabilities } from "../contracts/ui.js";
 import { createLineEditorState } from "../ui/input/lineEditor.js";
+import type { ParsedKeypress } from "../ui/input/parseKeypress.js";
 import {
   applyActiveWorkRuntimeEvent,
   createActiveWorkRuntimeState,
   getActiveWorkSurfaceDesiredHeight,
+  hasRunningDelegationWork,
+  hasVisibleTaskMotion,
+  isHardInterruptInput,
+  isMouseModeToggle,
+  isPromptEditingInput,
   normalizeActiveWorkRuntimeEventId,
   type ActiveWorkItem,
   type ActiveWorkRuntimeEvent,
@@ -16,11 +22,17 @@ import {
   type StreamingSegment,
   type StreamingState,
   type TerminalMetrics,
+  type TaskCardState,
+  type TaskSurfaceState,
   type ToolActivityState,
   type TranscriptBlock,
   type TurnActivityState,
+  routeOperatorConsoleInput,
+  reconcileTaskSurfaceState,
+  setOperatorConsoleMouseMode,
 } from "../ui/papyrus/operator-console/index.js";
 import { RawPromptRenderLoop } from "./rawPromptRenderLoop.js";
+import { semanticMotionForPhase, semanticMotionFrameIndex } from "../ui/semantic-motion.js";
 
 export type LiveOperatorConsoleControllerOptions = {
   readonly output: Pick<Writable, "write"> & {
@@ -34,13 +46,18 @@ export type LiveOperatorConsoleControllerOptions = {
   readonly animationIntervalMs?: number;
   readonly streamingRefreshIntervalMs?: number;
   readonly getStatus: () => StatusRailState;
+  readonly refreshTasks?: () => boolean;
+  readonly getTasks?: () => readonly TaskCardState[];
+  readonly taskRefreshIntervalMs?: number;
   readonly turnStartedAtMs?: number;
   readonly promptPlaceholder?: string;
+  readonly onMouseModeChange?: (active: boolean) => void;
   readonly now?: () => number;
 };
 
-const DEFAULT_OPERATOR_CONSOLE_ANIMATION_INTERVAL_MS = 90;
+const DEFAULT_OPERATOR_CONSOLE_ANIMATION_INTERVAL_MS = 16;
 const DEFAULT_STREAMING_REFRESH_INTERVAL_MS = 75;
+const DEFAULT_TASK_REFRESH_INTERVAL_MS = 750;
 const MIN_TIMER_REFRESH_INTERVAL_MS = 16;
 const MAX_STREAMING_TAIL_CHARS = 4_000;
 
@@ -57,14 +74,17 @@ export class LiveOperatorConsoleController {
   readonly #animationIntervalMs: number;
   readonly #streamingRefreshIntervalMs: number;
   readonly #getStatus: () => StatusRailState;
+  readonly #refreshTasks: (() => boolean) | undefined;
+  readonly #getTasks: (() => readonly TaskCardState[]) | undefined;
+  readonly #taskRefreshIntervalMs: number;
   readonly #turnStartedAtMs: number | undefined;
   readonly #promptPlaceholder: string | undefined;
+  readonly #onMouseModeChange: ((active: boolean) => void) | undefined;
   readonly #now: () => number;
+  readonly #animationStartedAtMs: number;
   #activeWork: ToolActivityState = createActiveWorkRuntimeState();
-  #activeWorkFrameIndex = 0;
   #steer: SteerState | undefined;
   #turnActivity: TurnActivityState | undefined;
-  #turnActivityFrameIndex = 0;
   #transcript: readonly TranscriptBlock[];
   #streamingSegments: readonly StreamingSegment[] = [];
   #streamingCurrentSegmentText = "";
@@ -73,8 +93,11 @@ export class LiveOperatorConsoleController {
   #streamingToolTrail: readonly InlineToolTrailEntry[] = [];
   #streamingToolTrailSequence = 0;
   #animationTimer: ReturnType<typeof setInterval> | undefined;
+  #lastVisibleMotionSignature: string | undefined;
   #streamingRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  #taskRefreshTimer: ReturnType<typeof setInterval> | undefined;
   #lastTimerRefreshAtMs = Number.NEGATIVE_INFINITY;
+  #tasks: TaskSurfaceState;
 
   constructor(options: LiveOperatorConsoleControllerOptions) {
     this.#output = options.output;
@@ -90,13 +113,29 @@ export class LiveOperatorConsoleController {
       DEFAULT_STREAMING_REFRESH_INTERVAL_MS
     );
     this.#getStatus = options.getStatus;
+    this.#refreshTasks = options.refreshTasks;
+    this.#getTasks = options.getTasks;
+    this.#taskRefreshIntervalMs = normalizePositiveInteger(
+      options.taskRefreshIntervalMs ?? DEFAULT_TASK_REFRESH_INTERVAL_MS,
+      DEFAULT_TASK_REFRESH_INTERVAL_MS
+    );
     this.#turnStartedAtMs = options.turnStartedAtMs;
     this.#promptPlaceholder = options.promptPlaceholder;
+    this.#onMouseModeChange = options.onMouseModeChange;
     this.#now = options.now ?? Date.now;
+    this.#animationStartedAtMs = this.#now();
     this.#transcript = [...options.runtimeHost.getState().transcript];
+    this.#refreshTasks?.();
+    this.#tasks = reconcileTaskSurfaceState(
+      setOperatorConsoleMouseMode(options.runtimeHost.getState(), false).tasks,
+      this.#getTasks?.() ?? []
+    );
+    this.#runtimeHost.setTasks(this.#tasks);
     this.#renderLoop = new RawPromptRenderLoop(options.output, {
       operatorConsoleHostFactory: () => options.runtimeHost,
     });
+    this.#startTaskRefreshTimer();
+    this.#syncAnimationTimer();
   }
 
   get activeWork(): ToolActivityState {
@@ -105,6 +144,57 @@ export class LiveOperatorConsoleController {
 
   get steer(): SteerState | undefined {
     return this.#steer;
+  }
+
+  routeInput(event: ParsedKeypress): boolean {
+    if (isHardInterruptInput(event)) return false;
+    if (isMouseModeToggle(event)) {
+      this.setMouseModeActive(this.#tasks.mouseModeActive !== true);
+      return true;
+    }
+    if (this.#tasks.mouseModeActive === true && event.type === "key" && event.key === "escape") {
+      this.setMouseModeActive(false);
+      return true;
+    }
+    if (this.#tasks.mouseModeActive === true && isPromptEditingInput(event)) {
+      this.setMouseModeActive(false);
+    }
+    const state = this.#runtimeHost.getState();
+    const routed = routeOperatorConsoleInput({
+      state,
+      event,
+      approval: state.focus.target.kind === "approval",
+      typeahead: state.slash !== undefined,
+      attachment: state.focus.target.kind === "attachment",
+      steer: true,
+    });
+    const stateChanged = routed.state !== state;
+    const inspectionClosed = this.#tasks.inspectedTaskId !== undefined &&
+      routed.state.tasks.inspectedTaskId === undefined;
+    const releaseMouseMode = routed.releaseMouseMode === true || inspectionClosed;
+    if (stateChanged || releaseMouseMode) {
+      this.#tasks = setOperatorConsoleMouseMode(
+        routed.state,
+        !releaseMouseMode && routed.state.tasks.mouseModeActive === true
+      ).tasks;
+      if (releaseMouseMode) this.#onMouseModeChange?.(false);
+      this.#runtimeHost.setTasks(this.#tasks);
+      this.#runtimeHost.setFocus(routed.state.focus);
+      this.refresh();
+    }
+    if (!routed.handled) return false;
+    return true;
+  }
+
+  setMouseModeActive(active: boolean): boolean {
+    const state = setOperatorConsoleMouseMode(this.#runtimeHost.getState(), active);
+    const enabled = state.tasks.mouseModeActive === true;
+    if (enabled === (this.#tasks.mouseModeActive === true)) return enabled;
+    this.#tasks = state.tasks;
+    this.#runtimeHost.setTasks(this.#tasks);
+    this.#onMouseModeChange?.(enabled);
+    this.refresh();
+    return enabled;
   }
 
   applyActiveWorkEvent(event: ActiveWorkRuntimeEvent): ToolActivityState {
@@ -119,7 +209,6 @@ export class LiveOperatorConsoleController {
       expanded: this.#activeWork.expanded,
       startedAtMs: this.#activeWork.startedAtMs ?? this.#turnStartedAtMs ?? timestamp,
       updatedAtMs: timestamp,
-      ...(this.#activeWork.frameIndex === undefined ? {} : { frameIndex: this.#activeWork.frameIndex }),
     };
     const next = applyActiveWorkRuntimeEvent(baseState, event);
     this.#activeWork = isSettledDelegationEvent(event)
@@ -183,7 +272,6 @@ export class LiveOperatorConsoleController {
 
   resetActiveWork(): void {
     this.#activeWork = createActiveWorkRuntimeState();
-    this.#activeWorkFrameIndex = 0;
     this.#runtimeHost.setActiveWork(this.#activeWork);
     this.#syncAnimationTimer();
   }
@@ -202,7 +290,6 @@ export class LiveOperatorConsoleController {
       ...durableState,
       updatedAtMs: timestamp,
       completedAtMs: durableState.completedAtMs ?? timestamp,
-      frameIndex: undefined,
     };
     this.#runtimeHost.setActiveWork(this.#activeWork);
     this.#syncAnimationTimer();
@@ -224,23 +311,18 @@ export class LiveOperatorConsoleController {
   setTurnActivity(state: TurnActivityState | undefined): void {
     if (state === undefined) {
       this.#turnActivity = undefined;
-      this.#turnActivityFrameIndex = 0;
       this.#runtimeHost.setTurnActivity(undefined);
       this.refresh();
       return;
     }
 
-    this.#turnActivityFrameIndex = isSameTurnActivity(this.#turnActivity, state)
-      ? this.#turnActivityFrameIndex + 1
-      : 0;
-    this.#turnActivity = { ...state, frameIndex: this.#turnActivityFrameIndex };
+    this.#turnActivity = { ...state };
     this.#runtimeHost.setTurnActivity(this.#turnActivity);
     this.refresh();
   }
 
   clearTurnActivity(): void {
     this.#turnActivity = undefined;
-    this.#turnActivityFrameIndex = 0;
     this.#runtimeHost.setTurnActivity(undefined);
     this.#syncAnimationTimer();
   }
@@ -248,12 +330,19 @@ export class LiveOperatorConsoleController {
   clear(): void {
     this.#stopAnimationTimer();
     this.#stopStreamingRefreshTimer();
+    this.#stopTaskRefreshTimer();
     this.#renderLoop.clear();
   }
 
   refresh(options: LiveConsoleRefreshOptions = {}): void {
     const steerVisible = this.#steer?.mode === "drafting" || this.#steer?.mode === "queued";
     const activeWork = this.#activeWorkSnapshotForRender();
+    const motionElapsedMs = this.#motionElapsedMs();
+    const wasMouseModeActive = this.#tasks.mouseModeActive === true;
+    this.#tasks = reconcileTaskSurfaceState(this.#tasks, this.#getTasks?.() ?? []);
+    if (wasMouseModeActive && this.#tasks.mouseModeActive !== true) this.#onMouseModeChange?.(false);
+    this.#runtimeHost.setTasks(this.#tasks);
+    const focus = this.#runtimeHost.getState().focus;
     this.#renderLoop.render({
       prompt: "",
       state: createLineEditorState(this.#steer?.mode === "drafting" ? this.#steer.draft : ""),
@@ -261,6 +350,9 @@ export class LiveOperatorConsoleController {
         enabled: true,
         terminal: this.#terminalSnapshotForRender(activeWork),
         status: this.#getStatus(),
+        motionElapsedMs,
+        tasks: this.#tasks,
+        focus,
         transcript: this.#transcript,
         turnActivity: this.#turnActivity,
         activeWork,
@@ -273,6 +365,7 @@ export class LiveOperatorConsoleController {
       dirtyRegions: options.dirtyRegions,
     });
     this.#lastTimerRefreshAtMs = Date.now();
+    this.#startTaskRefreshTimer();
     this.#syncAnimationTimer();
   }
 
@@ -286,30 +379,30 @@ export class LiveOperatorConsoleController {
   }
 
   #activeWorkSnapshotForRender(): ToolActivityState {
-    if (!hasUnfinishedActiveWork(this.#activeWork)) {
-      this.#activeWorkFrameIndex = 0;
-      return this.#activeWork;
-    }
+    if (!hasUnfinishedActiveWork(this.#activeWork)) return this.#activeWork;
     const timestamp = this.#now();
-    const snapshot = {
+    return {
       ...this.#activeWork,
       updatedAtMs: timestamp,
-      frameIndex: this.#activeWorkFrameIndex,
     };
-    this.#activeWorkFrameIndex += 1;
-    return snapshot;
   }
 
   #terminalSnapshotForRender(activeWork: ToolActivityState): Partial<TerminalMetrics> {
-    if (activeWork.completedAtMs === undefined) return this.#terminal;
-    const requestedHeight = getActiveWorkSurfaceDesiredHeight(activeWork);
-    if (requestedHeight <= 0) return this.#terminal;
-    const surroundingChromeRows = 32;
-    const currentHeight = this.#terminal.height ?? 0;
-    const expandedHeight = Math.max(currentHeight, requestedHeight + surroundingChromeRows);
     const viewportHeight = normalizeOptionalPositiveInteger(this.#output.rows);
-    return {
+    const terminal = {
       ...this.#terminal,
+      width: normalizeOptionalPositiveInteger(this.#output.columns) ?? this.#terminal.width,
+      height: viewportHeight ?? this.#terminal.height,
+      isTty: this.#output.isTTY ?? this.#terminal.isTty,
+    };
+    if (activeWork.completedAtMs === undefined) return terminal;
+    const requestedHeight = getActiveWorkSurfaceDesiredHeight(activeWork);
+    if (requestedHeight <= 0) return terminal;
+    const surroundingChromeRows = 32;
+    const currentHeight = terminal.height ?? 0;
+    const expandedHeight = Math.max(currentHeight, requestedHeight + surroundingChromeRows);
+    return {
+      ...terminal,
       height: viewportHeight === undefined
         ? expandedHeight
         : Math.min(viewportHeight, expandedHeight),
@@ -317,15 +410,12 @@ export class LiveOperatorConsoleController {
   }
 
   #advanceAnimationFrame(): void {
-    if (this.#turnActivity !== undefined) {
-      this.#turnActivityFrameIndex += 1;
-      this.#turnActivity = {
-        ...this.#turnActivity,
-        frameIndex: this.#turnActivityFrameIndex,
-      };
-      this.#runtimeHost.setTurnActivity(this.#turnActivity);
-    }
-    this.#refreshFromTimer({ dirtyRegions: ["turnActivity", "activeWork", "statusRail"] });
+    const elapsedMs = this.#motionElapsedMs();
+    const signature = this.#visibleMotionSignature(elapsedMs);
+    if (signature === this.#lastVisibleMotionSignature) return;
+    this.#refreshFromTimer({
+      dirtyRegions: ["turnActivity", "activeWork", "streaming", "taskCards", "taskInspection", "statusRail"],
+    });
   }
 
   #syncAnimationTimer(): void {
@@ -333,6 +423,7 @@ export class LiveOperatorConsoleController {
       this.#stopAnimationTimer();
       return;
     }
+    this.#lastVisibleMotionSignature = this.#visibleMotionSignature(this.#motionElapsedMs());
     if (this.#animationTimer !== undefined) return;
     this.#animationTimer = setInterval(() => {
       this.#advanceAnimationFrame();
@@ -345,6 +436,7 @@ export class LiveOperatorConsoleController {
     if (this.#animationTimer === undefined) return;
     clearInterval(this.#animationTimer);
     this.#animationTimer = undefined;
+    this.#lastVisibleMotionSignature = undefined;
   }
 
   #scheduleStreamingRefresh(): void {
@@ -363,17 +455,72 @@ export class LiveOperatorConsoleController {
     this.#streamingRefreshTimer = undefined;
   }
 
-  #refreshFromTimer(options: LiveConsoleRefreshOptions = {}): void {
+  #startTaskRefreshTimer(): void {
+    if (this.#refreshTasks === undefined || this.#taskRefreshTimer !== undefined) return;
+    this.#taskRefreshTimer = setInterval(() => {
+      if (this.#refreshTasks?.() !== true) return;
+      // A refreshed durable snapshot must be reconciled even when an animation
+      // frame happened in the same clock tick.
+      this.refresh({ dirtyRegions: ["taskCards", "taskInspection", "statusRail"] });
+    }, this.#taskRefreshIntervalMs);
+    const timer = this.#taskRefreshTimer as { unref?: () => void };
+    timer.unref?.();
+  }
+
+  #stopTaskRefreshTimer(): void {
+    if (this.#taskRefreshTimer === undefined) return;
+    clearInterval(this.#taskRefreshTimer);
+    this.#taskRefreshTimer = undefined;
+  }
+
+  #refreshFromTimer(options: LiveConsoleRefreshOptions = {}): boolean {
     const now = Date.now();
-    if (now - this.#lastTimerRefreshAtMs < MIN_TIMER_REFRESH_INTERVAL_MS) return;
+    if (now - this.#lastTimerRefreshAtMs < MIN_TIMER_REFRESH_INTERVAL_MS) return false;
     this.refresh(options);
+    return true;
   }
 
   #shouldAnimate(): boolean {
     if (!this.#supportsAnimation) return false;
     const styleAllowsAnimation = this.#runtimeHost.getState().style?.tokens.contract.behavior.allowAnimation ?? true;
     if (!styleAllowsAnimation) return false;
-    return this.#turnActivity !== undefined || hasUnfinishedActiveWork(this.#activeWork);
+    return this.#visibleMotionSignature(this.#motionElapsedMs()).length > 0;
+  }
+
+  #motionElapsedMs(): number {
+    return Math.max(0, this.#now() - this.#animationStartedAtMs);
+  }
+
+  #visibleMotionSignature(elapsedMs: number): string {
+    const motion = this.#runtimeHost.getState().style?.tokens.contract.motion;
+    const hasLiveTail = this.#streamingTail.trim().length > 0;
+    const hasVisibleStreamingText = hasLiveTail || this.#streamingSegments.some((segment) => segment.text.trim().length > 0);
+    const hasVisibleWorkerMotion = !hasLiveTail &&
+      hasRunningDelegationWork(this.#activeWork) &&
+      this.#activeWork.items.some((item) => item.status === "running" && item.source === "subagent");
+    const hasVisibleToolMotion = hasVisibleStreamingText &&
+      this.#streamingToolTrail.some((entry) => entry.status === "running");
+    const hasVisibleDurableTaskMotion = hasVisibleTaskMotion(this.#tasks);
+    if (motion === undefined) {
+      return this.#turnActivity !== undefined || hasVisibleWorkerMotion || hasVisibleToolMotion || hasVisibleDurableTaskMotion
+        ? String(Math.floor(elapsedMs / 90))
+        : "";
+    }
+    const parts: string[] = [];
+    if (this.#turnActivity !== undefined) {
+      const token = semanticMotionForPhase(this.#turnActivity.phase);
+      parts.push(`${token}:${semanticMotionFrameIndex(motion[token], elapsedMs)}`);
+    }
+    if (hasVisibleWorkerMotion) {
+      parts.push(`worker:${semanticMotionFrameIndex(motion.worker, elapsedMs)}`);
+    }
+    if (hasVisibleDurableTaskMotion) {
+      parts.push(`task-worker:${semanticMotionFrameIndex(motion.worker, elapsedMs)}`);
+    }
+    if (hasVisibleToolMotion) {
+      parts.push(`tool:${semanticMotionFrameIndex(motion.tool, elapsedMs)}`);
+    }
+    return parts.join("|");
   }
 
   #streamingSnapshotForRender(): StreamingState | undefined {
@@ -524,15 +671,6 @@ function resolveToolTrailDurationMs(
   if (item.durationMs !== undefined) return item.durationMs;
   if (startedAtMs !== undefined && endedAtMs !== undefined) return Math.max(0, endedAtMs - startedAtMs);
   return existing?.durationMs;
-}
-
-function isSameTurnActivity(
-  current: TurnActivityState | undefined,
-  next: TurnActivityState
-): boolean {
-  return current?.phase === next.phase &&
-    current.backgroundKind === next.backgroundKind &&
-    current.label === next.label;
 }
 
 function hasUnfinishedActiveWork(state: ToolActivityState): boolean {

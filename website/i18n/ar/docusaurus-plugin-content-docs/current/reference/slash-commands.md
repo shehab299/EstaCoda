@@ -271,49 +271,24 @@ sidebar_position: 2
 
 ---
 
-## Workflow
+## المهام الدائمة
 
-يتطلب قاعدة بيانات جلسات SQLite. متاح عندما يكون Workflow مربوطاً.
+### `/task <subcommand>`
 
-```bash
-/workflow begin <objective>
-/workflow begin --skill <skillName> <objective>
-/workflow status [runId]
-/workflow pause <runId> [reason]
-/workflow resume <runId>
-/workflow interrupt <runId> [reason]
-/workflow cancel <runId> [reason]
-/workflow steer <runId> <guidance>
-/workflow approve <stepId>
-/workflow reject <stepId> [reason]
-/workflow retry <stepId>
-/workflow skip <stepId> [reason]
-/workflow checkpoint <runId> <name>
-/workflow trace [runId] [limit]
-/workflow summarize <runId>
-/workflow activate <runId>
-/workflow deactivate
+```text
+/task begin [--background] <objective>
+/task list [limit]
+/task show <task-id>
+/task pause <task-id>
+/task resume <task-id>
+/task cancel <task-id>
+/task retry <task-id> [step-id]
+/task result <task-id>
 ```
 
-إذا تم حذف `runId` في `status` و `trace`، يستخدم تشغيل Workflow النشط.
+**الحالة المُعدّلة:** سجلات المهام الدائمة الخاصة بالملف الشخصي. تبقى أجسام النتائج في مخزن النتائج الخاص بالملف الشخصي.
 
-**الحالة المُعدّلة:** قاعدة بيانات جلسات SQLite (جداول `workflow_events`، `workflow_steps`).
-
-**السلوك:**
-- `/workflow begin <objective>` ينشئ تشغيل Workflow محافظاً بخطوة واحدة، ويبدأه، ويفعّله في الجلسة التفاعلية الحالية.
-- `/workflow begin --skill <skillName> <objective>` يحل اسم المهارة، ويجمع playbook الخاص بها، ويحوله إلى `WorkflowPlan`، ثم ينشئ التشغيل ويبدأه ويفعّله في الجلسة التفاعلية الحالية.
-- أمر begin الناجح يطبع `Created workflow: <runId>` و`Started workflow: <runId>` و`Activated workflow: <runId>`.
-- `/workflow begin <objective>` بدون `--skill` يسجل provenance صريحاً ولا يستخدم تحويل playbook.
-- `/workflow steer` يسجّل حدث `OperatorEvent` غير مستهلك. في الدور التالي للمحوّل، يُضاف التوجيه كبدئة لنص المستخدم. الأحداث تُعلّم مستهلكة وتظهر في `/workflow trace`.
-- `/workflow activate` يربط الجلسة الحالية بتشغيل Workflow. `/workflow deactivate` يمسح الربط.
-
-**أنماط الفشل:**
-- الهدف المفقود يرجع نص الاستخدام.
-- المهارة غير المعروفة ترجع خطأ واضحاً.
-- يُرفض التوجيه لتشغيلات Workflow في حالات نهائية.
-- إعادة المحاولة تعمل فقط إذا كان `idempotent` أو `safeToRetry` صحيحاً وتحت `maxRetries`.
-- التخطي يعمل فقط إذا لم يبدأ الخطوة وكان `allowSkipIfSkippable` صحيحاً.
-- Workflow begin لا ينفذ automatic workflow promotion، ولا complex-request detection، ولا سلوك Agent Evolution، ولا إنشاء Workflow تلقائياً من اختيار المهارة العادي داخل AgentLoop. خيار `--skill` اشتراك صريح. `--use-selected-playbook` غير مدعوم.
+**السلوك:** ينشئ `/task begin` مهمة متحفظة ويربطها بالجلسة النشطة. يبدأها المسار الافتراضي فورًا في عملية EstaCoda التفاعلية، ثم يمكن للبوابة متابعتها لاحقًا. يرسل `--background` المهمة إلى البوابة منذ البداية. تفصل الحالة بين دورة الحياة وملكية التنفيذ الحالية (`foreground` أو `background` أو `waiting`) وتعرض جاهزية المتابعة بصورة محدودة من دون هوية المالك. تتطلب القراءة داخل الجلسة رابطاً بين المهمة والجلسة، وتتطلب تغييرات دورة الحياة رابط المنشئ.
 
 ---
 

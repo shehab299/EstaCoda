@@ -1,16 +1,16 @@
 import type { ChannelKind } from "../contracts/channel.js";
 import type { DelegateRole, DelegationConfig } from "../contracts/delegation.js";
-import type { RuntimeEventSink } from "../contracts/runtime-event.js";
+import type { RuntimeEvent, RuntimeEventSink } from "../contracts/runtime-event.js";
 import type { SessionDB } from "../contracts/session.js";
 import type { AgentLoopResponse } from "../runtime/agent-loop.js";
 import type { ChildAgentLoopRuntime } from "../runtime/agent-loop-factory.js";
-import type { DelegationSummary } from "./delegation-manager.js";
 import type { SubagentRegistry } from "./subagent-registry.js";
 import {
   type DelegationDiagnosticResult,
   writeDelegationDiagnostic
 } from "./delegation-diagnostics.js";
 import {
+  createDelegationAssistantPreviewRelay,
   createDelegationProgressRelay,
   type DelegationProgressSummary
 } from "./progress-relay.js";
@@ -38,7 +38,13 @@ export type ChildRunnerInput = {
   taskIndex?: number;
   batchTaskCount?: number;
   batchId?: string;
+  taskId?: string;
+  stepId?: string;
+  attemptId?: string;
   parentOnEvent?: RuntimeEventSink;
+  prompt?: string;
+  inputMetadata?: Record<string, unknown>;
+  onHeartbeat?: () => void;
   now?: () => Date;
 };
 
@@ -62,32 +68,63 @@ export type ChildRunnerResult =
 
 export async function runDelegatedChild(input: ChildRunnerInput): Promise<ChildRunnerResult> {
   const state = createActivityState(input.now);
-  const prompt = delegatedPrompt(input.task, input.context);
+  const prompt = input.prompt ?? delegatedPrompt(input.task, input.context);
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let heartbeatId: ReturnType<typeof setInterval> | undefined;
   let staleDiagnosticWritten = false;
   let timedOut = false;
   let cleanupRegistry = false;
-
-  const relay = createDelegationProgressRelay({
-    metadata: {
-      subagentId: input.subagentId,
-      childSessionId: input.childSessionId,
-      parentSessionId: input.parentSessionId,
-      role: input.role,
-      depth: input.depth,
-      taskIndex: input.taskIndex,
-      batchId: input.batchId,
-      taskLabel: input.task,
-      batchTaskCount: input.batchTaskCount ?? 1
-    },
-    parentOnEvent: input.parentOnEvent,
-    onActivity: (_event, summary) => {
-      state.record(summary);
-      input.subagentRegistry.updateSubagent(input.subagentId, {
-        lastActivityAt: state.lastActivityAt
-      });
+  const pulse = (): boolean => {
+    try {
+      input.onHeartbeat?.();
+      return true;
+    } catch {
+      if (!input.childAbortController.signal.aborted) {
+        input.childAbortController.abort("child-heartbeat-failed");
+      }
+      return false;
     }
+  };
+
+  if (!pulse()) {
+    return {
+      kind: "cancelled",
+      summary: "Child execution could not renew its owner heartbeat.",
+      lastActivityAt: state.lastActivityAt
+    };
+  }
+
+  const metadata = {
+    subagentId: input.subagentId,
+    childSessionId: input.childSessionId,
+    parentSessionId: input.parentSessionId,
+    role: input.role,
+    depth: input.depth,
+    taskIndex: input.taskIndex,
+    batchId: input.batchId,
+    taskLabel: input.task,
+    batchTaskCount: input.batchTaskCount ?? 1,
+    taskId: input.taskId,
+    stepId: input.stepId,
+    attemptId: input.attemptId
+  };
+  const onActivity = (_event: RuntimeEvent, summary: DelegationProgressSummary) => {
+    state.record(summary);
+    pulse();
+    input.subagentRegistry.updateSubagent(input.subagentId, {
+      lastActivityAt: state.lastActivityAt
+    });
+  };
+  const relay = createDelegationProgressRelay({
+    metadata,
+    parentOnEvent: input.parentOnEvent,
+    onActivity
+  });
+  const previewRelay = createDelegationAssistantPreviewRelay({
+    metadata,
+    parentOnEvent: input.parentOnEvent,
+    now: () => (input.now?.() ?? new Date()).getTime(),
+    onActivity
   });
 
   const timeoutMs = Math.max(1, input.delegationConfig.childTimeoutSeconds * 1_000);
@@ -95,11 +132,12 @@ export async function runDelegatedChild(input: ChildRunnerInput): Promise<ChildR
     timeoutId = setTimeout(() => resolve("timeout"), timeoutMs);
   });
 
-  const heartbeatMs = Math.max(1, input.delegationConfig.heartbeatSeconds * 1_000);
+  const heartbeatMs = finitePositiveMilliseconds(input.delegationConfig.heartbeatSeconds, 1_000);
   heartbeatId = setInterval(() => {
     void emitHeartbeat({
       input,
       state,
+      pulse,
       staleDiagnosticWritten,
       markStaleDiagnosticWritten: () => {
         staleDiagnosticWritten = true;
@@ -113,7 +151,8 @@ export async function runDelegatedChild(input: ChildRunnerInput): Promise<ChildR
     trustedWorkspace: input.trustedWorkspace,
     signal: input.childAbortController.signal,
     onEvent: relay,
-    inputMetadata: {
+    onDelta: previewRelay.push,
+    inputMetadata: input.inputMetadata ?? {
       delegated: true,
       parentSessionId: input.parentSessionId
     }
@@ -156,6 +195,7 @@ export async function runDelegatedChild(input: ChildRunnerInput): Promise<ChildR
     }
     throw error;
   } finally {
+    await previewRelay.flush();
     if (timeoutId !== undefined) {
       clearTimeout(timeoutId);
     }
@@ -171,40 +211,11 @@ export async function runDelegatedChild(input: ChildRunnerInput): Promise<ChildR
   }
 }
 
-export function timeoutDelegationSummary(input: {
-  childSessionId: string;
-  task: string;
-  summary: string;
-  role: DelegateRole;
-  depth: number;
-  batchId?: string;
-  taskIndex?: number;
-  allowedToolsets: DelegationSummary["allowedToolsets"];
-  allowedTools: DelegationSummary["allowedTools"];
-  child: ChildAgentLoopRuntime;
-  diagnostic?: DelegationDiagnosticResult;
-}): DelegationSummary {
-  return {
-    childSessionId: input.childSessionId,
-    status: "failed",
-    reason: "timeout",
-    task: input.task,
-    summary: input.summary,
-    role: input.role,
-    depth: input.depth,
-    batchId: input.batchId,
-    taskIndex: input.taskIndex,
-    allowedToolsets: input.allowedToolsets,
-    allowedTools: input.allowedTools,
-    effectiveAllowedToolsets: input.child.toolAccess.effectiveAllowedToolsets,
-    effectiveAllowedTools: input.child.toolAccess.effectiveAllowedTools,
-    strippedTools: input.child.toolAccess.strippedTools,
-    blockedTools: input.child.toolAccess.blockedTools,
-    rejectedRequestedTools: input.child.toolAccess.rejectedRequestedTools,
-    rejectedRequestedToolsets: input.child.toolAccess.rejectedRequestedToolsets,
-    toolExecutions: [],
-    diagnosticPath: input.diagnostic?.path
-  };
+function finitePositiveMilliseconds(seconds: number, fallbackMs: number): number {
+  const milliseconds = seconds * 1_000;
+  return Number.isFinite(milliseconds) && milliseconds > 0
+    ? Math.max(1, milliseconds)
+    : fallbackMs;
 }
 
 type ActivityState = {
@@ -250,10 +261,19 @@ function createActivityState(now: (() => Date) | undefined): ActivityState {
 async function emitHeartbeat(input: {
   input: ChildRunnerInput;
   state: ActivityState;
+  pulse: () => boolean;
   staleDiagnosticWritten: boolean;
   markStaleDiagnosticWritten: () => void;
 }): Promise<void> {
-  if (input.state.completed || input.state.stale) {
+  if (input.state.completed) {
+    return;
+  }
+
+  if (!input.pulse()) {
+    return;
+  }
+
+  if (input.state.stale) {
     return;
   }
 
@@ -273,16 +293,6 @@ async function emitHeartbeat(input: {
     return;
   }
 
-  await input.input.sessionDb.appendEvent(input.input.parentSessionId, {
-    kind: "delegation-heartbeat",
-    childSessionId: input.input.childSessionId,
-    activeChildCount: 1,
-    completedCount: 0,
-    failedCount: 0,
-    lastActivityAt: input.state.lastActivityAt,
-    taskIndex: input.input.taskIndex,
-    batchId: input.input.batchId
-  });
 }
 
 async function writeTimeoutDiagnostic(

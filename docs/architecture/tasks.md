@@ -1,0 +1,174 @@
+---
+title: "Durable Task foundation"
+description: "Profile-owned Task persistence, results, scheduling, and isolated agent execution."
+---
+
+# Durable Task foundation
+
+EstaCoda's durable execution records use the Task domain model:
+
+```text
+Task
+├── Host lease
+└── PlanRevision
+    └── Step
+        └── Attempt
+            ├── Lease
+            ├── Approval link
+            └── Result
+
+Provider request ledger
+├── visible turn → session
+└── optional Attempt → Step → Task → root Task
+```
+
+This document describes the persistence, result, scheduler, agent-execution, background-host, delegation, and operator-control foundation currently present in the codebase. The profile gateway supervisor runs a durable Task tick beside cron and channel work, recovers abandoned Attempts after restart, and delivers terminal results through a fail-closed completion outbox. Trusted users can create Tasks through `estacoda task`, `/task`, and `delegate_task`.
+
+## Source of truth
+
+- `src/contracts/task.ts` defines the durable records, legal state transitions, authority and budget policies, and deterministic graph validation.
+- `src/tasks/task-schema.ts` owns SQLite schema version 20.
+- `src/tasks/task-store.ts` defines the profile-bound storage contract.
+- `src/tasks/sqlite-task-store.ts` implements transactional SQLite persistence.
+- `src/tasks/task-result-service.ts` stores bounded result bodies under the selected profile and verifies them before reads.
+- `src/tasks/fixed-task-service.ts` creates immutable initial graphs idempotently and records authorized Task steering.
+- `src/tasks/task-step-executor.ts` defines the narrow Attempt execution and settlement contract.
+- `src/tasks/agent-step-executor.ts` runs one agent Attempt in an isolated child session under narrowed authority.
+- `src/providers/provider-usage-ledger.ts` builds and projects the canonical provider-request records used by ordinary turns and Task workers.
+- `src/providers/provider-usage-estimator.ts` applies full-precision, cache-aware pricing from the exact resolved route.
+- `src/tasks/task-agent-usage.ts` adapts canonical projections to Task budget totals and provides a bounded fallback for injected executors.
+- `src/tasks/task-approval-service.ts` narrows runtime policy with Task authority and bridges asks to the durable gateway approval queue.
+- `src/tasks/task-scheduler.ts` owns deterministic readiness, dispatch, fencing, retry, cancellation, acceptance, and restart reconciliation.
+- `src/tasks/task-background-host.ts` prevents overlapping scheduler/delivery ticks and performs one-time startup recovery.
+- `src/tasks/supervisor-task-background-host.ts` lazily creates the workspace-eligible agent runtime when runnable work exists.
+- `src/tasks/task-completion-delivery.ts` owns authorized, terminal-only completion delivery.
+- `src/tasks/task-workspace.ts` derives the canonical workspace identity shared by Task creation and hosts.
+- `src/tasks/task-artifact-content.ts` constrains artifact capture to reviewed workspace/profile roots.
+- `src/tasks/task-operator-service.ts` owns profile-bound status and lifecycle controls with explicit session authorization.
+- `src/ui/papyrus/operator-console/taskSurface.ts` renders retained cards and modal inspection exclusively from that bounded projection; it does not query raw session or tool records.
+- `src/cli/task-commands.ts` exposes deterministic local CLI and in-session Task controls.
+- `src/tools/task-tools.ts` exposes the bounded, read-only `task.status` tool.
+- `src/tools/task-result-tools.ts` exposes authorized, paged `task.result.read` access.
+- `src/session/sqlite-session-db.ts` runs the migration and enables SQLite foreign-key enforcement.
+
+There is one durable persistence model. Schema version 10 drops obsolete pre-Task execution tables instead of attempting to infer Task authority, immutable plan revisions, Attempts, workspace bindings, or profile ownership from incompatible records.
+
+## Profile isolation
+
+Every durable record carries `profile_id`. A `SQLiteTaskStore` cannot be constructed without a profile, every query includes that profile, and composite foreign keys repeat the ownership boundary in SQLite. Sessions, trajectories, parent Tasks, parent Attempts, Steps, Results, Events, and links cannot be attached across profiles.
+
+Bounded Task reads apply Task IDs, linked-session authorization, workspace identity, execution preference, root origin, and status predicates inside SQLite before `LIMIT`. Stable `(timestamp, Task ID)` keyset cursors page oldest-first scheduling scans without offset drift. Hosts inspect at most one admission page per tick and carry the cursor forward; their bounded dispatch-grant window rotates when ownership exceeds one page. The scheduler queries only the currently fenced Task IDs, orders runnable work by immutable creation time, and pages the complete active-Attempt set when enforcing profile capacity. Thus unrelated or newer rows cannot hide an authorized older Task, while a large queue cannot turn one host tick into an unbounded scan.
+
+Opaque Task and session identifiers are routing keys, not authorization boundaries.
+
+## Transaction and graph invariants
+
+- A Task, its first PlanRevision, Steps, dependencies, creator-session link, and any inherited origin-observer link can be inserted in one `begin immediate` transaction.
+- Creation events are journaled in that same transaction, with deterministic ordering and no raw objective or result content.
+- Failed graph writes roll back completely.
+- Plan definitions are immutable after insertion. Replanning creates a new PlanRevision.
+- Task creation keys and Attempt dispatch keys have separate profile-scoped uniqueness constraints.
+- Only one PlanRevision can be active for a Task.
+- Attempt leases are stored separately. Acquisition is one conditional SQLite mutation, and a persisted generation issues a strictly increasing fencing token whenever the same Attempt resumes.
+- Task host leases are separate from Attempt leases. They grant one foreground or background runtime exclusive, expiring scheduling ownership for a profile/workspace-bound Task, while a persisted Task generation prevents stale fence reuse after expiry or release.
+- Scheduler graph mutations are serialized by short `begin immediate` transactions; Attempt leases and fencing are the sole execution-concurrency authority.
+- Event metadata and Result sizes are bounded before persistence.
+- A Step's available Results cannot exceed its declared aggregate result budget.
+- SQLite check constraints reject unknown states, invalid JSON, negative sizes, invalid attempt numbers, and self-dependencies.
+
+## Durable result plane
+
+SQLite stores Result identity, ownership, opaque handle, byte length, MIME type, and SHA-256 digest. Raw result bodies are never stored in SQLite events or ordinary diagnostics. Content is written under `~/.estacoda/profiles/<id>/tasks/results/` with private directory and file permissions; filenames are hashes of opaque handles and never appear in tool output.
+
+Every Result has an immutable disposition. `accepted` Results are successful Step output and may satisfy dependency reads. `diagnostic` Results are safe output recovered from a failed Attempt: they remain session-authorized and inspectable, but never complete a Step, satisfy a dependency, become the primary synthesis Result, or enter synthesis context. Task surfaces label them **Recovered output** and warn that the body may be incomplete. Approval-denied or policy-blocked content is not published, and output associated with mutating or privileged tool activity is excluded from automatic recovery.
+
+Result creation first writes and verifies private prepared bodies without publishing metadata or handles. Provider requests are already present in the canonical ledger when Attempt settlement begins. Successful settlement verifies that attribution, inserts the complete Result batch, and writes Attempt, Step, and Task state in one fenced SQLite transaction. A failed transaction removes every prepared body, so downstream Steps cannot observe a partial batch. Private preparation markers let supervisor startup remove bodies abandoned before commit while preserving bodies whose metadata committed before marker cleanup. Reads verify the stored byte length and digest, reject symlinks and non-regular files, and fail closed when content is missing or modified.
+
+`task.result.read` requires both the Task and Result IDs. The active session must have a profile-owned `TaskSessionLink` to that Task. Access survives transcript-preserving compaction only when every lineage hop has the same profile, a matching `parentSessionId` and `compactedFromSessionId`, and a parent ended for compression; ordinary parent/child session relationships grant nothing. Missing, cross-profile, and unauthorized records share the same error. Text and JSON are returned in bounded Unicode-character pages; binary artifacts remain durable but are not transported through a text tool. Read metadata includes the Result disposition and an explicit warning for diagnostic output. Pruned and expired Results are unavailable.
+
+Interactive CLI Tasks that have one terminal answer use the same durable
+completion outbox as external delivery, with a local `cli` destination bound to
+the creator session. The CLI consumer accepts only that session or its verified
+compression descendants, reads the accepted synthesis Result (or the sole
+accepted Result for an operator-created single-Step Task), and appends one
+deterministically identified `agent` message to the active transcript. Local
+claims are safely retryable, and the CLI acknowledges the outbox only after it
+has written the ordinary assistant response. A crash cannot duplicate the
+transcript message; an unacknowledged terminal display may be replayed after
+the stale-claim window. External delivery workers ignore local bindings. This
+keeps the final answer in subsequent model context without exposing
+intermediate or diagnostic Results.
+
+## Scheduler core
+
+`TaskScheduler.dispatchOnce()` performs one bounded reconciliation and dispatch pass. It derives ready Steps from completed dependencies, creates deterministic dispatch keys, acquires fenced Attempt leases, starts available executors within profile, Task-tree, Task, executor, and provider concurrency limits, and returns a durable dispatch confirmation without waiting for provider or tool execution to finish. Hosts may restrict the pass to the exact Task IDs for which they already hold scheduling ownership; reconciliation and dispatch leave every other Task untouched. The returned completion promise reports settlement for the independently running batch. `runOnce()` remains the completion-waiting compatibility surface used by the current gateway host. Every agent Attempt reserves at least one provider call for budget enforcement even if an executor reports incomplete usage.
+
+Executors return settlements; they cannot declare a Step or Task complete. The scheduler caps each running Attempt at the earliest remaining Task, Step, or ancestor wall-clock deadline and delivers an abort signal at that boundary. It also validates required result kind and presence, prepares result bodies through the fenced durable result plane, validates aggregate Task-tree and owning Step-subtree usage and wall-clock budgets, and atomically publishes Results while settling the Attempt, logical Step, and Task update. Output returned after a deadline is retained only as a diagnostic Result; it cannot satisfy a dependency or become primary. Retry classification is deterministic: failure-class policy, attempt limits, backoff, idempotency, and uncertain side effects are evaluated before a Step can return to `ready`.
+
+Runtime child creation writes an immutable `task_budget_reservations` row in the same transaction as the child graph. Provider-call, token, and estimated-cost reservations are additive across repeated child calls, so descendants divide the parent Step and Task ceilings instead of multiplying them. Root delegation wall time is capacity-aware: it budgets `ceil(worker count / effective concurrency)` worker waves, one additional allowance when synthesis is present, and a scheduling allowance capped at 30 seconds. Wall-clock and concurrency are hard lineage ceilings: a child cannot request broader limits, and its worker waves plus synthesis divide the inherited wall-clock ceiling without adding slack. The scheduler counts live Attempts against the root Task's concurrency while enforcing every ancestor deadline. Status projections aggregate canonical provider usage across the requested Task and all descendants.
+
+Cancellation is durable on the Attempt lease and visible to its owner on heartbeat. Local work also receives an `AbortSignal`. The scheduler-owned lease guard starts before asynchronous executor work, schedules its first renewal within a bounded jittered interval, and is independent of child activity. After a local abort it renews for only a bounded shutdown grace; after a heartbeat write failure it retries for no longer than the remainder of the last successfully persisted lease. A stale owner cannot write results or settle after expiry, cancellation, or fencing loss. Restart reconciliation preserves unexpired foreign leases, expires or interrupts abandoned Attempts, and records the fencing generation, last successful heartbeat, expiry, detection time, and heartbeat failure reason before retrying only when policy permits. Terminal Task state is reconstructed from durable Step state; the scheduler can produce `completed`, `partial`, `failed`, and `cancelled` outcomes without provider inference.
+
+Process shutdown first closes scheduler admission so no new Steps can be claimed and gives already-dispatched work a bounded opportunity to settle normally. An Attempt that has not started, or whose Step is explicitly `idempotent` or `retry_safe`, receives a dedicated handoff abort and is atomically requeued with its checkpoint and provider-usage history; its Attempt lease is released and the Task moves to `waiting_for_host`. Started `unknown` and `non_idempotent` work is instead terminalized as an interrupted Attempt and the Step and Task move to `waiting_for_input`, because execution may already have produced side effects. Only an explicit operator retry creates its next Attempt. The foreground process releases its Task host lease only after that durable transition and then disposes its runtime. A late foreground settlement cannot publish through the released fence.
+
+An approval ask is a normal non-terminal settlement. The scheduler records a profile- and Attempt-owned approval link, moves the Attempt, Step, and Task to `waiting_for_approval`, and releases the lease. Interactive and gateway hosts project that link into the same global SQLite approval queue, scoped to the Task creator session. Queue insertion uses the durable link ID as an idempotency key, so a crash between insertion and link update cannot create a second prompt. While the creator session is active in the interactive CLI, its pending Task links appear in the existing Operator Console approval surface with only bounded tool, target, risk, and Task-handle metadata. Approval controls are deliberately limited to approve once or reject; they do not create session or persistent grants. Resolution requires the exact profile and creator session, and the foreground host immediately runs another scheduler pass so an approval resumes the same Attempt or a rejection settles the Task. Switching to another session hides the approval without changing it. Approval returns the same Attempt to `queued`; the next acquisition receives a higher fencing token. Denial or expiry fails the waiting work without executing the gated tool. Waiting Attempts intentionally hold no lease and consume no concurrency slot.
+
+## Agent Step executor
+
+`AgentStepExecutor` adapts the existing child-agent factory and runner to the durable Attempt contract; it does not create a parallel delegation lifecycle. Before constructing a child, it verifies the Task, Step, Attempt, profile, exact workspace binding, creator session, and current workspace trust. The scheduler resolver receives both Task and Step so a future host can expose the executor only for workspace-eligible work without embedding delegation or runtime policy in the scheduler.
+
+Task and Step authority are intersected with the parent session's visible tools. Blocked tools, forbidden risk classes, and non-shared toolsets are removed. Every Step also has an immutable child policy: `forbid` or `fire_and_forget`. Worker Steps are always `forbid`; only a reviewed orchestrator Step with child-creation authority and remaining depth may be `fire_and_forget`. Worker depth is derived from the validated durable Task/Attempt ancestry and propagated unchanged to session, registry, progress, and diagnostic metadata; invalid ancestry fails closed rather than falling back to depth one. A runtime-created child can therefore never become an undeclared dependency of the active PlanRevision, and parent settlement does not wait for explicitly detached children. Required fan-out and synthesis must be declared in the initial fixed graph until governed PlanRevision changes exist. Authorized write and side-effect tools remain available, but Task authority can only narrow the active runtime security policy: a runtime denial remains a denial, `forbid` denies, and `require_approval` creates a durable ask. An approval is bound to the creator session, Attempt, tool, risk class, and SHA-256 target fingerprint; it cannot become a general grant or override the hardline floor.
+
+`delegate_task` uses that fixed pattern by default for batches: independent worker Steps fan out in revision 1, and one `synthesis` agent Step depends on every worker. A synthesis object customizes the final-answer objective/model; `synthesis: false` explicitly requests inspection-only work. Dependency context contains bounded opaque accepted-Result handles, and synthesis receives only `task.result.read` authority. Synthesis waits for every worker to settle. If at least one completed worker published an accepted Result, it may proceed with a bounded coverage manifest and must disclose failed, cancelled, skipped, or missing work; diagnostic Results remain inspection-only. If no accepted worker Result exists, synthesis is skipped. The Step survives process restart as ordinary durable graph state and cannot create nested Tasks. Its accepted Result is projected first and marked primary; completion delivery expands that Result rather than replaying every intermediate body.
+
+Every Task persists its root Task, parent Task and Attempt when present, origin session, and stable origin-turn/call attribution when available. Descendants inherit this lineage unchanged. New child creation is authorized by the exact live parent Attempt lease generation and fails closed after expiry, cancellation, or fencing loss; an exact idempotent replay may return an existing child without creating or reserving anything again. Child creation atomically links the original session as an observer, so the originating user can inspect child handles and statuses even though the worker session remains the child's creator and approval root.
+
+The child session is marked `task-step-worker` and carries Task, PlanRevision, Step, and Attempt ownership metadata. Its session is checkpointed under the current fencing token before provider work begins. Once the child trajectory is durably present, that trajectory is checkpointed under the same fence. These checkpoints renew the lease, create the worker `TaskSessionLink`, append a bounded `attempt-progressed` event, and cannot be replaced by a later checkpoint or settlement.
+
+The child runner sends progress through the normal runtime event sink while its heartbeat renews the Attempt lease. The Task journal is the sole durable lifecycle authority. Durable cancellation aborts the child; timeouts and provider, approval, security, tool, JSON, and artifact-capture failures return bounded classifications to the scheduler.
+
+Successful text and JSON results are captured in full. A Result producer may also persist a dedicated `displaySummary`: presentation-ready, single-line plain text capped at 480 Unicode characters and immutable with the Result. Agent Steps deliberately lead text Results with a concise plain-language paragraph and persist its bounded extract in that field. The older generic `summary` metadata remains readable and is used only as a safe extractive UI fallback when `displaySummary` is absent. Artifact bodies are accepted only through an injected, bounded resolver and must match the artifact's declared byte count before the scheduler writes them to the result plane. Dependency context contains bounded accepted-result metadata plus exact `task_id` and `result_id` read inputs, never raw bodies, diagnostic Results, or filesystem paths; the child reads authorized content through `task.result.read`. Authorized steering is stored outside the conversation transcript and injected as bounded context at safe Attempt boundaries, so transcript compaction or terminal closure cannot discard it. Guidance is user context, not policy: it cannot override Task authority, repository instructions, or runtime security.
+
+Usage is one profile-owned, append-only provider-request ledger for ordinary turns and Task workers. Every row uses the persisted user-message ID as its visible turn, a deterministic request key, the exact resolved provider/model route, route role and attempt index, dispatch time, input/output/reasoning/cache-read/cache-write tokens, full-precision known estimated cost, and explicit usage/pricing completeness. Optional root Task, Task, PlanRevision, Step, and Attempt fields provide durable worker attribution. Initial calls, continuations, fallbacks, retries, and failed requests that reached an adapter are included; preflight failures that never dispatched are excluded. Deterministic keys make runtime replay and approval resume idempotent. The same rows project to Attempt, Step, Task subtree, visible turn, or session—there is no separate delegation-cost or session-cost ledger.
+
+Turn and session UX reads projections rather than maintaining counters. A
+session projection includes direct requests from the current session and its
+verified transcript-compression ancestors, plus root Task trees whose immutable
+origin session is in that lineage. It does not follow ordinary session parents
+or worker/delegation parents. Request keys are deduplicated across the direct
+and Task queries. Complete pricing is approximate, partial known pricing is a
+lower bound, and a projection with no usable price is unavailable.
+
+## Background host and restart recovery
+
+An interactive CLI process creates one dedicated foreground Task runtime for its profile and workspace. It is independent of the active conversation runtime, so session switching, model refresh, and ordinary turn completion do not dispose Task workers. An immutable `auto` execution preference invokes the process activation hook after graph commit; the hook acquires the Task host lease and waits only for the first durable dispatch confirmation. An explicit `background` preference bypasses foreground admission and leaves the profile gateway to claim the Task from the beginning. Remote gateway creation defaults to `background`; local interactive creation defaults to `auto`. The host heartbeats ownership, keeps scheduling its exact owned Task set, and automatically advances fixed dependency graphs such as fan-out followed by synthesis. Delegated leaf and synthesis Steps are marked `retry_safe` only when their persisted authority permits no child Tasks and exposes no risk classes beyond read-only local or network access. Orchestrators and any authority that can mutate shared state remain `unknown`. Automatic recovery for delegated Steps is limited to lease expiry or loss; ordinary provider and tool failures do not become automatic retries. On startup the foreground host may recover compatible runnable `auto` Tasks with expired foreground ownership, but it never claims `background` Tasks.
+
+The selected profile's gateway supervisor remains the persistent background host. It runs even when no channel adapter is configured, so service mode is a general background host for Tasks and cron rather than a cron-only process. Each supervisor tick starts at most one Task pass; overlapping ticks are skipped. Before ownership, the gateway resolves each Task's persisted canonical path, requires the live canonical path and identity hash to match exactly, and rechecks workspace trust. Only then may it acquire and heartbeat a fenced background Task host lease. Executor runtimes are created lazily and isolated per verified workspace, with new workspace-runtime admission capped by the scheduler's remaining profile Attempt capacity, so queued work cannot construct an unbounded runtime set before dispatch. Oldest-first keyset admission and a rotating bounded grant window ensure work beyond the first page is eventually considered without scanning the entire queue on every tick. One profile gateway can continue Tasks from several workspaces without routing a Task through the gateway launch directory or another workspace's tools. Identity mismatch, missing workspaces, and untrusted workspaces remain unclaimed; trust is checked again at runtime creation and by the executor before each Attempt. A live foreground lease excludes that Task; after graceful foreground release or lease expiry, the gateway acquires the next generation and resumes the saved Attempt through its original open worker session. Terminal Tasks release background ownership and their now-unused workspace runtime is disposed. A failed disposal retains the runtime reference, removes its executor from admission, records a bounded warning, and retries on a later tick or shutdown; gateway shutdown also reports and retries its first Task-host disposal failure. Shutdown drain waits for active Task work as well as channel turns, and the shared session database remains open until active Task/finalization work settles.
+
+The host is cheap while idle. It constructs a full agent runtime only when a queued, running, or `waiting_for_host` Task exists for a verified workspace. `createRuntime()` exposes an `AgentStepExecutor` only when backed by the profile SQLite database. Each executor is bound to one canonical workspace identity and rechecks workspace trust immediately before every Attempt. A Task whose persisted workspace cannot be verified remains unclaimed; the host never rewrites its workspace binding or widens its authority.
+
+Startup reconciliation stays scheduler-owned. The Task host removes abandoned prepared Result bodies before dispatch, then expired or abandoned Attempt leases are reconciled from durable state while current foreign leases are preserved. The scheduler is the only component that may settle an Attempt, Step, or Task, so a process disconnect or restart cannot manufacture success from an incomplete child run.
+
+Gateway state records the Task and cron hosts as `starting` or `running`. `estacoda gateway status` shows those services plus bounded foreground-owned, background-owned, waiting-for-host, and preference counts. Task projections derive ownership only from an unexpired fenced host lease; the lifecycle status is not treated as proof of execution.
+
+## Authorized completion delivery
+
+Completion delivery is a profile-owned SQLite outbox linked to both a Task and a session already authorized through `TaskSessionLink`. A binding records one explicit channel destination and a profile/Task-scoped delivery key. It can be claimed only after the Task reaches `completed`, `partial`, `failed`, or `cancelled`.
+
+Interactive CLI delegation creates this local binding for a default single-worker answer and for a batch synthesis answer. Both flow through the same deterministic assistant-message append and display acknowledgement. Explicit `synthesis: false` work remains inspection-only. A terminal Task without an accepted single-worker or synthesis answer settles the local binding as unavailable once; it does not retry automatically and diagnostic output is never substituted for an answer.
+
+Delivery renders bounded Task status and durable Results. Text/JSON bodies are read through `TaskResultService` using the authorized session; artifacts are represented by opaque handles and summaries, never local paths. Transport errors are reduced to bounded static failure metadata so provider, adapter, or user content is not copied into the outbox.
+
+External delivery is deliberately at-most-once after ambiguity. A crash or transport exception may occur after an adapter accepts a message but before the process records success. Those bindings are marked `delivery-outcome-unknown` and cannot be retried through the delivery service. Startup recovery isolates each interrupted binding: one row that cannot be settled contributes a bounded failure count and operator warning but cannot prevent healthy binding recovery, Task scheduling, or later delivery work. Confirmed transport rejection and pre-send rendering failure remain failed until an explicit retry call resets the binding; nothing retries automatically. This preserves a reviewable retry path without turning uncertain delivery into duplicate external messages.
+
+## Migration behavior
+
+Opening a writable `SQLiteSessionDB` migrates it to schema version 25 under the existing migration lock and transaction. Versions 10–20 establish Task persistence, fenced scheduling, durable approvals and steering, child governance, canonical usage, host ownership, and immutable execution preference. Version 21 completes provider-usage identity and attribution; version 22 adds immutable Task/session spending policy and execution limits; version 23 adds crash-safe provider-spend reservations; version 24 adds immutable accepted-versus-diagnostic Result disposition; version 25 adds optional immutable Result display summaries without rewriting legacy metadata. The migrations preserve unrelated session, message, trajectory, approval, cron, finalization, and memory-curation data. A best-effort pre-migration backup is created by the session database migration runner.
+
+The cutover migration is intentionally destructive only for obsolete execution tables. There is no dual-read, dual-write, compatibility alias, or alternate store.
+
+## Current boundary
+
+Durable Tasks can be created by trusted local operator commands or `delegate_task`, recovered, dispatched by an eligible workspace host, inspected through bounded status/result surfaces, and delivered through an authorized binding. Worker sessions cannot authorize lifecycle mutations, steering, or delivery. In-session reads require a Task/session link; operator mutations require the creator link. Task controls do not bypass workspace trust, runtime security, approval, authority, budget, profile, or result-access boundaries.
+
+Schema version 20 backs foreground-first execution, explicit direct-background admission, and background takeover. The interactive process acquires and heartbeats foreground ownership for `auto` Tasks; the profile gateway validates the Task's own workspace and either owns `background` Tasks from the beginning or acquires a later generation after an `auto` foreground lease is released or expires. Graceful shutdown immediately requeues only unstarted, `idempotent`, or `retry_safe` work. Started `unknown` or `non_idempotent` work pauses for operator review, and ungraceful crash recovery applies the same uncertain-side-effect boundary after Attempt and host lease expiry. Approval-waiting Tasks remain host-claimable. If no gateway is running—or the Task workspace is unavailable, changed, or untrusted—the Task and any pending approval remain durable and every bounded UX surface reports execution as waiting without exposing owner identities.

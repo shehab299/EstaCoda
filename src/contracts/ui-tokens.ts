@@ -21,6 +21,18 @@ export interface TokenSeverity {
   info: string;
 }
 
+export interface TokenTrace {
+  terminal: string;
+  search: string;
+  plan: string;
+  read: string;
+  edit: string;
+  answer: string;
+  wait: string;
+  finish: string;
+  failed: string;
+}
+
 export interface TokenSurface {
   bg: string;
   bgElevated: string;
@@ -33,6 +45,7 @@ export interface TokenText {
   primary: string;
   secondary: string;
   muted: string;
+  placeholder: string;
   inverse: string;
   agentMessage: string;
 }
@@ -44,13 +57,30 @@ export interface TokenInteractive {
   selectedBg: string;
 }
 
-export interface TokenSpinner {
-  waiting: readonly string[];
-  thinking: readonly string[];
-  tool: readonly string[];
-  worker: readonly string[];
-  background: readonly string[];
+export const SEMANTIC_MOTION_TOKENS = [
+  "waiting",
+  "thinking",
+  "routing",
+  "tool",
+  "worker",
+  "finalizing",
+  "background",
+] as const;
+
+export type SemanticMotionToken = (typeof SEMANTIC_MOTION_TOKENS)[number];
+
+export interface TokenMotionDefinition {
+  readonly frames: readonly string[];
+  readonly cadenceMs: number;
+  /** Theme-owned foreground color for this motion token. */
+  readonly color: string;
 }
+
+export type TokenMotion = Readonly<Record<SemanticMotionToken, TokenMotionDefinition>>;
+
+export type TokenMotionOverlay = {
+  readonly [Token in SemanticMotionToken]?: Partial<TokenMotionDefinition>;
+};
 
 export interface TokenGlyph {
   prompt: string;
@@ -60,11 +90,16 @@ export interface TokenGlyph {
   check: string;
   cross: string;
   arrow: string;
-  spinner: TokenSpinner;
   progress: {
     filled: string;
     empty: string;
     thumb: string;
+  };
+  trace: {
+    event: string;
+    selected: string;
+    live: string;
+    earlier: string;
   };
 }
 
@@ -86,9 +121,11 @@ export interface TokenBehavior {
 export interface UiTokenContract {
   readonly palette: TokenColors;
   readonly severity: TokenSeverity;
+  readonly trace: TokenTrace;
   readonly surface: TokenSurface;
   readonly text: TokenText;
   readonly interactive: TokenInteractive;
+  readonly motion: TokenMotion;
   readonly glyph: TokenGlyph;
   readonly toolIcon: Readonly<Record<string, string>>;
   readonly branding: TokenBranding;
@@ -97,14 +134,19 @@ export interface UiTokenContract {
 
 // A partial set of overrides that a skin or mode can apply.
 export type TokenOverlay = Partial<
-  Omit<UiTokenContract, "palette" | "severity" | "surface" | "text" | "interactive" | "glyph" | "toolIcon" | "branding" | "behavior">
+  Omit<UiTokenContract, "palette" | "severity" | "trace" | "surface" | "text" | "interactive" | "motion" | "glyph" | "toolIcon" | "branding" | "behavior">
 > & {
   palette?: Partial<TokenColors>;
   severity?: Partial<TokenSeverity>;
+  trace?: Partial<TokenTrace>;
   surface?: Partial<TokenSurface>;
   text?: Partial<TokenText>;
   interactive?: Partial<TokenInteractive>;
-  glyph?: Partial<TokenGlyph>;
+  motion?: TokenMotionOverlay;
+  glyph?: Partial<Omit<TokenGlyph, "progress" | "trace">> & {
+    progress?: Partial<TokenGlyph["progress"]>;
+    trace?: Partial<TokenGlyph["trace"]>;
+  };
   toolIcon?: Readonly<Record<string, string>>;
   branding?: Partial<TokenBranding>;
   behavior?: Partial<TokenBehavior>;

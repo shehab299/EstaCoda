@@ -12,6 +12,7 @@ import {
   SessionFinalizationQueue,
   type SessionFinalizationQueueSummary,
 } from "../session/session-finalization-queue.js";
+import { SQLiteTaskStore } from "../tasks/sqlite-task-store.js";
 import { openDefaultSQLiteDatabase } from "../storage/factory.js";
 import { WorkspaceApprovalController } from "../security/workspace-approval-controller.js";
 import { GatewayApprovalQueue } from "../gateway/approval-queue.js";
@@ -175,11 +176,32 @@ export async function runGatewayStatus(
   let executionStore: CronExecutionStore | undefined;
   let executionDb: { close(): void } | undefined;
   let sessionFinalization: SessionFinalizationQueueSummary | undefined;
+  let durableTasks: GatewayStatusData["durableTasks"];
   try {
     const sessionDb = await createSQLiteSessionDB({ path: globalPaths.sessionsSqlitePath });
     executionDb = sessionDb;
     executionStore = new CronExecutionStore({ db: sessionDb.db });
     sessionFinalization = new SessionFinalizationQueue({ db: sessionDb.db }).summarize(selected.profileId);
+    const taskStore = new SQLiteTaskStore({ db: sessionDb.db, profileId: selected.profileId });
+    const tasks = taskStore.listTasks({ limit: 1_000 });
+    const activeTasks = tasks.filter((task) => !["completed", "partial", "failed", "cancelled"].includes(task.status));
+    const activeTaskIds = new Set(activeTasks.map((task) => task.id));
+    const now = Date.now();
+    const activeLeases = taskStore.listTaskHostLeases({ limit: 1_000 })
+      .filter((lease) => activeTaskIds.has(lease.taskId) && Date.parse(lease.expiresAt) > now);
+    const leasedTaskIds = new Set(activeLeases.map((lease) => lease.taskId));
+    durableTasks = {
+      active: activeTasks.length,
+      queued: tasks.filter((task) => task.status === "queued").length,
+      running: tasks.filter((task) => task.status === "running").length,
+      waiting: tasks.filter((task) => task.status.startsWith("waiting_")).length,
+      terminal: tasks.filter((task) => ["completed", "partial", "failed", "cancelled"].includes(task.status)).length,
+      foregroundOwned: activeLeases.filter((lease) => lease.kind === "foreground").length,
+      backgroundOwned: activeLeases.filter((lease) => lease.kind === "background").length,
+      waitingForHost: activeTasks.filter((task) => !leasedTaskIds.has(task.id)).length,
+      autoPreference: activeTasks.filter((task) => task.executionPreference === "auto").length,
+      backgroundPreference: activeTasks.filter((task) => task.executionPreference === "background").length
+    };
   } catch { /* ignore */ }
 
   let recentCronFailures: Awaited<ReturnType<CronExecutionStore["recentFailures"]>> = [];
@@ -265,6 +287,7 @@ export async function runGatewayStatus(
             startedAt: state.startedAt,
             version: state.version,
             profileId: state.profileId ?? selected.profileId,
+            backgroundServices: state.backgroundServices,
           }
         : pidContent !== undefined
           ? {
@@ -279,6 +302,7 @@ export async function runGatewayStatus(
     runtimeState: runtimeStateValid ? runtimeState : undefined,
     runtimeCacheState: runtimeCacheStateTrustworthy ? rawRuntimeCacheState : undefined,
     sessionFinalization,
+    durableTasks,
   };
 
   const viewModel = buildGatewayStatusViewModel(data);

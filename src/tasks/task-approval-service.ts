@@ -1,0 +1,405 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { SecurityAssessment, SecurityPolicy, SecurityRequest } from "../contracts/security.js";
+import { assessSecurityPolicy } from "../contracts/security.js";
+import type { Task, TaskApprovalLink, TaskAttempt, TaskStep } from "../contracts/task.js";
+import { isTerminalTaskStatus } from "../contracts/task.js";
+import type { PendingApproval, PendingApprovalCreationOptions } from "../gateway/approval-queue.js";
+import type { TaskStore } from "./task-store.js";
+
+type ApprovalQueue = {
+  createPendingApproval(
+    approval: Omit<PendingApproval, "id" | "status">,
+    options?: PendingApprovalCreationOptions
+  ): Promise<PendingApproval>;
+  getApproval(id: string, scope: { profileId: string; sessionId?: string }): Promise<PendingApproval | undefined>;
+  resolveApproval(
+    id: string,
+    decision: "approved" | "denied",
+    resolvedBy: string,
+    scope: { profileId: string; sessionId?: string }
+  ): Promise<void>;
+};
+
+export type TaskApprovalRequest = {
+  toolName: string;
+  riskClass: TaskApprovalLink["riskClass"];
+  targetFingerprint: string;
+  targetPreview: string;
+};
+
+export type PendingTaskApproval = {
+  approvalId: string;
+  taskId: string;
+  stepId: string;
+  attemptId: string;
+  authorizedSessionId: string;
+  toolName: string;
+  riskClass: TaskApprovalLink["riskClass"];
+  targetPreview: string;
+  requestedAt: string;
+  expiresAt: string;
+};
+
+export type TaskApprovalResolution = {
+  approvalId: string;
+  taskId: string;
+  decision: "approved" | "denied";
+};
+
+export type TaskApprovalServiceOptions = {
+  store: TaskStore;
+  queue?: ApprovalQueue;
+  now?: () => Date;
+  id?: () => string;
+  ttlMs?: number;
+};
+
+const DEFAULT_APPROVAL_TTL_MS = 24 * 60 * 60 * 1_000;
+const TASK_QUERY_ID_SCOPE_LIMIT = 900;
+
+/** Bridges an in-process security ask to the shared durable, session-authorized approval queue. */
+export class TaskApprovalService {
+  readonly #store: TaskStore;
+  readonly #queue: ApprovalQueue | undefined;
+  readonly #now: () => Date;
+  readonly #id: () => string;
+  readonly #ttlMs: number;
+  readonly #requests = new Map<string, TaskApprovalRequest>();
+  readonly #approvedRequests = new Map<string, TaskApprovalRequest[]>();
+
+  constructor(options: TaskApprovalServiceOptions) {
+    this.#store = options.store;
+    this.#queue = options.queue;
+    this.#now = options.now ?? (() => new Date());
+    this.#id = options.id ?? randomUUID;
+    this.#ttlMs = positiveInteger(options.ttlMs ?? DEFAULT_APPROVAL_TTL_MS, "Task approval TTL");
+  }
+
+  securityPolicyFor(
+    task: Task,
+    step: TaskStep,
+    attempt: TaskAttempt,
+    basePolicy: SecurityPolicy
+  ): SecurityPolicy {
+    const decide = (request: SecurityRequest) => {
+      const baseDecision = basePolicy.decide(request);
+      return this.#narrowDecision(task, step, attempt, request, baseDecision);
+    };
+    return {
+      decide,
+      assess: async (request) => {
+        const base = await assessSecurityPolicy(basePolicy, request);
+        const decision = this.#narrowDecision(task, step, attempt, request, base.decision);
+        // Persist one deterministic approval boundary at a time. A later replay can
+        // surface the next gated call after the first exact target is approved.
+        if (decision === "ask" && !this.#requests.has(attempt.id)) {
+          this.#requests.set(attempt.id, approvalRequest(request));
+        }
+        if (decision === "allow" && this.#matchingApproved(attempt.id, taskApprovalFingerprint(request)) !== undefined) {
+          const approved = this.#approvedRequests.get(attempt.id) ?? [];
+          approved.push(approvalRequest(request));
+          this.#approvedRequests.set(attempt.id, approved);
+        }
+        if (decision === base.decision) return base;
+        return taskAssessment(base, decision);
+      }
+    };
+  }
+
+  takeRequest(attemptId: string): TaskApprovalRequest | undefined {
+    const request = this.#requests.get(attemptId);
+    this.#requests.delete(attemptId);
+    return request;
+  }
+
+  takeApprovedRequests(attemptId: string): readonly TaskApprovalRequest[] {
+    const requests = this.#approvedRequests.get(attemptId) ?? [];
+    this.#approvedRequests.delete(attemptId);
+    return requests;
+  }
+
+  clearAttempt(attemptId: string): void {
+    this.#requests.delete(attemptId);
+    this.#approvedRequests.delete(attemptId);
+  }
+
+  /** Returns only queue-backed approvals authorized to the exact interactive session. */
+  listPendingForSession(authorizedSessionId: string): readonly PendingTaskApproval[] {
+    const sessionId = requireIdentifier(authorizedSessionId, "Task approval session ID");
+    if (this.#queue === undefined) return [];
+    return this.#store.listApprovalLinks({
+      statuses: ["pending"],
+      authorizedSessionId: sessionId,
+      excludeTerminalTasks: true,
+      limit: 1_000
+    })
+      .filter((link) => link.pendingApprovalId !== undefined)
+      .map((link) => ({
+        approvalId: link.pendingApprovalId!,
+        taskId: link.taskId,
+        stepId: link.stepId,
+        attemptId: link.attemptId,
+        authorizedSessionId: link.authorizedSessionId,
+        toolName: link.toolName,
+        riskClass: link.riskClass,
+        targetPreview: link.targetPreview,
+        requestedAt: link.requestedAt,
+        expiresAt: link.expiresAt
+      }));
+  }
+
+  /** Resolves one exact session-owned queue row; Task state is reconciled by the owning host. */
+  async resolvePendingForSession(input: {
+    approvalId: string;
+    authorizedSessionId: string;
+    decision: "approved" | "denied";
+  }): Promise<TaskApprovalResolution> {
+    const queue = this.#queue;
+    if (queue === undefined) throw new Error("Durable Task approval queue is unavailable.");
+    const approvalId = requireIdentifier(input.approvalId, "Task approval ID");
+    const sessionId = requireIdentifier(input.authorizedSessionId, "Task approval session ID");
+    const link = this.#store.listApprovalLinks({
+      statuses: ["pending"],
+      authorizedSessionId: sessionId,
+      pendingApprovalId: approvalId,
+      excludeTerminalTasks: true,
+      limit: 1
+    })[0];
+    if (link === undefined) throw new Error("Pending Task approval not found for this session.");
+    await queue.resolveApproval(approvalId, input.decision, "cli-operator", {
+      profileId: this.#store.profileId,
+      sessionId
+    });
+    await this.reconcile({ eligibleTaskIds: new Set([link.taskId]) });
+    return { approvalId, taskId: link.taskId, decision: input.decision };
+  }
+
+  createLink(input: {
+    task: Task;
+    step: TaskStep;
+    attempt: TaskAttempt;
+    request: TaskApprovalRequest;
+  }): TaskApprovalLink {
+    const sessionId = input.task.creatorSessionId;
+    if (sessionId === undefined) throw new Error("A durable approval requires the Task creator session.");
+    const now = this.#now();
+    return {
+      id: this.#id(),
+      profileId: input.task.profileId,
+      taskId: input.task.id,
+      planRevisionId: input.step.planRevisionId,
+      stepId: input.step.id,
+      attemptId: input.attempt.id,
+      authorizedSessionId: sessionId,
+      toolName: input.request.toolName,
+      riskClass: input.request.riskClass,
+      targetFingerprint: input.request.targetFingerprint,
+      targetPreview: input.request.targetPreview,
+      status: "requesting",
+      requestedAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + this.#ttlMs).toISOString(),
+      updatedAt: now.toISOString()
+    };
+  }
+
+  async reconcile(options: { eligibleTaskIds?: ReadonlySet<string> } = {}): Promise<void> {
+    const terminalLinks = this.#store.listApprovalLinks({
+      statuses: ["requesting", "pending"],
+      terminalTasksOnly: true,
+      limit: 1_000
+    });
+    for (const link of terminalLinks) await this.#closeForTerminalTask(link);
+    const links = options.eligibleTaskIds === undefined
+      ? this.#store.listApprovalLinks({
+          statuses: ["requesting", "pending"],
+          excludeTerminalTasks: true,
+          limit: 1_000
+        })
+      : listApprovalLinksForTasks(this.#store, options.eligibleTaskIds);
+    for (const link of links) {
+      const task = this.#store.getTask(link.taskId);
+      if (task === null || isTerminalTaskStatus(task.status)) continue;
+      else if (link.status === "requesting") await this.#enqueue(link);
+      else await this.#refresh(link);
+    }
+  }
+
+  consumeApproved(attemptId: string, request: TaskApprovalRequest): void {
+    const link = this.#matchingApproved(attemptId, request.targetFingerprint);
+    if (link === undefined) return;
+    const now = this.#now().toISOString();
+    this.#store.atomicWrite((store) => store.updateApprovalLink({
+      ...link,
+      status: "consumed",
+      updatedAt: now,
+      consumedAt: now
+    }));
+  }
+
+  #narrowDecision(
+    task: Task,
+    step: TaskStep,
+    attempt: TaskAttempt,
+    request: SecurityRequest,
+    baseDecision: "allow" | "ask" | "deny"
+  ): "allow" | "ask" | "deny" {
+    if (baseDecision === "deny") return "deny";
+    const taskDisposition = task.authorityPolicy.riskClassPolicy[request.riskClass];
+    const stepDisposition = step.authorityPolicy.riskClassPolicy[request.riskClass];
+    if (taskDisposition === "forbid" || stepDisposition === "forbid") return "deny";
+    const fingerprint = taskApprovalFingerprint(request);
+    if (this.#matchingApproved(attempt.id, fingerprint) !== undefined) return "allow";
+    if (taskDisposition === "require_approval" || stepDisposition === "require_approval") return "ask";
+    return baseDecision;
+  }
+
+  #matchingApproved(attemptId: string, fingerprint: string): TaskApprovalLink | undefined {
+    return this.#store.listApprovalLinks({ attemptId, statuses: ["approved"], limit: 10 })
+      .find((link) => link.targetFingerprint === fingerprint && Date.parse(link.expiresAt) > this.#now().getTime());
+  }
+
+  async #enqueue(link: TaskApprovalLink): Promise<void> {
+    if (this.#queue === undefined) return;
+    const pending = await this.#queue.createPendingApproval(
+      {
+        sessionId: link.authorizedSessionId,
+        profileId: link.profileId,
+        commandPreview: link.targetPreview,
+        commandHash: link.targetFingerprint,
+        toolName: link.toolName,
+        approvalKind: "command",
+        requestedAt: new Date(link.requestedAt),
+        expiresAt: new Date(link.expiresAt),
+        channel: "cli"
+      },
+      { idempotencyKey: `task-approval:${link.id}` }
+    );
+    const now = this.#now().toISOString();
+    const status = pending.status === "pending" ? "pending" : pending.status;
+    this.#store.atomicWrite((store) => store.updateApprovalLink({
+      ...link,
+      pendingApprovalId: pending.id,
+      status,
+      updatedAt: now,
+      ...(status === "pending" ? {} : { resolvedAt: pending.resolvedAt?.toISOString() ?? now })
+    }));
+  }
+
+  async #refresh(link: TaskApprovalLink): Promise<void> {
+    if (this.#queue === undefined || link.pendingApprovalId === undefined) return;
+    const pending = await this.#queue.getApproval(link.pendingApprovalId, {
+      profileId: link.profileId,
+      sessionId: link.authorizedSessionId
+    });
+    if (pending === undefined || pending.status === "pending") return;
+    const now = this.#now().toISOString();
+    this.#store.atomicWrite((store) => store.updateApprovalLink({
+      ...link,
+      status: pending.status,
+      updatedAt: now,
+      resolvedAt: pending.resolvedAt?.toISOString() ?? now
+    }));
+  }
+
+  async #closeForTerminalTask(link: TaskApprovalLink): Promise<void> {
+    const queue = this.#queue;
+    if (link.status === "pending" && link.pendingApprovalId !== undefined && queue !== undefined) {
+      try {
+        await queue.resolveApproval(link.pendingApprovalId, "denied", "task-terminal", {
+          profileId: link.profileId,
+          sessionId: link.authorizedSessionId
+        });
+      } catch {
+        // A concurrent operator decision wins. Refresh below records the durable queue truth.
+      }
+      await this.#refresh(link);
+      return;
+    }
+    const now = this.#now().toISOString();
+    this.#store.atomicWrite((store) => {
+      const current = store.getApprovalLink(link.id);
+      if (current === null || (current.status !== "requesting" && current.status !== "pending")) return;
+      store.updateApprovalLink({
+        ...current,
+        status: "expired",
+        updatedAt: now,
+        resolvedAt: now
+      });
+    });
+  }
+}
+
+export function taskApprovalFingerprint(request: SecurityRequest): string {
+  const commandHash = request.command === undefined
+    ? ""
+    : createHash("sha256").update(request.command).digest("hex");
+  const digest = createHash("sha256").update(JSON.stringify([
+    request.toolName ?? "",
+    request.riskClass,
+    request.targetKey ?? "",
+    request.targetSummary ?? "",
+    commandHash
+  ])).digest("hex");
+  return `sha256:${digest}`;
+}
+
+function listApprovalLinksForTasks(
+  store: TaskStore,
+  taskIds: ReadonlySet<string>
+): TaskApprovalLink[] {
+  const ids = [...taskIds];
+  const links: TaskApprovalLink[] = [];
+  for (let offset = 0; offset < ids.length; offset += TASK_QUERY_ID_SCOPE_LIMIT) {
+    links.push(...store.listApprovalLinks({
+      taskIds: ids.slice(offset, offset + TASK_QUERY_ID_SCOPE_LIMIT),
+      statuses: ["requesting", "pending"],
+      excludeTerminalTasks: true,
+      limit: 1_000
+    }));
+  }
+  return links.sort((left, right) =>
+    left.requestedAt.localeCompare(right.requestedAt) || left.id.localeCompare(right.id)
+  ).slice(0, 1_000);
+}
+
+function approvalRequest(request: SecurityRequest): TaskApprovalRequest {
+  return {
+    toolName: bounded(request.toolName ?? "unknown-tool", 120),
+    riskClass: request.riskClass,
+    targetFingerprint: taskApprovalFingerprint(request),
+    targetPreview: bounded(request.targetSummary ?? request.targetKey ?? request.description, 240)
+  };
+}
+
+function taskAssessment(
+  base: SecurityAssessment,
+  decision: "allow" | "ask" | "deny"
+): SecurityAssessment {
+  return {
+    ...base,
+    decision,
+    reason: decision === "allow"
+      ? "Allowed by an exact, durable Task approval after the runtime policy accepted the operation."
+      : decision === "deny"
+        ? "Denied by the durable Task authority ceiling."
+        : "Durable Task approval is required before this operation can run."
+  };
+}
+
+function bounded(value: string, maxChars: number): string {
+  const normalized = value.replace(/[\u0000-\u001F\u007F]/gu, " ").trim();
+  return (normalized.length === 0 ? "Task operation" : normalized).slice(0, maxChars);
+}
+
+function positiveInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive integer.`);
+  return value;
+}
+
+function requireIdentifier(value: string, label: string): string {
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > 256 || /[\u0000-\u001F\u007F]/u.test(normalized)) {
+    throw new Error(`${label} must be a bounded non-empty identifier.`);
+  }
+  return normalized;
+}

@@ -11,7 +11,11 @@ import type {
   SessionSearchResult
 } from "../contracts/session.js";
 import type { FailureRecord } from "../contracts/failure.js";
+import type { ProviderUsageEntry, ProviderUsageQuery } from "../contracts/provider-usage.js";
+import { cloneSpendingLimit } from "../contracts/budget.js";
+import { verifiedCompressionLineage } from "./session-lineage.js";
 import { tokenizeSearchTerms } from "../search/fts-query.js";
+import { providerUsageMatches } from "../providers/provider-usage-ledger.js";
 
 const SESSION_MODEL_OVERRIDE_METADATA_KEY = "sessionModelOverride";
 
@@ -19,6 +23,7 @@ export class InMemorySessionDB implements SessionDB {
   readonly #sessions = new Map<string, SessionRecord>();
   readonly #messages = new Map<string, SessionMessage[]>();
   readonly #events = new Map<string, SessionEvent[]>();
+  readonly #providerUsage = new Map<string, ProviderUsageEntry>();
   readonly #now: () => Date;
   readonly #id: () => string;
 
@@ -35,6 +40,22 @@ export class InMemorySessionDB implements SessionDB {
       throw new Error(`Session already exists: ${id}`);
     }
 
+    const spendingLimit = cloneSpendingLimit(input.spendingLimit);
+    const spendingScopeSessionId = spendingLimit === undefined
+      ? undefined
+      : input.spendingScopeSessionId ?? id;
+    if (spendingLimit === undefined && input.spendingScopeSessionId !== undefined) {
+      throw new Error("A Session spending scope requires an immutable spending limit.");
+    }
+    if (spendingScopeSessionId !== undefined && spendingScopeSessionId !== id) {
+      const owner = this.#sessions.get(spendingScopeSessionId);
+      if (owner === undefined || owner.profileId !== input.profileId ||
+          owner.spendingScopeSessionId !== owner.id ||
+          JSON.stringify(owner.spendingLimit) !== JSON.stringify(spendingLimit)) {
+        throw new Error("A Session can inherit spending only from a matching logical-session scope owner.");
+      }
+    }
+
     const session: SessionRecord = {
       id,
       profileId: input.profileId,
@@ -42,6 +63,8 @@ export class InMemorySessionDB implements SessionDB {
       createdAt: now,
       updatedAt: now,
       parentSessionId: input.parentSessionId,
+      ...(spendingScopeSessionId === undefined ? {} : { spendingScopeSessionId }),
+      ...(spendingLimit === undefined ? {} : { spendingLimit }),
       endedAt: input.endedAt,
       endReason: input.endReason,
       metadata: input.metadata
@@ -189,6 +212,44 @@ export class InMemorySessionDB implements SessionDB {
     this.#touch(sessionId);
   }
 
+  async recordProviderUsageEntries(entries: readonly ProviderUsageEntry[]): Promise<void> {
+    for (const entry of entries) {
+      for (const sessionId of [entry.sessionId, entry.sessionBudgetScopeId]) {
+        if (sessionId !== undefined && this.#sessions.get(sessionId)?.profileId !== entry.profileId) {
+          throw new Error("Provider usage Session attribution is invalid.");
+        }
+      }
+      if (entry.visibleTurnId !== undefined) {
+        const lineageRoot = entry.sessionBudgetScopeId ?? entry.sessionId;
+        const lineage = lineageRoot === undefined
+          ? undefined
+          : await verifiedCompressionLineage(this, lineageRoot, entry.profileId);
+        const visibleTurnOwned = lineage?.some((session) =>
+          this.#messages.get(session.id)?.some((message) =>
+            message.id === entry.visibleTurnId && message.role === "user"
+          ) === true
+        ) === true;
+        if (!visibleTurnOwned) {
+          throw new Error("Provider usage visible turn does not belong to its attributed Session compression lineage.");
+        }
+      }
+      const key = `${entry.profileId}\0${entry.requestKey}`;
+      const existing = this.#providerUsage.get(key);
+      if (existing !== undefined && JSON.stringify(existing) !== JSON.stringify(entry)) {
+        throw new Error(`Provider usage request key ${entry.requestKey} conflicts with another entry.`);
+      }
+      this.#providerUsage.set(key, structuredClone(entry));
+    }
+  }
+
+  async listProviderUsageEntries(profileId: string, query: ProviderUsageQuery = {}): Promise<ProviderUsageEntry[]> {
+    return [...this.#providerUsage.values()]
+      .filter((entry) => entry.profileId === profileId && providerUsageMatches(entry, query))
+      .sort((left, right) => left.dispatchedAt.localeCompare(right.dispatchedAt) ||
+        left.providerAttemptIndex - right.providerAttemptIndex || left.id.localeCompare(right.id))
+      .map((entry) => structuredClone(entry));
+  }
+
   async listMessages(sessionId: string): Promise<SessionMessage[]> {
     return (this.#messages.get(sessionId) ?? []).map(cloneMessage);
   }
@@ -251,6 +312,7 @@ function scoreMessage(content: string, terms: string[]): number {
 function cloneSession(session: SessionRecord): SessionRecord {
   return {
     ...session,
+    ...(session.spendingLimit === undefined ? {} : { spendingLimit: cloneSpendingLimit(session.spendingLimit) }),
     metadata: session.metadata === undefined ? undefined : structuredClone(session.metadata)
   };
 }

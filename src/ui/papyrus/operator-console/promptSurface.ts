@@ -1,7 +1,11 @@
 import { stringWidth } from "../screen/stringWidth.js";
 import { truncateVisible } from "../../renderers/layout.js";
 import type { PromptSurfaceState, TerminalMetrics } from "./operatorConsoleState.js";
-import { styleColor, type OperatorConsoleStyle } from "./operatorConsoleStyle.js";
+import {
+  styleBackgroundRow,
+  styleColor,
+  type OperatorConsoleStyle,
+} from "./operatorConsoleStyle.js";
 
 export type PromptSurfaceRenderOptions = {
   readonly width: number;
@@ -15,12 +19,14 @@ export type PromptSurfaceMetrics = {
   readonly visibleRows: number;
   readonly overflow: boolean;
   readonly scrollOffset: number;
+  readonly contentStartRow: number;
   readonly cursorRow: number;
   readonly cursorColumn: number;
 };
 
 export const PREFERRED_PROMPT_INPUT_ROWS = 8;
 export const MAX_PROMPT_HEIGHT_RATIO = 0.3;
+export const PROMPT_HALF_CELL_BAND_ROWS = 2;
 
 export function getPromptSurfaceDesiredHeight(
   state: PromptSurfaceState,
@@ -28,8 +34,9 @@ export function getPromptSurfaceDesiredHeight(
 ): number {
   const logicalRows = getPromptLogicalRows(state, terminal.width).length;
   const preferredInputRows = Math.min(PREFERRED_PROMPT_INPUT_ROWS, logicalRows);
-  const absoluteInputRows = Math.max(1, Math.floor(terminal.height * MAX_PROMPT_HEIGHT_RATIO) - 2);
-  return Math.max(3, Math.min(preferredInputRows, Math.max(1, absoluteInputRows)) + 2);
+  const absoluteHeight = Math.max(3, Math.floor(terminal.height * MAX_PROMPT_HEIGHT_RATIO));
+  const absoluteInputRows = Math.max(1, absoluteHeight - PROMPT_HALF_CELL_BAND_ROWS);
+  return Math.max(3, Math.min(preferredInputRows, absoluteInputRows) + PROMPT_HALF_CELL_BAND_ROWS);
 }
 
 export function renderPromptSurface(
@@ -44,26 +51,32 @@ export function renderPromptSurface(
     width,
   }));
   if (height <= 0) return [];
-  if (height < 3) return [truncateVisibleCells(renderPromptFallbackLine(state), width)];
 
   const contentWidth = width;
-  const inputRows = Math.max(1, height - 2);
+  const chrome = resolvePromptChrome(height);
+  const inputRows = Math.max(1, height - chrome.topRows - chrome.bottomRows);
   const logicalRows = getPromptLogicalRows(state, width);
   const overflow = logicalRows.length > inputRows;
   const cursor = getPromptCursorPosition(state, logicalRows);
   const scrollOffset = getCursorVisibleScrollOffset(state, logicalRows.length, inputRows, overflow, cursor.row);
   const visibleRows = getVisiblePromptRows(logicalRows, scrollOffset, inputRows, overflow);
 
-  return [
-    renderHorizontalBorder(width),
-    ...visibleRows.map((row, index) => renderContentRow(
-      row.content,
-      contentWidth,
-      width,
-      shouldStylePlaceholderRow(state, scrollOffset, index) ? options.style : undefined
-    )),
-    renderHorizontalBorder(width),
-  ];
+  const content = visibleRows.map((row, index) => renderContentRow(
+    row,
+    contentWidth,
+    width,
+    shouldStylePlaceholderRow(state, scrollOffset, index),
+    options.style
+  ));
+  const topBand = chrome.topRows === 0
+    ? []
+    : [renderHalfCellBand(options.style, width, "▀")];
+  const bottomBand = chrome.bottomRows === 0
+    ? []
+    : [chrome.halfCellBands
+        ? renderHalfCellBand(options.style, width, "▄")
+        : renderFullPaddingRow(options.style, width)];
+  return [...topBand, ...content, ...bottomBand];
 }
 
 export function getPromptSurfaceMetrics(
@@ -75,7 +88,8 @@ export function getPromptSurfaceMetrics(
     width: options.width,
   }));
   const logicalRows = getPromptLogicalRows(state, options.width);
-  const visibleRows = Math.max(1, Math.max(0, height - 2));
+  const chrome = resolvePromptChrome(height);
+  const visibleRows = Math.max(1, height - chrome.topRows - chrome.bottomRows);
   const overflow = logicalRows.length > visibleRows;
   const cursor = getPromptCursorPosition(state, logicalRows);
   return {
@@ -83,9 +97,37 @@ export function getPromptSurfaceMetrics(
     visibleRows: Math.min(logicalRows.length, visibleRows),
     overflow,
     scrollOffset: getCursorVisibleScrollOffset(state, logicalRows.length, visibleRows, overflow, cursor.row),
+    contentStartRow: chrome.topRows,
     cursorRow: cursor.row,
     cursorColumn: cursor.column,
   };
+}
+
+function resolvePromptChrome(height: number): {
+  readonly topRows: number;
+  readonly bottomRows: number;
+  readonly halfCellBands: boolean;
+} {
+  if (height >= 3) return { topRows: 1, bottomRows: 1, halfCellBands: true };
+  if (height === 2) return { topRows: 0, bottomRows: 1, halfCellBands: false };
+  return { topRows: 0, bottomRows: 0, halfCellBands: false };
+}
+
+function renderHalfCellBand(
+  style: OperatorConsoleStyle | undefined,
+  width: number,
+  glyph: "▄" | "▀"
+): string {
+  if (style === undefined || !style.supportsColor) return "".padEnd(width);
+  // Inverse mode uses the terminal's real default background for the outer
+  // half while making the half adjacent to the content a continuous elevated
+  // background. This avoids foreground block-glyph seams at the inner edges.
+  return `\x1b[7m${styleColor(style, glyph.repeat(width), style.tokens.contract.surface.bgElevated)}`;
+}
+
+function renderFullPaddingRow(style: OperatorConsoleStyle | undefined, width: number): string {
+  const background = style?.tokens.contract.surface.bgElevated ?? "";
+  return styleBackgroundRow(style, "", width, background);
 }
 
 type PromptLogicalRow = {
@@ -188,27 +230,26 @@ function padRows(rows: readonly PromptLogicalRow[], count: number): readonly Pro
   return [...rows, ...Array.from({ length: count - rows.length }, () => staticPromptRow(""))];
 }
 
-function renderHorizontalBorder(width: number): string {
-  return "─".repeat(Math.max(0, width));
-}
-
 function renderContentRow(
-  row: string,
+  row: PromptLogicalRow,
   contentWidth: number,
   width: number,
+  placeholder: boolean,
   style: OperatorConsoleStyle | undefined
 ): string {
   if (width <= 0) return "";
-  const content = padVisibleEnd(truncateVisibleCells(row, contentWidth), contentWidth);
-  const styled = style === undefined
-    ? content
-    : styleColor(style, content, style.tokens.contract.text.muted);
-  return truncateVisibleCells(styled, width);
-}
-
-function renderPromptFallbackLine(state: PromptSurfaceState): string {
-  const content = state.value.length === 0 ? state.placeholder ?? ">" : state.value.replace(/\r\n|\n|\r/gu, " ");
-  return `Prompt: ${content.length === 0 ? ">" : content}`;
+  if (style === undefined) {
+    return padVisibleEnd(truncateVisibleCells(row.content, contentWidth), contentWidth);
+  }
+  const tokens = style.tokens.contract;
+  const prefix = row.prefix.length === 0
+    ? ""
+    : styleColor(style, row.prefix, tokens.palette.action);
+  const textColor = placeholder
+    ? tokens.text.placeholder
+    : row.prefix.length === 0 ? tokens.text.muted : tokens.text.primary;
+  const content = `${prefix}${styleColor(style, row.text, textColor)}`;
+  return styleBackgroundRow(style, content, width, tokens.surface.bgElevated);
 }
 
 function shouldStylePlaceholderRow(

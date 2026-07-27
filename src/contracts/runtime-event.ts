@@ -104,6 +104,14 @@ export type RuntimeEvent =
       reason: string;
     }
   | {
+      kind: "provider-spending-warning";
+      warningId: string;
+      scopeKind: "session" | "root_task";
+      warningThresholdPercent: number;
+      maxEstimatedCostUsd: number;
+      committedCostUsd: number;
+    }
+  | {
       kind: "context-estimate";
       filled: number;
       total: number;
@@ -208,6 +216,9 @@ export type RuntimeEvent =
       batchId?: string;
       taskLabel?: string;
       batchTaskCount?: number;
+      taskId?: string;
+      stepId?: string;
+      attemptId?: string;
       childEvent: {
         kind:
           | "agent-start"
@@ -216,8 +227,10 @@ export type RuntimeEvent =
           | "provider-attempt"
           | "provider-result"
           | "provider-budget-exhausted"
+          | "provider-spending-warning"
           | "agent-final"
           | "agent-cancelled"
+          | "assistant-preview"
           | "delegation-result";
         sessionId?: string;
         tool?: string;
@@ -240,6 +253,12 @@ export type RuntimeEvent =
         limit?: number;
         observed?: number;
         reason?: string;
+        warningId?: string;
+        scopeKind?: "session" | "root_task";
+        warningThresholdPercent?: number;
+        maxEstimatedCostUsd?: number;
+        committedCostUsd?: number;
+        preview?: string;
         status?: "completed" | "blocked" | "failed" | "timeout" | "cancelled";
       };
     };

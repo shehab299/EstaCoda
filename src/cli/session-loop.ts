@@ -33,6 +33,7 @@ import { buildToolsMenuViewModel, buildSkillsMenuViewModel } from "./slash-menu.
 import { renderSessionHelp, buildSessionHelpViewModel } from "./session-help.js";
 import { commandRegistry } from "./command-registry.js";
 import { toolDisplayIcon, toolDisplayLabel } from "../ui/tool-display.js";
+import { formatSpendingThresholdWarning } from "../ui/spending-warning-format.js";
 import {
   ToolActivityViewModelBuilder,
   buildSecurityAuditViewModel,
@@ -72,8 +73,9 @@ import {
   type TurnActivityState,
 } from "../ui/papyrus/operator-console/index.js";
 import type { ParsedKeypress } from "../ui/input/parseKeypress.js";
+import { applyKeypress, createLineEditorState } from "../ui/input/lineEditor.js";
 import { createKeypressStreamDispatcher } from "../ui/input/keyPressStreamDispatcher.js";
-import { createTerminalLifecycle } from "../ui/input/terminalLifecycle.js";
+import { createTerminalLifecycle, type TerminalLifecycle } from "../ui/input/terminalLifecycle.js";
 import { centerVisibleBlock, measureVisibleWidth, truncateVisible } from "../ui/renderers/layout.js";
 import { chromeCopy } from "../ui/cli-ui-copy.js";
 import { resolveShellHistoryMode } from "./shell-history-mode.js";
@@ -95,7 +97,7 @@ import {
   type CliVoiceMode
 } from "./voice-mode.js";
 import { createFilePasteReferenceStore } from "./paste-interceptor.js";
-import { beginExplicitWorkflowRun, beginSkillPlaybookWorkflowRun } from "../workflow/workflow-begin.js";
+import { detectTaskBackgroundHost, executeTaskCommand } from "./task-commands.js";
 import { summarizeProviderExecution } from "../runtime/provider-execution-summary.js";
 import { LiveOperatorConsoleController } from "./live-operator-console-controller.js";
 import {
@@ -121,6 +123,18 @@ import { buildProvidersStatusViewModel } from "./provider-status-view-models.js"
 import { selectProviderModelRoute } from "../setup/provider-model-route-prompt.js";
 import { isMemoryCurationModeMutation, runMemoryOperatorCommand } from "../memory/memory-operator-commands.js";
 import type { SessionFinalizationReason } from "../session/session-finalization-queue.js";
+import type { TaskStatusProjection } from "../tasks/task-operator-service.js";
+import type { PendingTaskApproval } from "../tasks/task-approval-service.js";
+import type { ApprovalIntent } from "../ui/papyrus/operator-console/approvalSurface.js";
+import type {
+  ApprovalCardState,
+  TaskCardState
+} from "../ui/papyrus/operator-console/operatorConsoleState.js";
+import type { SessionCostSummary, TurnUsageSummary, UsageCostSummary } from "../contracts/usage-cost.js";
+import { mergeUsageCostSummaries, unavailableUsageCostSummary } from "../providers/provider-usage-projection.js";
+import { formatTurnUsageFooter } from "../ui/usage-cost-format.js";
+import { isolateLtr, isolateRtl } from "../ui/bidi.js";
+import { resolveWorkspaceStatus } from "./workspace-status.js";
 
 export type SessionLoopOptions = {
   runtime: Runtime;
@@ -144,6 +158,14 @@ export type SessionLoopOptions = {
     readonly enabled?: boolean;
     readonly runtimeHost?: OperatorConsoleRuntimeHost;
   };
+  taskApprovals?: {
+    listPending(authorizedSessionId: string): readonly PendingTaskApproval[];
+    resolve(input: {
+      approvalId: string;
+      authorizedSessionId: string;
+      decision: "approved" | "denied";
+    }): Promise<void>;
+  };
   cliVoice?: {
     recorder?: CliVoiceRecorder;
     envOptions?: CliVoiceEnvironmentOptions;
@@ -152,6 +174,10 @@ export type SessionLoopOptions = {
 };
 
 const OPERATOR_CONSOLE_FALLBACK_TERMINAL_HEIGHT = 24;
+const OPERATOR_CONSOLE_TASK_REFRESH_INTERVAL_MS = 750;
+const TASK_SESSION_COMPLETION_REFRESH_INTERVAL_MS = 750;
+const SESSION_COST_REFRESH_INTERVAL_MS = 750;
+const WORKSPACE_STATUS_REFRESH_INTERVAL_MS = 5_000;
 const COMPACTION_PROMPT_PLACEHOLDER = "Compacting session history... Ctrl+C to cancel";
 
 type StatusRailTimerMode = "idle" | "active-turn" | "last-turn";
@@ -331,7 +357,54 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
     })
     : undefined;
   operatorConsoleRuntimeHost?.setStyle(operatorConsoleStyle);
+  let latestWorkspaceStatus = operatorConsoleEnabled && options.workspaceRoot !== undefined
+    ? await resolveWorkspaceStatus(options.workspaceRoot)
+    : undefined;
+  let workspaceStatusRefresh: Promise<void> | undefined;
+  let workspaceStatusRefreshedAtMs = Date.now();
+  const refreshWorkspaceStatus = (): Promise<void> => {
+    if (!operatorConsoleEnabled || options.workspaceRoot === undefined) return Promise.resolve();
+    if (workspaceStatusRefresh !== undefined) return workspaceStatusRefresh;
+    if (Date.now() - workspaceStatusRefreshedAtMs < WORKSPACE_STATUS_REFRESH_INTERVAL_MS) {
+      return Promise.resolve();
+    }
+    workspaceStatusRefresh = resolveWorkspaceStatus(options.workspaceRoot)
+      .then((status) => {
+        latestWorkspaceStatus = status;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        workspaceStatusRefreshedAtMs = Date.now();
+        workspaceStatusRefresh = undefined;
+      });
+    return workspaceStatusRefresh;
+  };
   let latestContextUsage: ContextUsageSnapshot | undefined;
+  let latestSessionCost: SessionCostSummary | undefined;
+  let sessionCostRefresh: Promise<void> | undefined;
+  let sessionCostRefreshedAtMs = Number.NEGATIVE_INFINITY;
+  const refreshSessionCost = (force = false): Promise<void> => {
+    if (sessionCostRefresh !== undefined) {
+      return force ? sessionCostRefresh.then(() => refreshSessionCost(true)) : sessionCostRefresh;
+    }
+    const timestamp = Date.now();
+    if (!force && timestamp - sessionCostRefreshedAtMs < SESSION_COST_REFRESH_INTERVAL_MS) {
+      return Promise.resolve();
+    }
+    const targetRuntime = runtime;
+    sessionCostRefresh = (async () => {
+      try {
+        const cost = await targetRuntime.currentSessionCost?.();
+        if (runtime === targetRuntime) latestSessionCost = cost;
+      } catch {
+        if (runtime === targetRuntime) latestSessionCost = unavailableUsageCostSummary("session-cost-read-failed");
+      }
+    })().finally(() => {
+      if (runtime === targetRuntime) sessionCostRefreshedAtMs = Date.now();
+      sessionCostRefresh = undefined;
+    });
+    return sessionCostRefresh;
+  };
   let timerMode: StatusRailTimerMode = "idle";
   let activeTurnStartedAtMs: number | undefined;
   let lastCompletedTurnSeconds: number | undefined;
@@ -345,13 +418,54 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
     activeTurnStartedAtMs,
     lastCompletedTurnSeconds
   });
-  const getOperatorConsoleStatus = () => operatorConsoleStatusRailState({
-    runtime,
-    renderer,
-    contextUsage: latestContextUsage,
-    timing: railTiming(),
-    providerExecutionSummary: lastProviderExecutionSummary
-  });
+  const getOperatorConsoleStatus = () => {
+    void refreshSessionCost();
+    void refreshWorkspaceStatus();
+    return operatorConsoleStatusRailState({
+      runtime,
+      renderer,
+      contextUsage: latestContextUsage,
+      sessionCost: latestSessionCost,
+      workspace: latestWorkspaceStatus,
+      timing: railTiming(),
+      providerExecutionSummary: lastProviderExecutionSummary
+    });
+  };
+  let cachedTaskRuntime: Runtime | undefined;
+  let cachedTaskCards: readonly TaskCardState[] = [];
+  let cachedTaskCardsAtMs = Number.NEGATIVE_INFINITY;
+  let taskTurnScope = await initialTaskTurnScope(runtime);
+  const refreshOperatorConsoleTasks = (): boolean => {
+    void refreshSessionCost();
+    const timestamp = Date.now();
+    if (cachedTaskRuntime === runtime &&
+        timestamp - cachedTaskCardsAtMs < OPERATOR_CONSOLE_TASK_REFRESH_INTERVAL_MS) {
+      return false;
+    }
+    cachedTaskRuntime = runtime;
+    cachedTaskCardsAtMs = timestamp;
+    cachedTaskCards = operatorConsoleTaskCards(runtime, taskTurnScope.supersededTurnIds);
+    return true;
+  };
+  const getOperatorConsoleTasks = () => cachedTaskRuntime === runtime ? cachedTaskCards : [];
+  const getOperatorConsoleApprovals = (): readonly ApprovalCardState[] => {
+    try {
+      return (options.taskApprovals?.listPending(runtime.sessionId) ?? [])
+        .map((approval) => taskApprovalToCard(approval, renderer.locale === "ar" ? "ar" : "en"));
+    } catch {
+      return [];
+    }
+  };
+  const onOperatorConsoleApprovalIntent = async (intent: ApprovalIntent): Promise<void> => {
+    if (intent.type !== "approve" && intent.type !== "reject") return;
+    const taskApprovals = options.taskApprovals;
+    if (taskApprovals === undefined) throw new Error("Interactive Task approvals are unavailable.");
+    await taskApprovals.resolve({
+      approvalId: intent.approvalId,
+      authorizedSessionId: runtime.sessionId,
+      decision: intent.type === "approve" ? "approved" : "denied"
+    });
+  };
   const prompt = options.prompt ?? createInteractivePrompt({
     input: cliInput,
     output: output as NodeJS.WriteStream,
@@ -363,16 +477,55 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
       : {
         operatorConsole: {
           enabled: true,
+          locale: renderer.locale === "ar" ? "ar" : "en",
           terminal: {
             width: renderer.capabilities.terminalWidth,
             height: operatorConsoleTerminalHeight(output),
             isTty: renderer.capabilities.isTTY,
           },
+          getTerminal: () => ({
+            width: (output as { readonly columns?: number }).columns ?? renderer.capabilities.terminalWidth,
+            height: operatorConsoleTerminalHeight(output),
+            isTty: (output as { readonly isTTY?: boolean }).isTTY ?? renderer.capabilities.isTTY,
+          }),
           getStatus: getOperatorConsoleStatus,
+          refreshTasks: refreshOperatorConsoleTasks,
+          getTasks: getOperatorConsoleTasks,
+          getApprovals: getOperatorConsoleApprovals,
+          onApprovalIntent: onOperatorConsoleApprovalIntent,
           style: operatorConsoleStyle,
         },
       }),
   });
+  let taskSessionCompletionRefresh: Promise<void> | undefined;
+  const refreshTaskSessionCompletions = (): Promise<void> => {
+    if (taskSessionCompletionRefresh !== undefined) return taskSessionCompletionRefresh;
+    const targetRuntime = runtime;
+    if (targetRuntime.drainTaskSessionCompletions === undefined) return Promise.resolve();
+    taskSessionCompletionRefresh = targetRuntime.drainTaskSessionCompletions()
+      .then(async (messages) => {
+        if (runtime !== targetRuntime) return;
+        for (const message of messages) {
+          const rendered = renderer.render(buildAssistantResponseViewModel({
+            label: targetRuntime.getStartup().agentName,
+            text: message.text,
+          }));
+          if (prompt.writeDurable?.(rendered) !== true) {
+            output.write(rendered.endsWith("\n") ? rendered : `${rendered}\n`);
+          }
+          await targetRuntime.acknowledgeTaskSessionCompletion?.({
+            bindingId: message.bindingId,
+            messageId: message.messageId,
+          });
+        }
+        if (messages.length > 0) cachedTaskCardsAtMs = Number.NEGATIVE_INFINITY;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (taskSessionCompletionRefresh !== undefined) taskSessionCompletionRefresh = undefined;
+      });
+    return taskSessionCompletionRefresh;
+  };
   const close = options.close ?? (() => prompt.close?.());
   const onSigint = () => {
     if (activeTurn !== undefined) {
@@ -392,6 +545,7 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
 
   try {
     latestContextUsage = await initialContextUsageForRuntime(runtime);
+    await refreshSessionCost(true);
     const resetTurnRailState = () => {
       timerMode = "idle";
       activeTurnStartedAtMs = undefined;
@@ -424,10 +578,12 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
     let idleStatusTicker: ReturnType<typeof setInterval> | undefined;
     const writeSessionStatusRail = () => {
       if (!managedTty || operatorConsoleRuntimeHost !== undefined) return;
+      void refreshSessionCost();
       output.write(`${renderer.render(sessionStatusRailViewModel({
         runtime,
         renderer,
         contextUsage: latestContextUsage,
+        sessionCost: latestSessionCost,
         timing: railTiming(),
         providerExecutionSummary: lastProviderExecutionSummary
       }))}\n`);
@@ -461,19 +617,28 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
         runtime,
         homeDir: options.homeDir
       });
-      submittedInput = await readNextCliInput({
-        voiceMode: turnVoiceMode,
-        prompt,
-        promptPrefix,
-        renderer,
-        useColor,
-        runtime,
-        output,
-        homeDir: options.homeDir,
-        workspaceRoot: options.workspaceRoot,
-        cliVoice: options.cliVoice,
-        inputPlaceholder,
-      });
+      await refreshTaskSessionCompletions();
+      const taskSessionCompletionTicker = prompt.writeDurable === undefined || runtime.drainTaskSessionCompletions === undefined
+        ? undefined
+        : setInterval(() => void refreshTaskSessionCompletions(), TASK_SESSION_COMPLETION_REFRESH_INTERVAL_MS);
+      try {
+        submittedInput = await readNextCliInput({
+          voiceMode: turnVoiceMode,
+          prompt,
+          promptPrefix,
+          renderer,
+          useColor,
+          runtime,
+          output,
+          homeDir: options.homeDir,
+          workspaceRoot: options.workspaceRoot,
+          cliVoice: options.cliVoice,
+          inputPlaceholder,
+        });
+      } finally {
+        if (taskSessionCompletionTicker !== undefined) clearInterval(taskSessionCompletionTicker);
+        await taskSessionCompletionRefresh;
+      }
       stopIdleStatusTicker();
 
       const text = submittedInput.text;
@@ -514,6 +679,8 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
               supportsAnimation: renderer.capabilities.supportsAnimation,
             },
             getStatus: getOperatorConsoleStatus,
+            refreshTasks: refreshOperatorConsoleTasks,
+            getTasks: getOperatorConsoleTasks,
             turnStartedAtMs: now(),
             promptPlaceholder: COMPACTION_PROMPT_PLACEHOLDER,
           });
@@ -578,12 +745,20 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
         }
 
         if (typeof shouldExit !== "boolean") {
+          await sessionCostRefresh;
           await runtime.dispose();
           runtime = shouldExit.runtime;
           latestContextUsage = await initialContextUsageForRuntime(runtime);
+          latestSessionCost = undefined;
+          sessionCostRefreshedAtMs = Number.NEGATIVE_INFINITY;
+          await refreshSessionCost(true);
           lastProviderExecutionSummary = undefined;
           providerServingState = undefined;
           resetTurnRailState();
+          taskTurnScope = await initialTaskTurnScope(runtime);
+          cachedTaskRuntime = undefined;
+          cachedTaskCards = [];
+          cachedTaskCardsAtMs = Number.NEGATIVE_INFINITY;
           activityBuilder = new ToolActivityViewModelBuilder({
             tools: runtime.tools()
           });
@@ -602,6 +777,11 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
       }
 
       // Render submitted non-slash user prompts as lightweight transcript rails
+      for (const turnId of taskTurnScope.currentTurnIds) {
+        taskTurnScope.supersededTurnIds.add(turnId);
+      }
+      taskTurnScope.currentTurnIds.clear();
+      cachedTaskCardsAtMs = Number.NEGATIVE_INFINITY;
       const userPromptRail = buildUserPromptRailViewModel({ text: submittedInput.displayText ?? text });
       const userPromptRailText = renderer.render(userPromptRail);
       output.write(`${userPromptRailText}\n`);
@@ -610,6 +790,11 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
       let wroteUserPromptRail = false;
       let pendingSteeringNote: string | undefined;
       let steeringRetryUsed = false;
+      const mainAgentUsageParts: UsageCostSummary[] = [];
+      const auxiliaryUsageParts: UsageCostSummary[] = [];
+      const delegatedUsageParts: UsageCostSummary[] = [];
+      const totalUsageParts: UsageCostSummary[] = [];
+      const delegatedTaskStates = new Map<string, string | undefined>();
       while (retryText !== undefined) {
         activeTurn = new AbortController();
         activeTurnCancelMessage = "Cancelling current turn. Press Ctrl+C again or type /exit to leave.";
@@ -622,6 +807,7 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
         let operatorConsoleSteerState: SteerState | undefined;
         let operatorConsoleSteerSequence = 0;
         let disposeOperatorConsoleSteerInput: (() => void) | undefined;
+        let operatorConsoleInputLifecycle: TerminalLifecycle | undefined;
         const operatorConsoleLiveFrame = operatorConsoleRuntimeHost === undefined
           ? undefined
           : new LiveOperatorConsoleController({
@@ -636,6 +822,11 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
               supportsAnimation: renderer.capabilities.supportsAnimation,
             },
             getStatus: getOperatorConsoleStatus,
+            refreshTasks: refreshOperatorConsoleTasks,
+            getTasks: getOperatorConsoleTasks,
+            onMouseModeChange: (active) => {
+              operatorConsoleInputLifecycle?.setMouseTracking(active);
+            },
             turnStartedAtMs,
           });
         let turnWasCancelled = false;
@@ -694,10 +885,10 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
           writeTurnBoundaryRows(block.text.split("\n"), { redrawLiveFrame: true });
         }
 
-        function currentDraftSteerState(draft: string): SteerState {
+        function currentDraftSteerState(draft: string, cursorOffset: number = draft.length): SteerState {
           return {
             draft,
-            cursorOffset: draft.length,
+            cursorOffset,
             mode: "drafting",
           };
         }
@@ -732,13 +923,6 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
             return;
           }
 
-          if (event.type === "key" && event.key === "backspace") {
-            if (current?.mode !== "drafting") return;
-            const nextDraft = current.draft.slice(0, -1);
-            setOperatorConsoleSteerState(nextDraft.length === 0 ? undefined : currentDraftSteerState(nextDraft));
-            return;
-          }
-
           if (event.type === "key" && event.ctrl === true && event.key === "u") {
             if (current?.mode === "drafting") {
               setOperatorConsoleSteerState(undefined);
@@ -762,15 +946,23 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
             return;
           }
 
-          if (event.type !== "text" && event.type !== "paste") {
-            return;
-          }
           if (queued !== undefined) {
-            setOperatorConsoleSteerState(currentQueuedSteerState(queued));
             return;
           }
-          const nextDraft = `${current?.mode === "drafting" ? current.draft : ""}${event.text}`;
-          setOperatorConsoleSteerState(currentDraftSteerState(nextDraft));
+          const line = applyKeypress(
+            createLineEditorState(
+              current?.mode === "drafting" ? current.draft : "",
+              current?.mode === "drafting" ? current.cursorOffset : 0
+            ),
+            event
+          ).state;
+          const unchanged = current?.mode === "drafting"
+            ? line.text === current.draft && line.cursor === current.cursorOffset
+            : line.text.length === 0 && line.cursor === 0;
+          if (unchanged) return;
+          setOperatorConsoleSteerState(
+            line.text.length === 0 ? undefined : currentDraftSteerState(line.text, line.cursor)
+          );
         }
 
         function startOperatorConsoleSteerInput(): (() => void) | undefined {
@@ -788,9 +980,11 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
             stdout: output as NodeJS.WriteStream,
             hideCursor: false,
           });
+          operatorConsoleInputLifecycle = lifecycle;
           const keypressDispatcher = createKeypressStreamDispatcher({
             onEvents: (events: readonly ParsedKeypress[]) => {
               for (const event of events) {
+                if (operatorConsoleLiveFrame?.routeInput(event) === true) continue;
                 handleOperatorConsoleSteerKey(event);
               }
             },
@@ -800,12 +994,15 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
             keypressDispatcher.handle(chunk);
           };
           lifecycle.start();
+          lifecycle.resetMouseTracking();
           cliInput.on("data", onData);
           cliInput.resume();
           return () => {
+            operatorConsoleLiveFrame?.setMouseModeActive(false);
             keypressDispatcher.dispose();
             cliInput.off("data", onData);
             lifecycle.stop();
+            operatorConsoleInputLifecycle = undefined;
           };
         }
 
@@ -909,8 +1106,29 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
 	            clearActiveTurnChrome = () => undefined;
 	          });
         const response = await responsePromise;
+        if (response.turnUsage?.turnId !== undefined) {
+          taskTurnScope.currentTurnIds.add(response.turnUsage.turnId);
+        }
+        if (response.turnUsage !== undefined) {
+          mainAgentUsageParts.push(response.turnUsage.mainAgent);
+          auxiliaryUsageParts.push(response.turnUsage.auxiliaryModels);
+          delegatedUsageParts.push(response.turnUsage.delegatedWork);
+          totalUsageParts.push(response.turnUsage.total);
+        }
+        recordDelegatedTaskStates(response.toolExecutions, delegatedTaskStates);
+        const delegatedWorkActive = hasActiveDelegatedTask(delegatedTaskStates, runtime);
+        const deliveredTurnUsage = combinedTurnUsage(
+          response.turnUsage,
+          mainAgentUsageParts,
+          auxiliaryUsageParts,
+          delegatedUsageParts,
+          totalUsageParts,
+          delegatedWorkActive
+        );
+        await refreshSessionCost(true);
+        const willRetryForSteering = pendingSteeringNote !== undefined && !steeringRetryUsed;
         const completedActiveWork = operatorConsoleLiveFrame?.completeActiveWork();
-        if (completedActiveWork !== undefined) {
+        if (completedActiveWork !== undefined && !willRetryForSteering) {
           const completedRows = renderCompletedActiveWorkSurface(completedActiveWork, {
             width: termWidth,
             locale: renderer.locale,
@@ -933,7 +1151,7 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
 	          timerMode = "last-turn";
 	        }
 	        writeSessionStatusRail();
-	        if (pendingSteeringNote !== undefined && !steeringRetryUsed) {
+	        if (willRetryForSteering && pendingSteeringNote !== undefined) {
 	          operatorConsoleLiveFrame?.resetStreaming();
 	          const steeringNote = pendingSteeringNote;
 	          pendingSteeringNote = undefined;
@@ -954,6 +1172,9 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
 	        const assistantVm = buildAssistantResponseViewModel({
 	          label: response.label,
           text: response.text,
+          usageFooter: deliveredTurnUsage === undefined
+            ? undefined
+            : formatTurnUsageFooter(deliveredTurnUsage, { locale: renderer.locale === "ar" ? "ar" : "en" }),
           matchedSkills: response.matchedSkills,
 	          progress: options.showResponseProgress === true ? response.progress : undefined,
 	        });
@@ -965,6 +1186,19 @@ export async function runSessionLoop(options: SessionLoopOptions): Promise<void>
 	          output.write(`${providerServingAlert}\n`);
 	        }
 	        output.write(renderer.render(assistantVm));
+        for (const notice of delegatedTaskNotices(
+          response.toolExecutions,
+          runtime,
+          renderer.locale === "ar" ? "ar" : "en",
+          operatorConsoleEnabled
+        )) {
+          output.write(`${notice}\n`);
+        }
+        mainAgentUsageParts.length = 0;
+        auxiliaryUsageParts.length = 0;
+        delegatedUsageParts.length = 0;
+        totalUsageParts.length = 0;
+        delegatedTaskStates.clear();
         if (turnVoiceMode === "tts") {
           const playback = await playCliResponseIfEnabled({
             runtime,
@@ -1196,6 +1430,7 @@ export async function handleSlashCommand(input: {
   output: NodeJS.WritableStream;
   renderer: {
     render(viewModel: import("../contracts/view-model.js").ViewModel): string;
+    locale?: "en" | "ar";
     capabilities?: TerminalCapabilities;
     tokens?: ResolvedTokens;
   };
@@ -1531,9 +1766,32 @@ export async function handleSlashCommand(input: {
     case "doctor":
       input.output.write(`${await renderRuntimeDoctor(input.runtime)}\n\n`);
       return false;
-    case "workflow": {
-      const result = await handleWorkflowCommand(input, args);
-      input.output.write(`${result}\n\n`);
+    case "task": {
+      if (input.runtime.taskOperator === undefined) {
+        input.output.write(input.renderer.locale === "ar"
+          ? "أوامر المهام الدائمة غير متاحة في بيئة التشغيل هذه.\n\n"
+          : "Durable Task commands are unavailable in this runtime.\n\n");
+        return false;
+      }
+      const taskProfileId = await runtimeProfileId(input.runtime);
+      const result = await executeTaskCommand({
+        args,
+        service: input.runtime.taskOperator,
+        locale: input.renderer.locale === "ar" ? "ar" : "en",
+        authorizedSessionId: input.runtime.sessionId,
+        begin: input.runtime.beginTask === undefined
+          ? undefined
+          : async (objective, _creatorSessionId, executionPreference) => ({
+              task: await input.runtime.beginTask!(objective, { executionPreference }),
+              creatorSessionId: input.runtime.sessionId
+            }),
+        workspaceTrusted: async () => input.runtime.isWorkspaceTrusted(),
+        backgroundHost: async () => detectTaskBackgroundHost({
+          homeDir: input.homeDir,
+          profileId: taskProfileId
+        })
+      });
+      input.output.write(`${result.output}\n\n`);
       return false;
     }
     case "handoff": {
@@ -1971,270 +2229,6 @@ function createNoticeLabelFormatter(
     !capabilities.isDumb;
   if (!supportsStyledNotice) return (value) => value;
   return (value) => `\u001b[1m${value}\u001b[22m`;
-}
-
-async function handleWorkflowCommand(input: {
-  runtime: Runtime;
-  output: NodeJS.WritableStream;
-}, args: string[]): Promise<string> {
-  if (input.runtime.workflow === undefined) {
-    return "Workflow is not available. It requires SQLite session persistence.";
-  }
-
-  const { workflow } = input.runtime;
-  const [subcommand = "", ...rest] = args;
-
-  switch (subcommand) {
-    case "":
-    case "help":
-      return [
-        "Workflow operator commands (v0.8)",
-        "  /workflow begin <objective>        Create, start, and activate a workflow",
-        "  /workflow begin --skill <name> <objective>",
-        "                                      Create a workflow from a skill playbook",
-        "  /workflow status [runId]           Show workflow status (active workflow if omitted)",
-        "  /workflow pause <runId> [reason]   Request pause at next safe boundary",
-        "  /workflow resume <runId>           Resume a paused/interrupted/waiting workflow",
-        "  /workflow interrupt <runId> [r]    Interrupt a running workflow",
-        "  /workflow cancel <runId> [reason]  Cancel a workflow",
-        "  /workflow steer <runId> <text...>  Inject operator guidance into a workflow",
-        "  /workflow approve <stepId>         Approve a pending approval gate",
-        "  /workflow reject <stepId> [reason] Reject a pending approval gate",
-        "  /workflow retry <stepId>           Retry a failed step",
-        "  /workflow skip <stepId> [reason]   Skip a skippable step",
-        "  /workflow checkpoint <runId> <n>   Create a named checkpoint",
-        "  /workflow trace [runId] [limit]    Show workflow trace",
-        "  /workflow summarize <runId>        Summarize workflow events",
-        "  /workflow activate <runId>         Activate workflow for this session",
-        "  /workflow deactivate               Clear active workflow"
-      ].join("\n");
-
-    case "begin": {
-      const parsed = parseInteractiveWorkflowBeginArgs(rest);
-      if (parsed.error !== undefined) return parsed.error;
-      if (parsed.objective.length === 0) {
-        return parsed.skillName === undefined
-          ? "Usage: /workflow begin <objective>"
-          : "Usage: /workflow begin --skill <skillName> <objective>";
-      }
-      const resolveSkill = input.runtime.resolveSkill;
-      if (parsed.skillName !== undefined && resolveSkill === undefined) {
-        return "Skill-backed workflow begin is not available in this runtime.";
-      }
-      const skill = parsed.skillName === undefined ? undefined : resolveSkill?.(parsed.skillName);
-      if (parsed.skillName !== undefined && skill === undefined) return `Skill not found: ${parsed.skillName}`;
-      const result = skill === undefined
-        ? await beginExplicitWorkflowRun({
-            engine: workflow.engine,
-            sessionId: input.runtime.sessionId,
-            objective: parsed.objective
-          })
-        : await beginSkillPlaybookWorkflowRun({
-            engine: workflow.engine,
-            sessionId: input.runtime.sessionId,
-            objective: parsed.objective,
-            skill
-          });
-      workflow.setActiveRunId(result.run.id);
-      return [
-        `Created workflow: ${result.run.id}`,
-        `Started workflow: ${result.run.id}`,
-        `Activated workflow: ${result.run.id}`
-      ].join("\n");
-    }
-
-    case "status": {
-      const runId = rest[0] ?? workflow.activeRunId ?? undefined;
-      if (runId === undefined) return "No active workflow. Use /workflow activate <runId> or pass a run ID.";
-      const result = await workflow.dispatcher.dispatch({ command: "/status", runId: runId });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "pause": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow pause <runId> [reason]";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/pause",
-        runId: runId,
-        reason: rest.slice(1).join(" ") || undefined,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "resume": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow resume <runId>";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/resume",
-        runId: runId,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "interrupt": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow interrupt <runId> [reason]";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/interrupt",
-        runId: runId,
-        reason: rest.slice(1).join(" ") || undefined,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "cancel": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow cancel <runId> [reason]";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/cancel",
-        runId: runId,
-        reason: rest.slice(1).join(" ") || undefined,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "steer": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow steer <runId> <guidance>";
-      const guidance = rest.slice(1).join(" ");
-      if (guidance.length === 0) return "Usage: /workflow steer <runId> <guidance>";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/steer",
-        runId: runId,
-        guidance,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "approve": {
-      const stepId = rest[0];
-      if (stepId === undefined) return "Usage: /workflow approve <stepId>";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/approve",
-        stepId,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "reject": {
-      const stepId = rest[0];
-      if (stepId === undefined) return "Usage: /workflow reject <stepId> [reason]";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/reject",
-        stepId,
-        reason: rest.slice(1).join(" ") || undefined,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "retry": {
-      const stepId = rest[0];
-      if (stepId === undefined) return "Usage: /workflow retry <stepId>";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/retry",
-        stepId,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "skip": {
-      const stepId = rest[0];
-      if (stepId === undefined) return "Usage: /workflow skip <stepId> [reason]";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/skip",
-        stepId,
-        reason: rest.slice(1).join(" ") || undefined,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "checkpoint": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow checkpoint <runId> <name>";
-      const name = rest.slice(1).join(" ");
-      if (name.length === 0) return "Usage: /workflow checkpoint <runId> <name>";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/checkpoint",
-        runId: runId,
-        name,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "trace": {
-      const runId = rest[0] ?? workflow.activeRunId ?? undefined;
-      const limit = runId !== undefined && rest[1] !== undefined ? parseInt(rest[1], 10) : undefined;
-      if (runId === undefined) return "No active workflow. Use /workflow activate <runId> or pass a run ID.";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/trace",
-        runId: runId,
-        limit: Number.isNaN(limit) ? undefined : limit
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "summarize": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow summarize <runId>";
-      const result = await workflow.dispatcher.dispatch({
-        command: "/compact",
-        runId: runId,
-        operator: "cli"
-      });
-      return result.ok ? result.message : `Error: ${result.error}`;
-    }
-
-    case "activate": {
-      const runId = rest[0];
-      if (runId === undefined) return "Usage: /workflow activate <runId>";
-      const run = await workflow.store.getWorkflowRun(runId);
-      if (run === null) return `Workflow run not found: ${runId}`;
-      workflow.setActiveRunId(runId);
-      return `Activated workflow: ${runId}`;
-    }
-
-    case "deactivate": {
-      workflow.setActiveRunId(null);
-      return "Active workflow cleared. Normal agent mode.";
-    }
-
-    default:
-      return `Unknown workflow command: ${subcommand}\nUse /workflow help for available commands.`;
-  }
-}
-
-function parseInteractiveWorkflowBeginArgs(args: string[]): { skillName?: string; objective: string; error?: string } {
-  const objectiveParts: string[] = [];
-  let skillName: string | undefined;
-
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    if (arg === "--skill") {
-      const value = args[index + 1];
-      if (value === undefined || value.startsWith("-")) {
-        return { objective: "", error: "Usage: /workflow begin --skill <skillName> <objective>" };
-      }
-      skillName = value;
-      index++;
-      continue;
-    }
-    objectiveParts.push(arg);
-  }
-
-  return {
-    skillName,
-    objective: objectiveParts.join(" ").trim()
-  };
 }
 
 async function renderSecurityAudit(
@@ -2874,6 +2868,10 @@ export function renderRuntimeEvent(
       clearActiveSpinnerLine();
       safeWrite(`\nprovider budget: ${event.reason}\n`);
       return undefined;
+    case "provider-spending-warning":
+      clearActiveSpinnerLine();
+      safeWrite(`\n${formatSpendingThresholdWarning(event, locale)}\n`);
+      return undefined;
     case "context-estimate":
     case "context-window-usage":
       return undefined;
@@ -2945,6 +2943,121 @@ function truncateSingleLine(value: string, maxLength: number): string {
   }
 
   return `${singleLine.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function combinedTurnUsage(
+  current: TurnUsageSummary | undefined,
+  mainAgentParts: readonly UsageCostSummary[],
+  auxiliaryParts: readonly UsageCostSummary[],
+  delegatedParts: readonly UsageCostSummary[],
+  totalParts: readonly UsageCostSummary[],
+  provisional: boolean
+): TurnUsageSummary | undefined {
+  if (mainAgentParts.length === 0 || totalParts.length === 0) return undefined;
+  return {
+    turnId: current?.turnId ?? "combined-turn",
+    mainAgent: mergeUsageCostSummaries(mainAgentParts),
+    auxiliaryModels: mergeUsageCostSummaries(auxiliaryParts),
+    delegatedWork: mergeUsageCostSummaries(delegatedParts),
+    total: mergeUsageCostSummaries(totalParts),
+    provisional
+  };
+}
+
+function copyForLocale(locale: "en" | "ar", english: string, arabic: string): string {
+  return locale === "ar" ? arabic : english;
+}
+
+function recordDelegatedTaskStates(
+  executions: readonly ToolExecutionRecord[],
+  taskStates: Map<string, string | undefined>
+): void {
+  for (const execution of executions) {
+    if (execution.tool.name !== "delegate_task" || execution.result?.ok !== true) continue;
+    const taskId = execution.result.metadata?.taskId;
+    if (typeof taskId !== "string" || taskId.length === 0) continue;
+    const status = execution.result.metadata?.status;
+    taskStates.set(taskId, typeof status === "string" ? status : undefined);
+  }
+}
+
+function hasActiveDelegatedTask(
+  taskStates: ReadonlyMap<string, string | undefined>,
+  runtime: Runtime
+): boolean {
+  for (const [taskId, recordedStatus] of taskStates) {
+    if (runtime.taskOperator === undefined) {
+      if (recordedStatus === undefined || !["completed", "partial", "failed", "cancelled"].includes(recordedStatus)) {
+        return true;
+      }
+      continue;
+    }
+    try {
+      const status = runtime.taskOperator.status(taskId, runtime.sessionId).status;
+      if (!["completed", "partial", "failed", "cancelled"].includes(status)) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function delegatedTaskNotices(
+  executions: readonly ToolExecutionRecord[],
+  runtime: Runtime,
+  locale: "en" | "ar",
+  liveTaskCardsVisible: boolean
+): readonly string[] {
+  if (liveTaskCardsVisible) return [];
+  const notices: string[] = [];
+  const seen = new Set<string>();
+  for (const execution of executions) {
+    if (execution.tool.name !== "delegate_task" || execution.result?.ok !== true) continue;
+    const taskId = execution.result.metadata?.taskId;
+    if (typeof taskId !== "string" || taskId.length === 0 || seen.has(taskId)) continue;
+    seen.add(taskId);
+    const metadataStatus = execution.result.metadata?.status;
+    let phase = typeof metadataStatus === "string" ? metadataStatus : "queued";
+    let workerProgress: TaskStatusProjection["phase"]["workerProgress"];
+    try {
+      const projection = runtime.taskOperator?.status(taskId, runtime.sessionId);
+      phase = projection?.phase.name ?? projection?.status ?? phase;
+      workerProgress = projection?.phase.workerProgress;
+    } catch {
+      // The durable handle is still valid when its retained card has not refreshed yet.
+    }
+    notices.push(locale === "ar"
+      ? isolateRtl(`مهمة مفوضة ${isolateLtr(taskId)} · ${localizedTaskStatus(phase, "ar")}`)
+      : `Delegated Task ${taskId} · ${localizedTaskStatus(phase, "en")}`);
+    if (workerProgress !== undefined) {
+      const progress = workerProgress.completed === workerProgress.total
+        ? locale === "ar"
+          ? `اكتملت ${workerProgress.completed} من ${workerProgress.total} خطوات مفوضة`
+          : `${workerProgress.completed} of ${workerProgress.total} delegated Steps completed`
+        : locale === "ar"
+          ? `استقرت ${workerProgress.settled} من ${workerProgress.total} خطوات مفوضة`
+          : `${workerProgress.settled} of ${workerProgress.total} delegated Steps settled`;
+      notices.push(locale === "ar" ? isolateRtl(progress) : progress);
+    }
+  }
+  return notices;
+}
+
+function localizedTaskStatus(status: string, locale: "en" | "ar"): string {
+  if (locale === "en") return status;
+  switch (status) {
+    case "queued": return "قيد الانتظار";
+    case "running": return "قيد التنفيذ";
+    case "delegating": return "يتم تنفيذ العمل المفوض";
+    case "synthesizing": return "يتم تجميع النتائج";
+    case "completed": return "مكتملة";
+    case "partial": return "مكتملة جزئياً";
+    case "failed": return "فشلت";
+    case "cancelled": return "ملغاة";
+    case "paused": return "متوقفة مؤقتاً";
+    case "waiting-for-approval": return "بانتظار الموافقة";
+    default: return isolateLtr(status);
+  }
 }
 
 async function initialContextUsageForRuntime(runtime: Runtime): Promise<ContextUsageSnapshot | undefined> {
@@ -3050,6 +3163,218 @@ function operatorConsoleTerminalHeight(output: NodeJS.WritableStream): number {
   const rows = (output as { readonly rows?: number }).rows;
   if (rows === undefined || !Number.isFinite(rows)) return OPERATOR_CONSOLE_FALLBACK_TERMINAL_HEIGHT;
   return Math.max(1, Math.floor(rows));
+}
+
+type TaskTurnScope = {
+  readonly currentTurnIds: Set<string>;
+  readonly supersededTurnIds: Set<string>;
+};
+
+async function initialTaskTurnScope(runtime: Runtime): Promise<TaskTurnScope> {
+  let userTurnIds: string[] = [];
+  try {
+    userTurnIds = (await runtime.sessionDb.listMessages(runtime.sessionId))
+      .filter((message) => message.role === "user")
+      .map((message) => message.id);
+  } catch {
+    // A missing transcript must not hide active Tasks. Terminal Tasks still become receipts.
+  }
+  const latestTurnId = userTurnIds.at(-1);
+  const currentTurnIds = new Set(latestTurnId === undefined ? [] : [latestTurnId]);
+  const supersededTurnIds = new Set(userTurnIds.slice(0, -1));
+  try {
+    for (const task of runtime.taskOperator?.list({ authorizedSessionId: runtime.sessionId, limit: 100 }) ?? []) {
+      if (task.originTurnId !== undefined && task.originTurnId !== latestTurnId) {
+        supersededTurnIds.add(task.originTurnId);
+      }
+    }
+  } catch {
+    // Projection refresh remains best effort; authorization and storage errors stay non-fatal in the CLI.
+  }
+  return { currentTurnIds, supersededTurnIds };
+}
+
+function operatorConsoleTaskCards(
+  runtime: Runtime,
+  supersededTurnIds: ReadonlySet<string>
+): readonly TaskCardState[] {
+  if (runtime.taskOperator === undefined) return [];
+  try {
+    return runtime.taskOperator.list({ authorizedSessionId: runtime.sessionId, limit: 12 })
+      .map((task) => taskProjectionToCard(task, { supersededTurnIds }));
+  } catch {
+    return [];
+  }
+}
+
+function taskApprovalToCard(
+  approval: PendingTaskApproval,
+  locale: import("../ui/tool-display.js").ToolDisplayLocale
+): ApprovalCardState {
+  const summary = locale === "ar"
+    ? isolateRtl(`المهمة ${isolateLtr(approval.taskId)} · موافقة لمرة واحدة فقط`)
+    : `Task ${approval.taskId} · approve once only`;
+  return {
+    id: approval.approvalId,
+    status: "pending",
+    action: toolDisplayLabel(approval.toolName, locale),
+    target: approval.targetPreview,
+    risk: approval.riskClass,
+    summary
+  };
+}
+
+export function taskProjectionToCard(
+  task: TaskStatusProjection,
+  options: { readonly supersededTurnIds?: ReadonlySet<string> } = {}
+): TaskCardState {
+  const presentation = isTerminalTaskStatus(task.status) ||
+    (task.originTurnId !== undefined && options.supersededTurnIds?.has(task.originTurnId) === true)
+    ? "receipt"
+    : "expanded";
+  return {
+    taskId: task.taskId,
+    ...(task.originTurnId === undefined ? {} : { originTurnId: task.originTurnId }),
+    presentation,
+    objective: task.objective,
+    status: task.status,
+    executionPreference: task.executionPreference,
+    execution: task.execution,
+    foregroundOwnerActive: task.foregroundOwnerActive,
+    backgroundContinuation: task.backgroundContinuation,
+    ...(task.executionWaitingReason === undefined ? {} : { executionWaitingReason: task.executionWaitingReason }),
+    progress: {
+      completed: task.progress.completed,
+      skipped: task.progress.skipped,
+      total: task.progress.total,
+    },
+    ...(task.planRevision === undefined ? {} : { planRevision: { ...task.planRevision } }),
+    steps: task.steps.map((step) => ({
+      stepId: step.stepId,
+      position: step.position,
+      title: step.title,
+      objective: step.objective,
+      executorRole: step.executorRole,
+      status: step.status,
+      dependsOn: [...step.dependsOn],
+      childTaskPolicy: step.childTaskPolicy,
+      usage: taskUsageToCard(step.usage),
+      attempts: step.attempts.map(taskAttemptToCard),
+      ...(step.latestAttempt === undefined ? {} : { latestAttempt: taskAttemptToCard(step.latestAttempt) }),
+      ...(step.activeAttempt === undefined ? {} : { activeAttempt: taskAttemptToCard(step.activeAttempt) }),
+    })),
+    subagents: task.subagents.map((subagent) => ({
+      stepId: subagent.stepId,
+      position: subagent.position,
+      displayIndex: subagent.displayIndex,
+      displayLabel: subagent.displayLabel,
+      title: subagent.title,
+      objective: subagent.objective,
+      role: subagent.role,
+      status: subagent.status,
+      dependsOn: [...subagent.dependsOn],
+      elapsedMs: subagent.elapsedMs,
+      ...(subagent.currentActivity === undefined ? {} : { currentActivity: subagent.currentActivity }),
+      ...(subagent.currentToolCategory === undefined ? {} : { currentToolCategory: subagent.currentToolCategory }),
+      ...(subagent.assistantPreview === undefined ? {} : { assistantPreview: subagent.assistantPreview }),
+      usage: {
+        total: taskUsageToCard(subagent.usage.total),
+        ...(subagent.usage.currentAttempt === undefined
+          ? {}
+          : { currentAttempt: taskUsageToCard(subagent.usage.currentAttempt) })
+      },
+      attempts: subagent.attempts.map(taskAttemptToCard),
+      ...(subagent.latestAttempt === undefined ? {} : { latestAttempt: taskAttemptToCard(subagent.latestAttempt) }),
+      ...(subagent.activeAttempt === undefined ? {} : { activeAttempt: taskAttemptToCard(subagent.activeAttempt) }),
+      trace: subagent.trace.map((event) => ({ ...event })),
+      traceSummary: {
+        totalEvents: subagent.traceSummary.totalEvents,
+        categoryCounts: { ...subagent.traceSummary.categoryCounts },
+        hasEarlierEvents: subagent.traceSummary.hasEarlierEvents
+      },
+      results: subagent.results.map(taskResultToCard)
+    })),
+    trace: {
+      events: task.trace.events.map((event) => ({ ...event })),
+      totalEvents: task.trace.totalEvents,
+      categoryCounts: { ...task.trace.categoryCounts },
+      hasEarlierEvents: task.trace.hasEarlierEvents
+    },
+    childTasks: task.childTasks.map((child) => ({ ...child })),
+    phase: {
+      name: task.phase.name,
+      ...(task.phase.workerProgress === undefined
+        ? {}
+        : { workerProgress: { ...task.phase.workerProgress } }),
+    },
+    recentActivity: task.recentActivity.map((activity) => ({ ...activity })),
+    ...(task.currentToolCategory === undefined ? {} : { currentToolCategory: task.currentToolCategory }),
+    elapsedMs: task.elapsedMs,
+    usage: taskUsageToCard(task.usage),
+    ...(task.spending === undefined ? {} : { spending: { ...task.spending } }),
+    results: task.results.map(taskResultToCard),
+    ...(task.waitReason === undefined ? {} : { waitReason: task.waitReason }),
+    ...(task.failure === undefined ? {} : { failure: { ...task.failure } }),
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+  };
+}
+
+function isTerminalTaskStatus(status: TaskStatusProjection["status"]): boolean {
+  return status === "completed" || status === "partial" || status === "failed" || status === "cancelled";
+}
+
+function taskAttemptToCard(
+  attempt: TaskStatusProjection["steps"][number]["attempts"][number]
+): TaskCardState["steps"][number]["attempts"][number] {
+  return {
+    attemptId: attempt.attemptId,
+    taskId: attempt.taskId,
+    stepId: attempt.stepId,
+    attemptNumber: attempt.attemptNumber,
+    status: attempt.status,
+    ...(attempt.workerSessionId === undefined ? {} : { workerSessionId: attempt.workerSessionId }),
+    createdAt: attempt.createdAt,
+    updatedAt: attempt.updatedAt,
+    ...(attempt.startedAt === undefined ? {} : { startedAt: attempt.startedAt }),
+    ...(attempt.completedAt === undefined ? {} : { completedAt: attempt.completedAt }),
+    elapsedMs: attempt.elapsedMs,
+    ...(attempt.currentActivity === undefined ? {} : { currentActivity: attempt.currentActivity }),
+    ...(attempt.currentToolCategory === undefined ? {} : { currentToolCategory: attempt.currentToolCategory }),
+    ...(attempt.assistantPreview === undefined ? {} : { assistantPreview: attempt.assistantPreview }),
+    usage: taskUsageToCard(attempt.usage)
+  };
+}
+
+function taskResultToCard(
+  result: TaskStatusProjection["results"][number]
+): TaskCardState["results"][number] {
+  return {
+    id: result.id,
+    handle: result.handle,
+    kind: result.kind,
+    disposition: result.disposition,
+    status: result.status,
+    byteLength: result.byteLength,
+    primary: result.primary,
+    ...(result.stepId === undefined ? {} : { stepId: result.stepId }),
+    ...(result.attemptId === undefined ? {} : { attemptId: result.attemptId }),
+    ...(result.mimeType === undefined ? {} : { mimeType: result.mimeType }),
+    ...(result.displaySummary === undefined ? {} : { displaySummary: result.displaySummary }),
+    ...(result.summary === undefined ? {} : { summary: result.summary })
+  };
+}
+
+function taskUsageToCard(usage: import("../contracts/task.js").TaskUsageTotals): TaskCardState["usage"] {
+  return {
+    providerCalls: usage.providerCalls,
+    totalTokens: usage.totalTokens,
+    ...(usage.pricingComplete || usage.estimatedCostUsd > 0
+      ? { estimatedCostUsd: usage.estimatedCostUsd }
+      : {}),
+    usageComplete: usage.usageComplete,
+    pricingComplete: usage.pricingComplete
+  };
 }
 
 function ansiColor(text: string, hex: string): string {

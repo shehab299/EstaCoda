@@ -2,6 +2,8 @@
 // Pure structured data types for all CLI output surfaces.
 // No ANSI, formatting, terminal-width, or rendering logic.
 
+import type { SessionCostSummary } from "./usage-cost.js";
+
 export type ViewModelSeverity = "ok" | "warn" | "error" | "info";
 
 // ─────────────────────────────────────────────────────────────
@@ -24,8 +26,6 @@ export interface StatusViewModel {
     readonly active: number;
     readonly total: number;
   };
-  readonly workflowAvailable: boolean;
-  readonly workflowRunActive: boolean;
   readonly warnings: readonly WarningErrorViewModel[];
   readonly sections?: readonly ViewModel[];
 }
@@ -275,6 +275,7 @@ export interface AssistantResponseViewModel {
   readonly kind: "assistantResponse";
   readonly label: string;
   readonly text: string;
+  readonly usageFooter?: string;
   readonly matchedSkills?: readonly string[];
   readonly progress?: readonly string[];
 }
@@ -404,6 +405,7 @@ export interface SessionStatusRailViewModel {
     readonly filled?: number;
     readonly total: number;
   };
+  readonly sessionCost?: Pick<SessionCostSummary, "estimatedCostUsd" | "costComplete" | "budget">;
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -3,6 +3,8 @@ import { resolveProfileStateHome } from "../config/profile-home.js";
 import type { LoadedRuntimeConfig } from "../config/runtime-config.js";
 import { resolveAuxiliaryModelRoute } from "../providers/auxiliary-model-resolver.js";
 import { ProviderExecutor } from "../providers/provider-executor.js";
+import { createProviderUsageRecorder } from "../providers/provider-usage-ledger.js";
+import { SQLiteProviderSpendController } from "../tasks/sqlite-provider-spend.js";
 import type { SQLiteSessionDB } from "../session/sqlite-session-db.js";
 import type { SessionFinalizationJob } from "../session/session-finalization-queue.js";
 import { MemoryCurationStore, memoryCurationStorePath } from "./memory-curation-store.js";
@@ -84,6 +86,13 @@ export async function curateSessionFinalizationJob(input: {
       registry: input.config.providerRegistry,
       homeDir: input.homeDir,
       profileId: input.profileId,
+      spendController: new SQLiteProviderSpendController({ db: input.sessionDb.db, profileId: input.profileId }),
+      usageRecorder: createProviderUsageRecorder({
+        profileId: input.profileId,
+        record: (entries) => input.sessionDb.recordProviderUsageEntries(entries),
+        resolveSessionBudgetScopeId: async (sessionId) =>
+          (await input.sessionDb.getSessionForProfile(sessionId, input.profileId))?.spendingScopeSessionId
+      })
     });
     const externalMemory = input.config.externalMemory;
     const externalMemoryProviders = createExternalMemoryProvidersFromConfig(externalMemory, {

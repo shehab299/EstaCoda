@@ -271,49 +271,24 @@ Manage local browser/CDP connection.
 
 ---
 
-## Workflow
+## Durable Tasks
 
-Requires SQLite session persistence. Available when Workflow is wired.
+### `/task <subcommand>`
 
-```bash
-/workflow begin <objective>
-/workflow begin --skill <skillName> <objective>
-/workflow status [runId]
-/workflow pause <runId> [reason]
-/workflow resume <runId>
-/workflow interrupt <runId> [reason]
-/workflow cancel <runId> [reason]
-/workflow steer <runId> <guidance>
-/workflow approve <stepId>
-/workflow reject <stepId> [reason]
-/workflow retry <stepId>
-/workflow skip <stepId> [reason]
-/workflow checkpoint <runId> <name>
-/workflow trace [runId] [limit]
-/workflow summarize <runId>
-/workflow activate <runId>
-/workflow deactivate
+```text
+/task begin [--background] <objective>
+/task list [limit]
+/task show <task-id>
+/task pause <task-id>
+/task resume <task-id>
+/task cancel <task-id>
+/task retry <task-id> [step-id]
+/task result <task-id>
 ```
 
-If `runId` is omitted for `status` and `trace`, the active workflow run is used.
+**State touched:** Profile-scoped durable Task records. Result bodies remain in the profile's private result store.
 
-**State touched:** SQLite session DB (`workflow_events`, `workflow_steps`).
-
-**Behavior:**
-- `/workflow begin <objective>` creates a conservative one-step workflow run, starts it, and activates it in the current interactive session.
-- `/workflow begin --skill <skillName> <objective>` resolves the named skill, compiles its playbook, converts it into a `WorkflowPlan`, creates the run, starts it, and activates it in the current interactive session.
-- Successful begin prints `Created workflow: <runId>`, `Started workflow: <runId>`, and `Activated workflow: <runId>`.
-- Plain `/workflow begin <objective>` records explicit provenance and does not use playbook conversion.
-- `/workflow steer` records an unconsumed `OperatorEvent`. On the next adapter turn, guidance is prefixed to the user text in a structured block. Events are marked consumed and visible in `/workflow trace`.
-- `/workflow activate` binds the current session to a workflow run. `/workflow deactivate` clears the binding.
-
-**Failure modes:**
-- Missing objectives return usage text.
-- Unknown skills return a clear error.
-- Steer rejected for terminal-state workflow runs.
-- Retry requires `idempotent` or `safeToRetry` and `retryCount < maxRetries`.
-- Skip requires the step not started and `allowSkipIfSkippable`.
-- Workflow begin does not perform automatic workflow promotion, complex-request detection, Agent Evolution behavior, or automatic workflow creation from normal AgentLoop skill selection. `--skill` is explicit opt-in. `--use-selected-playbook` is not supported.
+**Behavior:** `/task begin` creates and links a conservative Task to the active session. By default the interactive process starts it immediately and the gateway can take over later. `--background` durably sends it to the gateway from the beginning. Status distinguishes lifecycle state from live foreground/background/waiting ownership and reports bounded continuation readiness without owner identities. In-session reads require a Task/session link; lifecycle mutations require the creator link.
 
 ---
 

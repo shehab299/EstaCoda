@@ -10,11 +10,20 @@ import type {
   ProviderFinishReason,
   ProviderLoopRuntimeMetadata,
   ProviderReasoningMetadata,
+  ProviderAttemptState,
   ProviderRouteRole,
   ProviderStreamDiagnostics,
   ProviderStreamFinish,
   ProviderUsage
 } from "../contracts/provider.js";
+import type { ProviderUsageContext, ProviderUsageEntry } from "../contracts/provider-usage.js";
+import type {
+  ProviderSpendAttempt,
+  ProviderSpendDenialReason,
+  ProviderSpendRequest,
+  ProviderSpendReservationResult,
+  ProviderSpendingWarning
+} from "../contracts/provider-spend.js";
 import { stripThinkBlocks } from "./provider-reasoning.js";
 import { ProviderRegistry } from "./provider-registry.js";
 import { resolveRuntimeCredential } from "./runtime-credential-resolver.js";
@@ -22,10 +31,15 @@ import { getProviderMetadata } from "./provider-metadata.js";
 import { isOAuthAuthMethod } from "./oauth/oauth-types.js";
 import { loadOAuthStore } from "./oauth/oauth-store.js";
 import { refreshOAuthToken } from "./oauth/oauth-refresh.js";
+import { providerUsageEntryFromAttempt } from "./provider-usage-ledger.js";
+import { prepareProviderSpend, providerSpendDenialMessage } from "./provider-spend-policy.js";
 
-export type ProviderAttempt = {
+export type ProviderAttempt = ProviderAttemptState & {
   provider: string;
   model: string;
+  /** Exact position and semantic role in the resolved route chain. */
+  routeIndex?: number;
+  routeRole?: ProviderRouteRole;
   credentialId?: string;
   ok: boolean;
   errorClass?: string;
@@ -38,6 +52,23 @@ export type ProviderAttempt = {
   streamDiagnostics?: ProviderStreamDiagnostics;
 };
 
+/** Runtime guard for injected executors and persisted/untyped boundaries. */
+export function assertProviderAttemptState(attempt: ProviderAttempt): void {
+  const candidate = attempt as ProviderAttempt & { state?: unknown; dispatchedAt?: unknown };
+  if (candidate.state === "preflight") {
+    if ("dispatchedAt" in candidate) {
+      throw new Error("A preflight provider Attempt cannot have a dispatch timestamp.");
+    }
+    return;
+  }
+  if (candidate.state === "dispatched" &&
+      typeof candidate.dispatchedAt === "string" &&
+      Number.isFinite(Date.parse(candidate.dispatchedAt))) {
+    return;
+  }
+  throw new Error("Provider Attempt dispatch state is missing or invalid.");
+}
+
 export type ProviderExecutionResult = {
   ok: boolean;
   response?: ProviderResponse;
@@ -48,6 +79,7 @@ export type ProviderExecutionResult = {
   attemptedRouteIndex?: number;
   routeRole?: ProviderRouteRole;
   runtimeMetadata?: ProviderLoopRuntimeMetadata;
+  spendDenialReason?: ProviderSpendDenialReason;
   toolCalls: Array<{
     index?: number;
     id?: string;
@@ -58,6 +90,10 @@ export type ProviderExecutionResult = {
 };
 
 export type ProviderRuntimeEvent =
+  | {
+      kind: "provider-spending-warning";
+      warning: ProviderSpendingWarning;
+    }
   | {
       kind: "provider-attempt-start";
       provider: string;
@@ -104,23 +140,68 @@ export type ProviderExecutionOptions = {
   fallbackChain?: ResolvedModelRoute[];
   onEvent?: (event: ProviderRuntimeEvent) => void | Promise<void>;
   now?: () => number;
+  usage?: ProviderUsageContext;
 };
 
 export type ProviderExecutorOptions = {
   registry: ProviderRegistry;
   homeDir?: string;
   profileId?: string;
+  usageRecorder?: (input: {
+    execution: ProviderExecutionResult;
+    context: ProviderUsageContext;
+    routes: readonly ResolvedModelRoute[];
+  }) => Promise<void>;
+  spendController?: ProviderSpendController;
+  /** Test-only compatibility for non-durable in-memory runtimes. Never enable for production SQLite execution. */
+  allowUnenforcedAttributedSpend?: boolean;
+};
+
+export type ProviderSpendController = {
+  reserve(
+    request: ProviderSpendRequest,
+    reservedAt: string
+  ): ProviderSpendReservationResult | Promise<ProviderSpendReservationResult>;
+  markDispatching(
+    requestKey: string,
+    dispatchingAt: string
+  ): ProviderSpendAttempt | Promise<ProviderSpendAttempt>;
+  releaseBeforeDispatch(
+    requestKey: string,
+    releasedAt: string
+  ): ProviderSpendAttempt | Promise<ProviderSpendAttempt>;
+  settle(
+    requestKey: string,
+    usage: ProviderUsageEntry,
+    settledAt: string
+  ): ProviderSpendAttempt | Promise<ProviderSpendAttempt>;
+  markUncertain(
+    requestKey: string,
+    uncertainAt: string,
+    reason: string
+  ): ProviderSpendAttempt | Promise<ProviderSpendAttempt>;
+  dispose?(disposedAt?: string): unknown | Promise<unknown>;
 };
 
 export class ProviderExecutor {
   readonly #registry: ProviderRegistry;
   readonly #homeDir: string | undefined;
   readonly #profileId: string | undefined;
+  readonly #usageRecorder: ProviderExecutorOptions["usageRecorder"];
+  readonly #spendController: ProviderSpendController | undefined;
+  readonly #allowUnenforcedAttributedSpend: boolean;
 
   constructor(options: ProviderExecutorOptions) {
     this.#registry = options.registry;
     this.#homeDir = options.homeDir;
     this.#profileId = options.profileId;
+    this.#usageRecorder = options.usageRecorder;
+    this.#spendController = options.spendController;
+    this.#allowUnenforcedAttributedSpend = options.allowUnenforcedAttributedSpend === true;
+  }
+
+  async dispose(): Promise<void> {
+    await this.#spendController?.dispose?.(new Date().toISOString());
   }
 
   async complete(
@@ -138,6 +219,7 @@ export class ProviderExecutor {
           {
             provider: request.provider ?? "none",
             model: request.model ?? "none",
+            state: "preflight",
             ok: false,
             errorClass: "missing-route",
             content: "No explicit primary route is available. Production execution requires a resolved model route."
@@ -146,8 +228,20 @@ export class ProviderExecutor {
         toolCalls: []
       };
     }
+    if (options.usage !== undefined && this.#usageRecorder === undefined && this.#spendController === undefined &&
+        !this.#allowUnenforcedAttributedSpend) {
+      throw new Error("Attributed provider execution requires an immutable usage recorder before dispatch.");
+    }
 
-    return this.#executeRouteChain(request, preferences, options);
+    const execution = await this.#executeRouteChain(request, preferences, options);
+    if (options.usage !== undefined && this.#usageRecorder !== undefined && this.#spendController === undefined) {
+      await this.#usageRecorder({
+        execution,
+        context: options.usage,
+        routes: [primaryRoute, ...(options.fallbackChain ?? [])]
+      });
+    }
+    return execution;
   }
 
   async #executeRouteChain(
@@ -179,6 +273,7 @@ export class ProviderExecutor {
         attempts.push({
           provider: route.provider,
           model: route.id,
+          state: "preflight",
           ok: false,
           errorClass: "unsupported",
           content: preferenceFailure
@@ -204,6 +299,7 @@ export class ProviderExecutor {
         attempts.push({
           provider: route.provider,
           model: route.id,
+          state: "preflight",
           ok: false,
           errorClass: provider === undefined ? undefined : "unsupported",
           content: reason
@@ -228,6 +324,7 @@ export class ProviderExecutor {
         attempts.push({
           provider: route.provider,
           model: route.id,
+          state: "preflight",
           ok: false,
           errorClass: "unsupported",
           content: reason
@@ -256,6 +353,7 @@ export class ProviderExecutor {
         attempts.push({
           provider: route.provider,
           model: route.id,
+          state: "preflight",
           ok: false,
           errorClass: "unsupported",
           content: reason
@@ -286,6 +384,7 @@ export class ProviderExecutor {
         attempts.push({
           provider: route.provider,
           model: route.id,
+          state: "preflight",
           ok: false,
           errorClass: "auth",
           content: errorContent
@@ -317,14 +416,54 @@ export class ProviderExecutor {
 
       while (routeAttemptCount < maxRouteAttempts) {
         routeAttemptCount++;
-
-        await options.onEvent?.({
-          kind: "provider-attempt-start",
-          provider: route.provider,
-          model: route.id,
-          credentialId: credential?.id,
-          fallback: index > 0
+        const dispatchedAt = new Date().toISOString();
+        const routeRequest = buildRouteProviderRequest(request, route, { stream: options.stream === true });
+        const providerAttemptIndex = attempts.length;
+        const authorization = await this.#authorizeProviderSpend({
+          request: routeRequest,
+          route,
+          routeIndex: index,
+          providerAttemptIndex,
+          usage: options.usage,
+          reservedAt: dispatchedAt
         });
+        for (const warning of authorization.warnings ?? []) {
+          try {
+            await options.onEvent?.({ kind: "provider-spending-warning", warning });
+          } catch {
+            // The warning is already durable. Presentation failure must not strand
+            // or cancel an otherwise valid provider reservation.
+          }
+        }
+        if (authorization.ok === false) {
+          const content = providerSpendDenialMessage(authorization.reason);
+          attempts.push({
+            provider: route.provider,
+            model: route.id,
+            routeIndex: index,
+            routeRole: routeRoleForIndex(index),
+            state: "preflight",
+            ok: false,
+            errorClass: "spend-denied",
+            content
+          });
+          await options.onEvent?.({
+            kind: "provider-attempt-end",
+            provider: route.provider,
+            model: route.id,
+            ok: false,
+            errorClass: "spend-denied",
+            fallback: index > 0,
+            willFallback: false
+          });
+          return {
+            ok: false,
+            fallbackUsed: index > 0,
+            attempts,
+            spendDenialReason: authorization.reason,
+            toolCalls
+          };
+        }
 
         const completionOptions: ProviderCompletionOptions = {
           credential,
@@ -340,28 +479,45 @@ export class ProviderExecutor {
           };
         }
 
-        const callResult = options.stream === true && provider.stream !== undefined
-          ? await collectProviderStream({
-              provider: route.provider,
-              model: route.id,
-              stream: provider.stream(buildRouteProviderRequest(request, route, { stream: true }), completionOptions),
-              onEvent: options.onEvent,
-              signal: options.signal,
-              now: options.now
-            })
-          : {
-              response: await provider.complete(buildRouteProviderRequest(request, route), completionOptions),
-              toolCalls: [],
-              streamDiagnostics: undefined
-            };
+        let callResult;
+        try {
+          await options.onEvent?.({
+            kind: "provider-attempt-start",
+            provider: route.provider,
+            model: route.id,
+            credentialId: credential?.id,
+            fallback: index > 0
+          });
+          callResult = options.stream === true && provider.stream !== undefined
+            ? await collectProviderStream({
+                provider: route.provider,
+                model: route.id,
+                stream: provider.stream(routeRequest, completionOptions),
+                onEvent: options.onEvent,
+                signal: options.signal,
+                now: options.now
+              })
+            : {
+                response: await provider.complete(routeRequest, completionOptions),
+                toolCalls: [],
+                streamDiagnostics: undefined
+              };
+        } catch (error) {
+          await this.#markDispatchedSpendUncertain(authorization.reservation, "provider-call-threw-after-dispatch");
+          throw error;
+        }
         const callResponse = callResult.response;
 
         const nextRoute = chain[index + 1];
         const callWillFallback = !callResponse.ok && shouldFallback(callResponse, route, nextRoute);
 
-        attempts.push({
+        const dispatchedAttempt: ProviderAttempt & { state: "dispatched"; dispatchedAt: string } = {
           provider: route.provider,
           model: route.id,
+          routeIndex: index,
+          routeRole: routeRoleForIndex(index),
+          state: "dispatched",
+          dispatchedAt,
           credentialId: credential?.id,
           ok: callResponse.ok,
           errorClass: callResponse.errorClass,
@@ -369,7 +525,38 @@ export class ProviderExecutor {
           ...(callResponse.partialContent === undefined ? {} : { partialContent: callResponse.partialContent }),
           ...(callResult.streamDiagnostics === undefined ? {} : { streamDiagnostics: callResult.streamDiagnostics }),
           ...attemptMetadataFromResponse(callResponse)
-        });
+        };
+        attempts.push(dispatchedAttempt);
+        if (authorization.reservation !== undefined && this.#spendController !== undefined) {
+          try {
+            const { sessionBudgetScopeId: _unverifiedScopeId, ...usageWithoutScope } = options.usage!;
+            const normalizedUsageContext: ProviderUsageContext =
+              authorization.reservation.request.sessionBudgetScopeId === undefined
+                ? usageWithoutScope
+                : {
+                    ...usageWithoutScope,
+                    sessionBudgetScopeId: authorization.reservation.request.sessionBudgetScopeId
+                  };
+            const usageEntry = providerUsageEntryFromAttempt({
+              attempt: dispatchedAttempt,
+              providerAttemptIndex,
+              profileId: authorization.reservation.request.profileId,
+              context: normalizedUsageContext,
+              routes: chain
+            });
+            await this.#spendController.settle(
+              authorization.reservation.request.requestKey,
+              usageEntry,
+              new Date().toISOString()
+            );
+          } catch (error) {
+            await this.#markDispatchedSpendUncertain(
+              authorization.reservation,
+              "provider-settlement-failed-after-dispatch"
+            );
+            throw error;
+          }
+        }
 
         if (!callResponse.ok) {
           await options.onEvent?.({
@@ -546,6 +733,114 @@ export class ProviderExecutor {
       ...(partialContent === undefined ? {} : { partialContent }),
       toolCalls
     };
+  }
+
+  async #authorizeProviderSpend(input: {
+    request: ProviderRequest;
+    route: ResolvedModelRoute;
+    routeIndex: number;
+    providerAttemptIndex: number;
+    usage?: ProviderUsageContext;
+    reservedAt: string;
+  }): Promise<
+    | { ok: true; reservation?: ProviderSpendAttempt; warnings?: readonly ProviderSpendingWarning[] }
+    | { ok: false; reason: ProviderSpendDenialReason; warnings?: readonly ProviderSpendingWarning[] }
+  > {
+    if (input.usage === undefined) return { ok: true };
+    if (this.#spendController === undefined || this.#profileId === undefined) {
+      return this.#allowUnenforcedAttributedSpend
+        ? { ok: true }
+        : { ok: false, reason: "SPEND_CONTROLLER_UNAVAILABLE" };
+    }
+
+    const prepared = prepareProviderSpend({
+      profileId: this.#profileId,
+      request: input.request,
+      route: input.route,
+      routeIndex: input.routeIndex,
+      routeRole: routeRoleForIndex(input.routeIndex),
+      providerAttemptIndex: input.providerAttemptIndex,
+      usage: input.usage
+    });
+    let reserved: ProviderSpendReservationResult;
+    try {
+      reserved = await this.#spendController.reserve(prepared.request, input.reservedAt);
+    } catch {
+      return { ok: false, reason: "SPEND_CONTROLLER_UNAVAILABLE" };
+    }
+    if (!reserved.ok) {
+      return {
+        ok: false,
+        reason: reserved.reason,
+        ...(reserved.warnings === undefined ? {} : { warnings: reserved.warnings })
+      };
+    }
+
+    const hasApplicableLimit = reserved.attempt.allocations.length > 0;
+    const policyDenial = hasApplicableLimit && !prepared.pricingAvailable
+      ? "PRICING_UNAVAILABLE" as const
+      : hasApplicableLimit && !prepared.safelyBounded
+      ? "REQUEST_CANNOT_BE_SAFELY_BOUNDED" as const
+      : undefined;
+    if (policyDenial !== undefined) {
+      if (reserved.attempt.state === "reserved") {
+        try {
+          await this.#spendController.releaseBeforeDispatch(prepared.request.requestKey, input.reservedAt);
+        } catch {
+          return {
+            ok: false,
+            reason: "SPEND_CONTROLLER_UNAVAILABLE",
+            ...(reserved.warnings === undefined ? {} : { warnings: reserved.warnings })
+          };
+        }
+      }
+      return {
+        ok: false,
+        reason: policyDenial,
+        ...(reserved.warnings === undefined ? {} : { warnings: reserved.warnings })
+      };
+    }
+    if (reserved.attempt.state !== "reserved") {
+      return {
+        ok: false,
+        reason: "SPEND_CONTROLLER_UNAVAILABLE",
+        ...(reserved.warnings === undefined ? {} : { warnings: reserved.warnings })
+      };
+    }
+    try {
+      const reservation = await this.#spendController.markDispatching(
+        prepared.request.requestKey,
+        input.reservedAt
+      );
+      return {
+        ok: true,
+        reservation,
+        ...(reserved.warnings === undefined ? {} : { warnings: reserved.warnings })
+      };
+    } catch {
+      return {
+        ok: false,
+        reason: "SPEND_CONTROLLER_UNAVAILABLE",
+        ...(reserved.warnings === undefined ? {} : { warnings: reserved.warnings })
+      };
+    }
+  }
+
+  async #markDispatchedSpendUncertain(
+    reservation: ProviderSpendAttempt | undefined,
+    reason: string
+  ): Promise<void> {
+    if (reservation === undefined || this.#spendController === undefined) return;
+    try {
+      await this.#spendController.markUncertain(
+        reservation.request.requestKey,
+        new Date().toISOString(),
+        reason
+      );
+    } catch {
+      // The durable lease remains reserved. An expired-owner recovery pass will
+      // conservatively mark it uncertain if this runtime can no longer fence it.
+    }
   }
 
   async #tryRefreshOAuthToken(providerId: string): Promise<

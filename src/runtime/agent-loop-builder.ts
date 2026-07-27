@@ -10,12 +10,14 @@ import type { RegisteredTool, ToolDefinition, ToolProvider, ToolsetName } from "
 import type { RuntimeToolContext, SessionToolContext } from "../contracts/tool-context.js";
 import type { LoadedRuntimeConfig } from "../config/runtime-config.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
+import type { TaskResultService } from "../tasks/task-result-service.js";
+import type { TaskOperatorService } from "../tasks/task-operator-service.js";
 import type { ContextReferenceExpander } from "../context/context-reference-expander.js";
 import type { CronStore } from "../cron/cron-store.js";
 import { availableToolsetsFromTools } from "../cron/cron-runtime-validation.js";
 import type { DelegationConfig } from "../contracts/delegation.js";
 import { DEFAULT_DELEGATION_CONFIG } from "../config/delegation-defaults.js";
-import type { DelegationManager } from "../delegation/delegation-manager.js";
+import type { DurableDelegationService } from "../delegation/durable-delegation-service.js";
 import type { FileStateTracker } from "../delegation/file-state-tracker.js";
 import type { MemoryFileCompactionService } from "../memory/memory-file-compaction-service.js";
 import type { MemoryIndexSync } from "../memory/memory-index-sync.js";
@@ -31,6 +33,7 @@ import type { ProviderRegistry } from "../providers/provider-registry.js";
 import type { SessionCompressionService } from "../prompt/session-compression-service.js";
 import type { SessionCompressionConfig } from "../config/runtime-config.js";
 import type { WorkspaceTrustStore } from "../security/workspace-trust-store.js";
+import type { ProviderUsageTaskAttribution } from "../providers/provider-usage-ledger.js";
 import { loadSessionContextWindowUsage } from "../session/session-context-window-usage.js";
 import type { SkillEvolutionStore } from "../skills/skill-evolution.js";
 import type { ChangeManifestStore } from "../skills/change-manifest-store.js";
@@ -161,6 +164,8 @@ export type AgentLoopRuntimeSubstrate = {
   browserBackend: BrowserBackend;
   browserConfig: SessionToolContext["browserConfig"];
   artifactStore: ArtifactStore;
+  taskResultService?: TaskResultService;
+  taskOperatorService?: TaskOperatorService;
   trustStore: WorkspaceTrustStore;
   cronStore: CronStore;
   disableCronTools?: boolean;
@@ -210,11 +215,10 @@ export type AgentLoopSessionInput = {
   ui?: AgentLoopOptions["ui"];
   agentProfile?: AgentLoopOptions["agentProfile"];
   securityPolicy: SecurityPolicy;
-  delegationManagerFactory: (input: {
-    toolExecutor: ToolExecutor;
+  delegationServiceFactory?: (input: {
     toolRegistry: ToolRegistry;
     sessionRuntimeContext: SessionRuntimeContext;
-  }) => DelegationManager;
+  }) => DurableDelegationService | undefined;
   trustedWorkspace: () => Promise<boolean>;
   disabledToolsets?: ToolsetName[];
   skillVisibilityStrategy?: AgentLoopSkillVisibilityStrategy;
@@ -223,6 +227,7 @@ export type AgentLoopSessionInput = {
   projectContext?: ProjectContextSnapshot;
   providerRoutes?: AgentLoopSessionRouteOverride;
   toolRegistryFilter?: AgentLoopToolRegistryFilter;
+  taskExecution?: ProviderUsageTaskAttribution;
 };
 
 export type BuiltAgentLoopSession = {
@@ -242,7 +247,7 @@ export type BuiltAgentLoopSession = {
   sessionSkillCatalog: SkillCatalogEntry[];
   providerTools: OpenAICompatibleToolSchema[];
   providerRoutes: AgentLoopRouteInput;
-  delegationManager: DelegationManager;
+  delegationService?: DurableDelegationService;
   sessionRecallService: import("../session/session-recall-service.js").SessionRecallService;
   memoryFileCompactionService: MemoryFileCompactionService;
   memoryCurationService?: MemoryCurationService;
@@ -334,6 +339,8 @@ export class AgentLoopBuilder {
         providerExecutor: substrate.providerExecutor,
         processManager: substrate.processManager,
         artifactStore: substrate.artifactStore,
+        taskResultService: substrate.taskResultService,
+        taskOperatorService: substrate.taskOperatorService,
         sessionDb: input.sessionDb,
         trajectoryRecorder: input.trajectoryRecorder,
         memoryStore: substrate.memoryStore,
@@ -419,8 +426,7 @@ export class AgentLoopBuilder {
       trajectoryRecorder: input.trajectoryRecorder,
       workspaceRoot: substrate.workspaceRoot
     });
-    const delegationManager = input.delegationManagerFactory({
-      toolExecutor,
+    const delegationService = input.delegationServiceFactory?.({
       toolRegistry,
       sessionRuntimeContext
     });
@@ -435,7 +441,7 @@ export class AgentLoopBuilder {
         sessionId: input.sessionId,
         currentSessionId: () => sessionRuntimeContext.currentSessionId(),
         toolExecutor,
-        delegationManager,
+        delegationService,
         delegationConfig: substrate.delegationConfig ?? DEFAULT_DELEGATION_CONFIG,
         sessionDb: input.sessionDb,
         trajectoryRecorder: input.trajectoryRecorder,
@@ -518,7 +524,8 @@ export class AgentLoopBuilder {
         ...substrate.executionControls?.providerBudgets
       },
       providerRequestDefaults: substrate.executionControls?.providerRequestDefaults,
-      initialContextWindowUsage
+      initialContextWindowUsage,
+      taskExecution: input.taskExecution
     });
     const skillPlaybookRunner = (this.#factories.skillPlaybookRunner ?? ((options) => new SkillPlaybookRunner(options)))({
       toolExecutor,
@@ -602,7 +609,7 @@ export class AgentLoopBuilder {
       sessionSkillCatalog,
       providerTools: providerToolSchemaCatalog.tools,
       providerRoutes: routes,
-      delegationManager,
+      delegationService,
       sessionRecallService,
       memoryFileCompactionService,
       memoryCurationService,
@@ -723,6 +730,8 @@ function buildPreSkillVisibilityToolContext(input: SessionToolContext): SessionT
     providerExecutor: input.providerExecutor,
     processManager: input.processManager,
     artifactStore: input.artifactStore,
+    taskResultService: input.taskResultService,
+    taskOperatorService: input.taskOperatorService,
     sessionDb: input.sessionDb,
     trajectoryRecorder: input.trajectoryRecorder,
     memoryStore: input.memoryStore,
@@ -783,7 +792,7 @@ function buildPostToolExecutorToolContext(input: SessionToolContext): SessionToo
     sessionId: input.sessionId,
     currentSessionId: input.currentSessionId,
     toolExecutor: input.toolExecutor,
-    delegationManager: input.delegationManager,
+    delegationService: input.delegationService,
     delegationConfig: input.delegationConfig,
     sessionDb: input.sessionDb,
     trajectoryRecorder: input.trajectoryRecorder,

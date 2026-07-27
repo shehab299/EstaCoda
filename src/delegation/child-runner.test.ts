@@ -43,6 +43,32 @@ describe("runDelegatedChild", () => {
     expect(harness.registry.listActiveSubagents()).toHaveLength(1);
   });
 
+  it("relays only redacted visible deltas with durable Task attribution", async () => {
+    const harness = await createHarness({
+      handle: async (input) => {
+        input.onDelta?.("\x1b[32mFound password: hunter2\x1b[0m");
+        return response({ text: "done" });
+      }
+    });
+
+    await runDelegatedChild({
+      ...harness.input(),
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1"
+    });
+
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      kind: "delegation-progress",
+      taskId: "task-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      childEvent: { kind: "assistant-preview", preview: "Found password: [REDACTED]" }
+    }));
+    expect(JSON.stringify(harness.events)).not.toContain("hunter2");
+    expect(JSON.stringify(harness.events)).not.toContain("\x1b");
+  });
+
   it("aborts only the child on timeout and returns a structured timeout result", async () => {
     vi.useFakeTimers();
     const parentController = new AbortController();
@@ -148,29 +174,55 @@ describe("runDelegatedChild", () => {
     expect(harness.registry.listActiveSubagents()).toEqual([]);
   });
 
-  it("emits parent heartbeat events while the child runs and stops after completion", async () => {
+  it("uses Task metadata and renews the Attempt heartbeat", async () => {
     vi.useFakeTimers();
     let resolveChild: ((response: AgentLoopResponse) => void) | undefined;
+    let handledInput: AgentLoopInput | undefined;
+    const onHeartbeat = vi.fn();
     const harness = await createHarness({
-      configOverrides: { heartbeatSeconds: 0.001 },
+      configOverrides: { heartbeatSeconds: 0.001, heartbeatStaleCyclesIdle: 0 },
+      handle: async (input) => {
+        handledInput = input;
+        return await new Promise<AgentLoopResponse>((resolve) => {
+          resolveChild = resolve;
+        });
+      }
+    });
+
+    const pending = runDelegatedChild({
+      ...harness.input(),
+      prompt: "Durable Task prompt",
+      inputMetadata: { durableTask: true, attemptId: "attempt-1" },
+      onHeartbeat
+    });
+    await vi.advanceTimersByTimeAsync(3);
+    resolveChild?.(response());
+    await pending;
+
+    expect(handledInput).toMatchObject({
+      text: "Durable Task prompt",
+      inputMetadata: { durableTask: true, attemptId: "attempt-1" }
+    });
+    expect(onHeartbeat.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it("falls back to a bounded heartbeat interval when configuration is not finite", async () => {
+    vi.useFakeTimers();
+    let resolveChild: ((response: AgentLoopResponse) => void) | undefined;
+    const onHeartbeat = vi.fn();
+    const harness = await createHarness({
+      configOverrides: { heartbeatSeconds: Number.NaN },
       handle: async () => await new Promise<AgentLoopResponse>((resolve) => {
         resolveChild = resolve;
       })
     });
 
-    const pending = runDelegatedChild(harness.input());
-    await vi.advanceTimersByTimeAsync(3);
+    const pending = runDelegatedChild({ ...harness.input(), onHeartbeat });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(onHeartbeat).toHaveBeenCalledTimes(1);
+
     resolveChild?.(response());
     await pending;
-    const before = (await harness.db.listEvents("parent")).filter((event) => event.kind === "delegation-heartbeat").length;
-    await vi.runOnlyPendingTimersAsync();
-    await Promise.resolve();
-    await vi.runOnlyPendingTimersAsync();
-    await Promise.resolve();
-    const after = (await harness.db.listEvents("parent")).filter((event) => event.kind === "delegation-heartbeat").length;
-
-    expect(before).toBeGreaterThan(0);
-    expect(after).toBe(before);
   });
 
   it("stops heartbeat touches and writes diagnostics for stale idle children", async () => {
@@ -189,7 +241,6 @@ describe("runDelegatedChild", () => {
     await sleep(20);
 
     const events = await harness.db.listEvents("parent");
-    expect(events.filter((event) => event.kind === "delegation-heartbeat")).toHaveLength(0);
     expect(events).toContainEqual(expect.objectContaining({
       kind: "delegation-diagnostic",
       reason: "stale-heartbeat",

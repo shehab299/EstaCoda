@@ -122,8 +122,18 @@ Provider usage metadata is normalized as:
 | `outputTokens` | Provider-reported completion/output tokens |
 | `totalTokens` | Provider-reported total tokens |
 | `reasoningTokens` | Provider-reported reasoning token telemetry |
+| `cacheReadTokens` | Provider-reported input tokens served from a prompt cache |
+| `cacheWriteTokens` | Provider-reported input tokens written to a prompt cache |
 
 `reasoningTokens` is safe usage telemetry only. It does not mean raw reasoning was available, extracted, stored, displayed, summarized, or sent back to a provider. Raw reasoning, when an adapter can extract it for turn-local handling, is kept out of attempts, runtime events, session messages, summaries, memory, skill learning, and normal exports. Safe `reasoningMetadata` may record only presence, character count, and format.
+
+Every dispatched main-turn request is recorded in the profile-owned canonical provider-request ledger. Ordinary turns and durable Task workers use the same writer. Pricing uses the exact resolved route and separates uncached input, output, reasoning, cache-read, and cache-write rates; unknown components remain explicitly incomplete instead of being treated as zero. Preflight route and credential failures that never call an adapter are not ledger requests.
+
+UI cost is a read projection of that ledger. A complete projection renders an
+approximate estimate, a projection with some known price components renders a
+lower bound, and a projection with no usable price renders unavailable. Ledger
+read failure does not discard an otherwise completed model response and is not
+reported as zero cost.
 
 Operators can inspect provider final-state behavior through runtime `provider-result` events and session `provider-completion` / `provider-continuation` events. These events include finish reason, incomplete reason, usage, safe reasoning metadata, fallback status, and safe `runtimeMetadata` for truncation or continuation. They do not include raw provider payloads, raw reasoning, or discarded truncated tool arguments.
 
@@ -316,11 +326,11 @@ Scoped overrides persist with the session and are revalidated whenever a runtime
 
 ## Delegated Child Model Overrides
 
-`delegate_task` may request a child `modelOverride`. Same-provider model overrides and reviewed cross-provider child routes are supported. Overrides are request-local: they affect only the child loop being constructed and do not mutate profile config, session model overrides, parent fallback routes, auxiliary routes, or provider preferences outside that child.
+`delegate_task` may persist a Step `modelOverride`. Same-provider model overrides and reviewed cross-provider worker routes are supported. Overrides are Task-local: they affect only the leased worker Step and do not mutate profile config, session model overrides, parent fallback routes, auxiliary routes, or provider preferences outside that worker.
 
-Cross-provider child routes are derived from the normalized target provider config, not from parent route internals. The executable child route preserves target `baseUrl`, `apiKeyEnv`, `apiMode`, `authMethod`, `enableNetwork`, `timeoutMs`, and `staleTimeoutMs` where configured. Provider preference for the child is set to the target provider only, and fallback routes are disabled with `fallbackBehavior: "disabled-for-override"`.
+Cross-provider worker routes are derived from the normalized target provider config when the scheduler constructs the worker, not during Task creation and not from parent route internals. The executable route preserves target `baseUrl`, `apiKeyEnv`, `apiMode`, `authMethod`, `enableNetwork`, `timeoutMs`, and `staleTimeoutMs` where configured. Provider preference for the worker is set to the target provider only, and fallback routes are disabled with `fallbackBehavior: "disabled-for-override"`.
 
-Credential handling uses the existing provider config and `apiKeyEnv` path. Credential pools are not introduced. `authMethod: "none"` does not require credentials when configured for the target provider. Env-backed missing credentials reject before child session/provider execution. `enableNetwork: false` rejects before child execution with structured override metadata. Literal credential routes or unsupported credential forms are rejected rather than copied into child metadata.
+Credential handling uses the existing provider config and `apiKeyEnv` path. Credential pools are not introduced. `authMethod: "none"` does not require credentials when configured for the target provider. Env-backed missing credentials and `enableNetwork: false` fail the worker before provider execution. Literal credential routes or unsupported credential forms are rejected rather than copied into worker metadata.
 
 Override metadata is bounded and redacted. It must not include raw API keys, env values, raw route objects, private config paths, prompts, diagnostics payloads, or transcripts.
 

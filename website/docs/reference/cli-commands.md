@@ -39,7 +39,7 @@ estacoda setup --provider <p> --model <m> --api-key-env <env>
 
 **Profile boundary:** Uses the active profile, or the profile selected via `--profile`.
 
-**Behavior:** Routes through a deterministic setup decision based on current state (`first-run`, configured-ready, configured-degraded, partial-provider, missing-credential, broken-config, untrusted-workspace, state-not-writable). The internal `first-run` state opens the Onboarding Wizard. Normal onboarding uses `summary -> confirm -> apply -> verify`; the redacted manifest and apply plan remain internal/operator-inspectable. Configured-ready state opens the Setup Editor with primary model route edit, fallback route edit, auxiliary route edit, optional capability configuration, security mode edit, Agent Evolution edit, EstaCoda Doctor, and exit. Doctor is the read-only health action for required fixes and provider route status. Cancelling review or summary confirmation produces no mutation. Raw secrets are never displayed in review metadata.
+**Behavior:** Routes through a deterministic setup decision based on current state (`first-run`, configured-ready, configured-degraded, partial-provider, missing-credential, broken-config, untrusted-workspace, state-not-writable). The internal `first-run` state opens the Onboarding Wizard. Normal onboarding uses `summary -> confirm -> apply -> verify`; the redacted manifest and apply plan remain internal/operator-inspectable. Configured-ready state opens the Setup Editor with primary model route edit, fallback route edit, auxiliary route edit, security mode edit, Agent Evolution edit, one nested `Budgets` entry for independent Task/session spending limits, language, optional capability configuration, EstaCoda Doctor, and exit. Budget limits are monetary, Off by default, and apply prospectively to new Tasks or sessions. Doctor is the read-only health action for required fixes and provider route status. Cancelling review or summary confirmation produces no mutation. Raw secrets are never displayed in review metadata.
 
 **Failure modes:**
 - Broken config blocks normal edits until parsing is safe.
@@ -363,54 +363,24 @@ estacoda memory finalization prune [--keep N]
 
 ---
 
-## Workflow
-
-Requires SQLite session persistence. In-memory session DB rejects Workflow commands.
+## Durable Tasks
 
 ```bash
-estacoda workflow begin --session <sessionId> <objective>
-estacoda workflow begin --skill <skillName> --session <sessionId> <objective>
-estacoda workflow list                      # active (non-terminal) workflow runs
-estacoda workflow show <runId>
-estacoda workflow status <runId>
-estacoda workflow trace <runId> [limit]
-estacoda workflow pause <runId> [reason]
-estacoda workflow resume <runId>
-estacoda workflow interrupt <runId> [reason]
-estacoda workflow cancel <runId> [reason]
-estacoda workflow steer <runId> <instruction>
-estacoda workflow approve <stepId>
-estacoda workflow reject <stepId> [reason]
-estacoda workflow retry <stepId>
-estacoda workflow skip <stepId> [reason]
-estacoda workflow checkpoint <runId> <name>
-estacoda workflow summarize <runId>
+estacoda task begin [--session <session-id>] [--background] <objective>
+estacoda task list [limit]
+estacoda task show <task-id>
+estacoda task pause <task-id>
+estacoda task resume <task-id>
+estacoda task cancel <task-id>
+estacoda task retry <task-id> [step-id]
+estacoda task result <task-id>
 ```
 
-**State touched:** SQLite session DB (`workflow_events`, `workflow_steps` tables).
+**State touched:** Profile-scoped durable Task records in the global session SQLite database; Task result bodies remain in the selected profile's private result store.
 
-**Behavior:**
-- `estacoda workflow begin --session <sessionId> <objective>` creates and starts a conservative one-step workflow run for an existing session. It records `activationReason: "explicit"` and the objective in run metadata.
-- `estacoda workflow begin --skill <skillName> --session <sessionId> <objective>` resolves the named skill, compiles its playbook, converts it into a `WorkflowPlan`, creates the run, and starts it.
-- Standalone begin does not activate future interactive sessions. Use `/workflow activate <runId>` inside an interactive session for live routing.
-- Plain begin does not use playbook conversion. `--skill` is explicit opt-in.
+The default immutable execution preference is `auto` (interactive foreground first, then gateway takeover). `--background` selects direct gateway ownership. `task list` and `task show` distinguish lifecycle status from current execution ownership and report safe background-continuation readiness.
 
-Successful standalone begin prints:
-
-```text
-Created workflow: <runId>
-Started workflow: <runId>
-Not activated. Use /workflow activate <runId> inside an interactive session.
-```
-
-**Failure modes:**
-- Missing or unknown session IDs return an error. Hidden sessions are not created.
-- Unknown skills return a clear error.
-- Retry only works if `idempotent` or `safeToRetry` is true and under `maxRetries`.
-- Skip only works if the step has not started and `allowSkipIfSkippable` is true.
-- Steer is rejected for workflow runs in terminal states.
-- Interrupt sends SIGTERM with 5s timeout to active processes, then transitions state.
-- No automatic workflow promotion, complex-request detection, Agent Evolution participation, automatic workflow creation from normal AgentLoop skill selection, or `--use-selected-playbook` flag exists.
+**Behavior:** `begin` requires a trusted workspace and creates one conservative agent Step. Without `--session`, it creates a visible profile-owned creator session and prints that session ID with the Task handle. With `--session`, the named session must already exist in the selected profile. `show` reports bounded progress, running/waiting counts, usage/pricing completeness, workspace trust, result count, and background-host state. `pause`, `resume`, `cancel`, and explicit `retry` mutate durable state. `result` lists opaque handles and summaries, not full bodies or local paths. A command-local `--profile` override never changes the active profile.
 
 ---
 

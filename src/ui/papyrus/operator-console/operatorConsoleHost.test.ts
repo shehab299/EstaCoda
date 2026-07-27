@@ -93,9 +93,14 @@ describe("Papyrus operator console raw prompt host", () => {
       },
     });
 
-    expect(frame.rows[0]).toMatch(/^─+$/u);
-    expect(frame.rows).toContainEqual(expect.stringContaining("› review the Papyrus rollout plan"));
-    expect(frame.rows.at(-1)).toBe("kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k 7% │ ◷ 01:12");
+    expect(frame.rows[0]?.trim()).toBe("");
+    expect(frame.rows[1]).toContain("› review the Papyrus rollout plan");
+    expect(frame.rows[2]?.trim()).toBe("");
+    expect(frame.rows).toHaveLength(4);
+    expect(frame.cursorRow).toBe(1);
+    expect(frame.cursorColumn).toBe(stringWidth("› review the Papyrus rollout plan"));
+    expect(frame.rows.at(-1)).toContain("kimi-k2.7-code ● · ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k");
+    expect(frame.rows.at(-1)?.trimEnd().endsWith("· ◷ 01:12")).toBe(true);
     expect(frame.rows.every((line) => stringWidth(line) <= 72)).toBe(true);
   });
 
@@ -116,8 +121,7 @@ describe("Papyrus operator console raw prompt host", () => {
       },
     });
 
-    expect(frame.rows[0]).toMatch(/^─+$/u);
-    expect(frame.rows).toContainEqual(expect.stringContaining("› write a migration plan for:"));
+    expect(frame.rows[1]).toContain("› write a migration plan for:");
     expect(frame.rows).toContainEqual(expect.stringContaining("  - approval cards"));
     expect(frame.rows.at(-1)).toContain("◷ 01:12");
   });
@@ -179,6 +183,31 @@ describe("Papyrus operator console raw prompt host", () => {
     expect(text).not.toContain("super-secret-value");
     expect(status).toContain("kimi-k2.7-code");
     expect(status).not.toMatch(/\b(attachment|pasted text|OPENAI_API_KEY|secret)\b/iu);
+  });
+
+  it("maps pending approvals into the raw prompt Operator Console frame", () => {
+    const approval = {
+      id: "approval-1",
+      status: "pending" as const,
+      action: "Write file",
+      target: "write the reviewed artifact",
+      risk: "workspace-write",
+      summary: "Task task-1 · approve once only",
+      focusedControl: "approve" as const
+    };
+    const frame = buildOperatorConsoleRawPromptFrame({
+      prompt: "> ",
+      state: createLineEditorState(""),
+      terminal: { width: 80, height: 18, isTty: true },
+      approvals: [approval]
+    });
+    const text = frame.rows.join("\n");
+
+    expect(frame.state.approvals).toEqual([approval]);
+    expect(text).toContain("Approval required");
+    expect(text).toContain("Action: Write file");
+    expect(text).toContain("Target: write the reviewed artifact");
+    expect(text).toContain("❯ Approve once");
   });
 
   it("maps raw prompt streaming state into the Operator Console frame", () => {

@@ -52,7 +52,7 @@ describe("Papyrus operator console renderer", () => {
     const layout = createOperatorConsoleLayout(state, { width: 80, height: 8, isTty: true });
     const output = renderOperatorConsoleTextLines(state, layout);
 
-    expect(output[0]).toMatch(/^─+$/u);
+    expect(output[1]).toContain("›");
     expect(output.at(-1)).toContain("◷ 00:00");
   });
 
@@ -61,10 +61,12 @@ describe("Papyrus operator console renderer", () => {
     const layout = createOperatorConsoleLayout(state, { width: 80, height: 8, isTty: true });
 
     const output = renderOperatorConsoleTextLines(state, layout);
-    expect(output[0]).toMatch(/^─+$/u);
+    expect(output).toHaveLength(4);
+    expect(output[0]?.trim()).toBe("");
     expect(output[1]).toContain("›");
-    expect(output[2]).toMatch(/^─+$/u);
-    expect(output[3]).toBe("model pending ● │ ctx [··········] -- --% │ ◷ 00:00");
+    expect(output[2]?.trim()).toBe("");
+    expect(output[3]).toContain("model pending ● · ctx [··········] --");
+    expect(output[3]?.trimEnd().endsWith("· ◷ 00:00")).toBe(true);
   });
 
   it("renders multiline prompt expansion with status rail below", () => {
@@ -90,10 +92,11 @@ describe("Papyrus operator console renderer", () => {
     const layout = createOperatorConsoleLayout(state, { width: 72, height: 20, isTty: true });
 
     const output = renderOperatorConsoleTextLines(state, layout);
-    expect(output[0]).toMatch(/^─+$/u);
+    expect(output[1]).toContain("› write a migration plan for:");
     expect(output).toContainEqual(expect.stringContaining("› write a migration plan for:"));
     expect(output).toContainEqual(expect.stringContaining("  - approval cards"));
-    expect(output.at(-1)).toBe("kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k 7% │ ◷ 01:12");
+    expect(output.at(-1)).toContain("kimi-k2.7-code ● · ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k");
+    expect(output.at(-1)?.trimEnd().endsWith("· ◷ 01:12")).toBe(true);
     expect(output.every((line) => stringWidth(line) <= 72)).toBe(true);
   });
 
@@ -472,12 +475,13 @@ describe("Papyrus operator console renderer", () => {
       );
 
       expect(output).not.toContainEqual(expect.stringContaining("Queued steer"));
-      expect(output.at(-1)).toBe("kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k 7% │ ◷ 00:31");
+      expect(output.at(-1)).toContain("kimi-k2.7-code ● · ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k");
+      expect(output.at(-1)?.trimEnd().endsWith("· ◷ 00:31")).toBe(true);
       expect(output.every((line) => stringWidth(line) <= 72)).toBe(true);
     }
   });
 
-  it("keeps status rail limited to model, context, and timer while steer is active", () => {
+  it("keeps contextual activity out of the status rail while steer is active", () => {
     const state = createState({
       steer: {
         draft: "focus only on approvals",
@@ -496,8 +500,9 @@ describe("Papyrus operator console renderer", () => {
     );
     const status = output.at(-1) ?? "";
 
-    expect(status).toBe("kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k 7% │ ◷ 00:31");
-    expect(status).not.toMatch(/\b(steer|approval|attachment|tool|workspace|trust|setup|channel)\b/iu);
+    expect(status).toContain("kimi-k2.7-code ● · ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k");
+    expect(status.trimEnd().endsWith("· ◷ 00:31")).toBe(true);
+    expect(status).not.toMatch(/\b(steer|approval|attachment|tool|trust|setup|channel)\b/iu);
   });
 
   it("renders steer draft instead of prompt when steering is active", () => {
@@ -533,7 +538,7 @@ describe("Papyrus operator console renderer", () => {
     const output = renderOperatorConsoleTextLines(state, layout);
 
     expect(output).not.toContainEqual(expect.stringContaining("Running tools"));
-    expect(output[0]).toMatch(/^─+$/u);
+    expect(output[1]).toContain("›");
   });
 
   it("does not reserve attachment rows when attachments are absent", () => {
@@ -542,7 +547,7 @@ describe("Papyrus operator console renderer", () => {
     const output = renderOperatorConsoleTextLines(state, layout);
 
     expect(output).not.toContain("Attachments");
-    expect(output[0]).toMatch(/^─+$/u);
+    expect(output[1]).toContain("›");
   });
 
   it("renders slash menu between prompt and status rail", () => {
@@ -592,10 +597,10 @@ describe("Papyrus operator console renderer", () => {
     const state = createFullState();
     const layout = createOperatorConsoleLayout(state, { width: 80, height: 2, isTty: true });
 
-    expect(renderOperatorConsoleTextLines(state, layout)).toEqual([
-      "Steer: >",
-      "kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k 7% │ ◷ 01:12",
-    ]);
+    const output = renderOperatorConsoleTextLines(state, layout);
+    expect(output[0]).toBe("Steer: >");
+    expect(output[1]).toContain("kimi-k2.7-code ● · ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k");
+    expect(output[1]?.trimEnd().endsWith("· ◷ 01:12")).toBe(true);
   });
 
   it("keeps prompt and status visible under constrained layout", () => {

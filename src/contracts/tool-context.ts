@@ -40,7 +40,7 @@ export type SessionToolContext = {
   providerRegistry?: import("../providers/provider-registry.js").ProviderRegistry;
   providerExecutor?: import("../providers/provider-executor.js").ProviderExecutor;
   toolExecutor?: import("../tools/tool-executor.js").ToolExecutor;
-  delegationManager?: import("../delegation/delegation-manager.js").DelegationManager;
+  delegationService?: import("../delegation/durable-delegation-service.js").DurableDelegationService;
   delegationConfig?: import("./delegation.js").DelegationConfig;
   trustedWorkspace?: () => Promise<boolean>;
   memoryStore?: import("../memory/memory-store.js").MemoryStore;
@@ -57,6 +57,8 @@ export type SessionToolContext = {
   skillConfig?: Record<string, Record<string, unknown>>;
   processManager?: import("../process/process-manager.js").ProcessManager;
   artifactStore?: import("../artifacts/artifact-store.js").ArtifactStore;
+  taskResultService?: import("../tasks/task-result-service.js").TaskResultService;
+  taskOperatorService?: import("../tasks/task-operator-service.js").TaskOperatorService;
   memoryFileCompactionService?: import("../memory/memory-file-compaction-service.js").MemoryFileCompactionService;
   fileStateTracker?: import("../delegation/file-state-tracker.js").FileStateTracker;
   sessionCompressionService?: import("../prompt/session-compression-service.js").SessionCompressionService;

@@ -15,11 +15,15 @@ import type {
 } from "../ui/papyrus/operator-console/operatorConsoleLayout.js";
 import type {
   AttachmentCardState,
+  ApprovalCardState,
   PromptSurfaceState,
   SlashMenuState,
   SteerState,
   StreamingState,
   ToolActivityState,
+  TaskCardState,
+  TaskSurfaceState,
+  TerminalMetrics,
   TranscriptBlock,
   TurnActivityState,
 } from "../ui/papyrus/operator-console/operatorConsoleState.js";
@@ -58,6 +62,14 @@ export type RawPromptOperatorConsoleOptions = Omit<OperatorConsoleRawPromptSnaps
   readonly onAttachmentsChange?: (attachments: readonly AttachmentCardState[]) => void;
   readonly onAttachmentPreview?: (attachment: AttachmentCardState) => void;
   readonly getStatus?: () => OperatorConsoleRawPromptSnapshot["status"];
+  readonly getTerminal?: () => Partial<TerminalMetrics>;
+  /** Refreshes the prepared Task snapshot outside prompt-edit render calls. */
+  readonly refreshTasks?: () => boolean;
+  readonly getTasks?: () => readonly TaskCardState[];
+  readonly getApprovals?: () => readonly ApprovalCardState[];
+  readonly onApprovalIntent?: (intent: import("../ui/papyrus/operator-console/approvalSurface.js").ApprovalIntent) =>
+    void | Promise<void>;
+  readonly tasks?: TaskSurfaceState;
   readonly focus?: FocusState;
   readonly slash?: SlashMenuState;
   readonly activeWork?: ToolActivityState;
@@ -124,14 +136,21 @@ export class RawPromptRenderLoop {
     const frame = snapshot.operatorConsole?.enabled === true
       ? buildOperatorConsoleRawPromptFrameWithRuntimeHost(this.#getOperatorConsoleHost(), {
         mode: snapshot.operatorConsole.mode,
+        locale: snapshot.operatorConsole.locale,
         prompt: snapshot.prompt,
         state: snapshot.state,
         status: snapshot.operatorConsole.getStatus?.() ?? snapshot.operatorConsole.status,
+        motionElapsedMs: snapshot.operatorConsole.motionElapsedMs,
         setupPanel: snapshot.operatorConsole.setupPanel,
         transcript: snapshot.operatorConsole.transcript,
         turnActivity: snapshot.operatorConsole.turnActivity,
-        terminal: snapshot.operatorConsole.terminal,
+        terminal: {
+          ...snapshot.operatorConsole.terminal,
+          ...snapshot.operatorConsole.getTerminal?.(),
+        },
         attachments: snapshot.operatorConsole.attachments,
+        approvals: snapshot.operatorConsole.approvals,
+        tasks: snapshot.operatorConsole.tasks,
         slash: snapshot.operatorConsole.slash,
         activeWork: snapshot.operatorConsole.activeWork,
         streaming: snapshot.operatorConsole.streaming,

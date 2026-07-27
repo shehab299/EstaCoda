@@ -24,6 +24,7 @@ import {
   type StreamingSegment,
   type StreamingState,
   type TerminalMetrics,
+  type TaskSurfaceState,
   type ToolActivityState,
   type TurnActivityState,
   type TranscriptBlock,
@@ -59,6 +60,14 @@ export class OperatorConsoleRuntimeHost {
     };
   }
 
+  setLocale(locale: OperatorConsoleState["locale"]): void {
+    if (this.#disposed) return;
+    this.#state = {
+      ...this.#state,
+      locale,
+    };
+  }
+
   setPrompt(input: OperatorConsoleRuntimePromptInput): void {
     if (this.#disposed) return;
     const current = this.#state.prompt;
@@ -85,6 +94,14 @@ export class OperatorConsoleRuntimeHost {
     this.#state = {
       ...this.#state,
       status: cloneStatusRailState(status),
+    };
+  }
+
+  setMotionElapsedMs(motionElapsedMs: number): void {
+    if (this.#disposed) return;
+    this.#state = {
+      ...this.#state,
+      motionElapsedMs: Number.isFinite(motionElapsedMs) ? Math.max(0, motionElapsedMs) : 0,
     };
   }
 
@@ -126,6 +143,14 @@ export class OperatorConsoleRuntimeHost {
     this.#state = {
       ...this.#state,
       attachments: attachments.map(cloneAttachmentCardState),
+    };
+  }
+
+  setTasks(tasks: TaskSurfaceState): void {
+    if (this.#disposed) return;
+    this.#state = {
+      ...this.#state,
+      tasks: cloneTaskSurfaceState(tasks),
     };
   }
 
@@ -233,8 +258,10 @@ function cloneOperatorConsoleState(state: OperatorConsoleState): OperatorConsole
     transcript: state.transcript.map(cloneTranscriptBlock),
     prompt: clonePromptSurfaceState(state.prompt),
     status: cloneStatusRailState(state.status),
+    motionElapsedMs: state.motionElapsedMs,
     turnActivity: state.turnActivity === undefined ? undefined : cloneTurnActivityState(state.turnActivity),
     attachments: state.attachments.map(cloneAttachmentCardState),
+    tasks: cloneTaskSurfaceState(state.tasks),
     activeWork: cloneToolActivityState(state.activeWork),
     streaming: state.streaming === undefined ? undefined : cloneStreamingState(state.streaming),
     approvals: state.approvals.map(cloneApprovalCardState),
@@ -293,6 +320,30 @@ function cloneStatusRailState(status: StatusRailState): StatusRailState {
         ? {}
         : { startedAtMs: normalizeNonNegativeNumber(status.sessionTimer.startedAtMs) }),
     },
+    ...(status.sessionCost === undefined
+      ? {}
+      : {
+          sessionCost: {
+            totalTokens: normalizeNonNegativeInteger(status.sessionCost.totalTokens),
+            usageComplete: status.sessionCost.usageComplete,
+            ...(status.sessionCost.estimatedCostUsd === undefined
+              ? {}
+              : { estimatedCostUsd: normalizeNonNegativeNumber(status.sessionCost.estimatedCostUsd) }),
+            costComplete: status.sessionCost.costComplete,
+            ...(status.sessionCost.budget === undefined
+              ? {}
+              : { budget: { ...status.sessionCost.budget } }),
+          },
+        }),
+    ...(!isStatusWorkspace(status.workspace)
+      ? {}
+      : {
+          workspace: {
+            label: status.workspace.label,
+            shortLabel: status.workspace.shortLabel,
+            ...(status.workspace.branch === undefined ? {} : { branch: status.workspace.branch }),
+          },
+        }),
     ...(status.security?.yolo === true ? { security: { yolo: true } } : {}),
   };
 }
@@ -315,6 +366,92 @@ function cloneTranscriptBlock(block: TranscriptBlock): TranscriptBlock {
     ...block,
     ...(block.attachmentIds === undefined ? {} : { attachmentIds: [...block.attachmentIds] }),
     ...(block.toolTrail === undefined ? {} : { toolTrail: block.toolTrail.map(cloneInlineToolTrailEntry) }),
+  };
+}
+
+function cloneTaskSurfaceState(tasks: TaskSurfaceState): TaskSurfaceState {
+  return {
+    cards: tasks.cards.map((card) => ({
+      ...card,
+      progress: { ...card.progress },
+      ...(card.planRevision === undefined ? {} : { planRevision: { ...card.planRevision } }),
+      steps: card.steps.map((step) => ({
+        ...step,
+        dependsOn: [...step.dependsOn],
+        usage: { ...step.usage },
+        attempts: step.attempts.map((attempt) => ({ ...attempt, usage: { ...attempt.usage } })),
+        ...(step.latestAttempt === undefined
+          ? {}
+          : { latestAttempt: { ...step.latestAttempt, usage: { ...step.latestAttempt.usage } } }),
+        ...(step.activeAttempt === undefined
+          ? {}
+          : { activeAttempt: { ...step.activeAttempt, usage: { ...step.activeAttempt.usage } } }),
+      })),
+      subagents: card.subagents.map((subagent) => ({
+        ...subagent,
+        dependsOn: [...subagent.dependsOn],
+        usage: {
+          total: { ...subagent.usage.total },
+          ...(subagent.usage.currentAttempt === undefined
+            ? {}
+            : { currentAttempt: { ...subagent.usage.currentAttempt } })
+        },
+        attempts: subagent.attempts.map((attempt) => ({ ...attempt, usage: { ...attempt.usage } })),
+        ...(subagent.latestAttempt === undefined
+          ? {}
+          : { latestAttempt: { ...subagent.latestAttempt, usage: { ...subagent.latestAttempt.usage } } }),
+        ...(subagent.activeAttempt === undefined
+          ? {}
+          : { activeAttempt: { ...subagent.activeAttempt, usage: { ...subagent.activeAttempt.usage } } }),
+        trace: subagent.trace.map((event) => ({ ...event })),
+        ...(subagent.traceSummary === undefined ? {} : {
+          traceSummary: {
+            ...(subagent.traceSummary.totalEvents === undefined
+              ? {}
+              : { totalEvents: subagent.traceSummary.totalEvents }),
+            ...(subagent.traceSummary.categoryCounts === undefined
+              ? {}
+              : { categoryCounts: { ...subagent.traceSummary.categoryCounts } }),
+            hasEarlierEvents: subagent.traceSummary.hasEarlierEvents
+          }
+        }),
+        results: subagent.results.map((result) => ({ ...result }))
+      })),
+      trace: {
+        events: card.trace.events.map((event) => ({ ...event })),
+        ...(card.trace.totalEvents === undefined ? {} : { totalEvents: card.trace.totalEvents }),
+        ...(card.trace.categoryCounts === undefined ? {} : { categoryCounts: { ...card.trace.categoryCounts } }),
+        hasEarlierEvents: card.trace.hasEarlierEvents
+      },
+      recentActivity: card.recentActivity.map((activity) => ({ ...activity })),
+      usage: { ...card.usage },
+      results: card.results.map((result) => ({ ...result })),
+      ...(card.spending === undefined ? {} : { spending: { ...card.spending } }),
+      ...(card.failure === undefined ? {} : { failure: { ...card.failure } }),
+    })),
+    ...(tasks.selectedTaskId === undefined ? {} : { selectedTaskId: tasks.selectedTaskId }),
+    ...(tasks.inspectedTaskId === undefined ? {} : { inspectedTaskId: tasks.inspectedTaskId }),
+    ...(tasks.mouseModeActive === true ? { mouseModeActive: true } : {}),
+    ...(tasks.inspection === undefined
+      ? {}
+      : {
+          inspection: {
+            followLive: tasks.inspection.followLive,
+            ...(tasks.inspection.selectedTraceEventId === undefined
+              ? {}
+              : { selectedTraceEventId: tasks.inspection.selectedTraceEventId }),
+            ...(tasks.inspection.selectedSubagentStepId === undefined
+              ? {}
+              : { selectedSubagentStepId: tasks.inspection.selectedSubagentStepId }),
+            ...(tasks.inspection.inspectedSubagentStepId === undefined
+              ? {}
+              : { inspectedSubagentStepId: tasks.inspection.inspectedSubagentStepId }),
+            ...(tasks.inspection.subagentTrace === undefined
+              ? {}
+              : { subagentTrace: { ...tasks.inspection.subagentTrace } })
+          }
+        }),
+    scrollOffset: normalizeNonNegativeInteger(tasks.scrollOffset),
   };
 }
 
@@ -397,6 +534,11 @@ function isStatusModelState(value: string | undefined): value is StatusRailState
 
 function isStatusModelRoute(value: string | undefined): value is NonNullable<StatusRailState["model"]["route"]> {
   return value === "primary" || value === "fallback" || value === "failed";
+}
+
+function isStatusWorkspace(value: StatusRailState["workspace"] | undefined): value is NonNullable<StatusRailState["workspace"]> {
+  return value !== undefined && value !== null && typeof value === "object" &&
+    typeof value.label === "string" && typeof value.shortLabel === "string";
 }
 
 function normalizeCursorOffset(value: number, text: string): number {

@@ -29,9 +29,10 @@ graph TB
     Runtime --> Memory["MemoryStore + LocalMemoryProvider + Recall"]
     Runtime --> Session["SQLiteSessionDB"]
     Runtime --> Security["SecurityPolicy + approval controllers"]
-    Runtime --> Workflow["WorkflowAgentLoopAdapter when active"]
+    Runtime --> TaskResults["TaskResultService + task.result.read"]
 
     Session --> GlobalState["~/.estacoda/sessions.sqlite"]
+    TaskResults --> ProfileState
     Memory --> ProfileState["~/.estacoda/profiles/<id>/"]
     Skills --> BundledSkills["skills/official/"]
     Security --> TrustState["~/.estacoda/trust.json + workspace approvals"]
@@ -57,7 +58,8 @@ graph TB
 | Active profile pointer | Profile home helpers | `~/.estacoda/active-profile.json` |
 | Runtime config | Selected profile | `~/.estacoda/profiles/<id>/config.json` |
 | Provider secrets | Selected profile secret store / OAuth store | `~/.estacoda/profiles/<id>/.env`, `auth.json` |
-| Sessions, gateway approvals, trajectories, workflows | Global SQLite DB with profile scoping | `~/.estacoda/sessions.sqlite` |
+| Sessions, gateway approvals, trajectories, Task metadata | Global SQLite DB with profile scoping | `~/.estacoda/sessions.sqlite` |
+| Durable Task result bodies | Selected profile | `~/.estacoda/profiles/<id>/tasks/results/` |
 | Workspace trust and approvals | Global workspace state | `~/.estacoda/trust.json`, `workspace-approvals.json` |
 | Memory files | Selected profile plus explicit shared memory | `USER.md`, `SOUL.md`, `MEMORY.md`, `memory/shared/` |
 | Channel media and gateway state | Selected profile | `channel-media/`, `gateway/` |
@@ -81,7 +83,7 @@ graph TB
 | Why did a channel accept/reject a message? | Adapter file, `src/channels/channel-gateway.ts`, `src/channels/adapter-capability.ts` |
 | Why did recall or memory appear? | `src/memory/memory-recall-orchestrator.ts`, `src/session/session-recall-service.ts`, prompt assembly tests |
 | Why did a skill load or route? | `src/skills/skill-loader.ts`, `src/skills/skill-registry.ts`, `src/runtime/runtime-router.ts` |
-| How is workflow state recovered? | `src/workflow/workflow-restart-recovery.ts`, `src/workflow/sqlite-workflow-store.ts` |
+| How is durable Task state persisted, executed, scheduled, hosted, delivered, and read? | `src/contracts/task.ts`, `src/tasks/task-schema.ts`, `src/tasks/sqlite-task-store.ts`, `src/tasks/task-scheduler.ts`, `src/tasks/agent-step-executor.ts`, `src/tasks/task-background-host.ts`, `src/tasks/supervisor-task-background-host.ts`, `src/tasks/task-completion-delivery.ts`, `src/tasks/task-result-service.ts`, `src/gateway/supervisor.ts` |
 | How are traces persisted? | `src/session/sqlite-session-db.ts`, `src/trajectory/trajectory-recorder.ts`, `src/cli/trace-commands.ts` |
 
 ## Current Limitations
@@ -89,4 +91,5 @@ graph TB
 - Some implemented adapters and optional providers need operator validation before they should be treated as production surfaces in a deployment.
 - Gateway status emphasizes readiness and configured state; process/service liveness depends on the service manager path.
 - Native SQLite packaging remains a release validation requirement because `better-sqlite3` uses native bindings.
-- Exact semantic freshness across memory, session recall, web content, and delegation is bounded; current stale-file warnings cover tracked parent reads vs. child file writes.
+- The profile gateway supervisor hosts the durable Task scheduler and authority-bounded agent executor, including durable approvals, restart recovery, metering, and authorized completion delivery. `delegate_task`, `estacoda task`, `/task`, `task.status`, and `task.result.read` share the same profile-owned substrate and authorization boundaries.
+- Exact semantic freshness across memory, session recall, web content, and background Task workspace changes remains bounded. The removed synchronous delegation result path no longer emits parent-read versus child-write warnings.

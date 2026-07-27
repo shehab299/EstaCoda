@@ -177,13 +177,14 @@ export class SemanticCompressor {
     });
     const providerMaxTokens = computeSummaryRequestMaxTokens(summaryBudget);
     const summary = await this.#summarize({
-      activeTask: sanitizeSummaryText(input.focusTopic?.trim() || latestUserText(input.messages)),
+      currentObjective: sanitizeSummaryText(input.focusTopic?.trim() || latestUserText(input.messages)),
       focusTopic: input.focusTopic === undefined ? undefined : sanitizeSummaryText(input.focusTopic),
       transcript: serialized.text,
       previousSummary: previousSummary === undefined ? undefined : sanitizeSummaryText(previousSummary),
       summaryBudget,
       providerMaxTokens,
       scopeKey,
+      sessionId: input.sessionId,
       signal: input.signal
     });
     const summaryText = normalizeSummaryPrefix(summary.summary);
@@ -305,13 +306,14 @@ export class SemanticCompressor {
   }
 
   async #summarize(input: {
-    activeTask: string;
+    currentObjective: string;
     focusTopic?: string;
     transcript: string;
     previousSummary?: string;
     summaryBudget: number;
     providerMaxTokens: number;
     scopeKey: string;
+    sessionId: string;
     signal?: AbortSignal;
   }): Promise<{
     summary: string;
@@ -345,14 +347,14 @@ export class SemanticCompressor {
     const request = input.previousSummary === undefined
       ? summarizerFirstRequest({
           model: this.#route.route.id,
-          activeTask: input.activeTask,
+          currentObjective: input.currentObjective,
           focusTopic: input.focusTopic,
           transcript: input.transcript,
           maxTokens: input.providerMaxTokens
         })
       : summarizerUpdateRequest({
           model: this.#route.route.id,
-          activeTask: input.activeTask,
+          currentObjective: input.currentObjective,
           focusTopic: input.focusTopic,
           transcript: input.transcript,
           previousSummary: input.previousSummary,
@@ -365,7 +367,10 @@ export class SemanticCompressor {
       providerExecutor: this.#providerExecutor,
       request,
       signal: input.signal,
-      scopeKey: input.scopeKey
+      scopeKey: input.scopeKey,
+      usage: {
+        executionSessionId: input.sessionId,
+      }
     });
 
     if (!auxiliary.ok || auxiliary.response === undefined || auxiliary.response.content.trim().length === 0) {
@@ -734,7 +739,7 @@ function boundedSnippet(content: string, start: number): string | undefined {
 
 function summarizerFirstRequest(input: {
   model: string;
-  activeTask: string;
+  currentObjective: string;
   focusTopic?: string;
   transcript: string;
   maxTokens: number;
@@ -756,8 +761,8 @@ function summarizerFirstRequest(input: {
       {
         role: "user" as const,
         content: [
-          "## Active Task",
-          input.activeTask || "Unknown current user task.",
+          "## Current Objective",
+          input.currentObjective || "Unknown current user objective.",
           input.focusTopic === undefined || input.focusTopic.trim().length === 0
             ? ""
             : `Manual focus topic: ${input.focusTopic.trim()}`,
@@ -800,7 +805,7 @@ function summarizerFirstRequest(input: {
 
 function summarizerUpdateRequest(input: {
   model: string;
-  activeTask: string;
+  currentObjective: string;
   focusTopic?: string;
   transcript: string;
   previousSummary: string;
@@ -823,8 +828,8 @@ function summarizerUpdateRequest(input: {
       {
         role: "user" as const,
         content: [
-          "## Active Task",
-          input.activeTask || "Unknown current user task.",
+          "## Current Objective",
+          input.currentObjective || "Unknown current user objective.",
           input.focusTopic === undefined || input.focusTopic.trim().length === 0
             ? ""
             : `Manual focus topic: ${input.focusTopic.trim()}`,
@@ -841,7 +846,7 @@ function summarizerUpdateRequest(input: {
           "1. Preserve all existing information that is still relevant.",
           "2. Add new completed actions to the completed work/action history when present.",
           "3. Move completed work and answered questions out of active state when appropriate.",
-          "4. Update active state and active task to reflect the latest current context.",
+          "4. Update active state and current objective to reflect the latest current context.",
           "5. Remove information only when it is clearly obsolete.",
           "6. Retain explicit constraints, preferences, safety-relevant decisions, file paths, commands, errors, and remaining work.",
           "",

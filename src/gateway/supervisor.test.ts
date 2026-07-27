@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -317,7 +317,7 @@ describe("runGatewaySupervisor", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("startup with no adapters configured (cron-only)", async () => {
+  it("startup with no adapters configured (background tasks and cron)", async () => {
     const tick = fakeTickCron();
     const sleeper = fakeSleep();
     const result = await runGatewaySupervisor({
@@ -339,6 +339,78 @@ describe("runGatewaySupervisor", () => {
 
     const pid = await readGatewayPid(profilePaths);
     expect(pid).toBeUndefined();
+  });
+
+  it("runs and disposes the durable Task host in once mode", async () => {
+    let taskHostOptions: Parameters<NonNullable<import("./supervisor.js").SupervisorFactories["createTaskBackgroundHost"]>>[0] | undefined;
+    const host = {
+      runOnce: vi.fn(async () => ({ skipped: false })),
+      hasPendingWork: vi.fn(() => false),
+      waitForIdle: vi.fn(async () => undefined),
+      status: vi.fn(() => ({ running: false, runs: 1 })),
+      dispose: vi.fn(async () => undefined)
+    };
+
+    const result = await runGatewaySupervisor({
+      workspaceRoot: tmpDir,
+      homeDir: tmpDir,
+      once: true,
+      factories: {
+        tickCron: fakeTickCron().tickCron,
+        createTaskBackgroundHost: (input) => {
+          taskHostOptions = input;
+          return host;
+        },
+        createChannelGateway: () => fakeChannelGateway() as any,
+        createDeliveryRouter: () => fakeDeliveryRouter() as any
+      }
+    });
+
+    expect(result.ok).toBe(true);
+    await expect(taskHostOptions?.resolveWorkspace(tmpDir)).resolves.toMatchObject({ canonicalPath: await realpath(tmpDir) });
+    await expect(taskHostOptions?.isWorkspaceTrusted(tmpDir)).resolves.toBe(false);
+    expect(host.runOnce).toHaveBeenCalledTimes(1);
+    expect(host.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports and retries durable Task host disposal failure in once mode", async () => {
+    let firstDisposal = true;
+    const host = {
+      runOnce: vi.fn(async () => ({ skipped: false })),
+      hasPendingWork: vi.fn(() => false),
+      waitForIdle: vi.fn(async () => undefined),
+      status: vi.fn(() => ({ running: false, runs: 1 })),
+      dispose: vi.fn(async () => {
+        if (firstDisposal) {
+          firstDisposal = false;
+          throw new TypeError("private disposal detail");
+        }
+      })
+    };
+    const warnings: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation((message: unknown) => {
+      warnings.push(String(message));
+    });
+    try {
+      const result = await runGatewaySupervisor({
+        workspaceRoot: tmpDir,
+        homeDir: tmpDir,
+        once: true,
+        factories: {
+          tickCron: fakeTickCron().tickCron,
+          createTaskBackgroundHost: () => host,
+          createChannelGateway: () => fakeChannelGateway() as any,
+          createDeliveryRouter: () => fakeDeliveryRouter() as any
+        }
+      });
+
+      expect(result.ok).toBe(true);
+      expect(host.dispose).toHaveBeenCalledTimes(2);
+      expect(warnings).toContain("Task background host disposal failed (TypeError); retrying once.");
+      expect(warnings.join("\n")).not.toContain("private disposal detail");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("cron runtime options preserve primary and fallback model routes", () => {
@@ -423,7 +495,7 @@ describe("runGatewaySupervisor", () => {
       },
     });
 
-    // With no adapters enabled, this should succeed in cron-only mode
+    // With no adapters enabled, the background tasks+cron host still succeeds.
     expect(result.ok).toBe(true);
   });
 
@@ -2724,7 +2796,7 @@ describe("supervisor lifecycle hooks", () => {
       expect(typeof payload.startedAt).toBe("string");
       expect(typeof payload.version).toBe("string");
       expect(payload.adapterKinds).toEqual(["telegram"]);
-      expect(payload.mode).toBe("adapters");
+      expect(payload.mode).toBe("adapters+background");
     } finally {
       HookRegistry.prototype.emit = originalEmit;
     }

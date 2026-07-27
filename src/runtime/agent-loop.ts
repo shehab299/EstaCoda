@@ -9,6 +9,7 @@ import type { ContextEstimateStage, RuntimeEvent, RuntimeEventSink } from "../co
 import type { SecurityDecision, SecurityPolicy } from "../contracts/security.js";
 import { assessSecurityPolicy, capabilityFirstDefaults } from "../contracts/security.js";
 import type { SessionDB } from "../contracts/session.js";
+import type { TurnUsageSummary, UsageCostSummary } from "../contracts/usage-cost.js";
 import type {
   LoadedSkill,
   SelectedSkillPromptContent,
@@ -24,6 +25,7 @@ import type { AgentProfileMode, AgentResponseLanguage, SessionCompressionConfig,
 import type { AgentEvolutionPolicy } from "../contracts/agent-evolution.js";
 import type { ContextReferenceExpander } from "../context/context-reference-expander.js";
 import type { ProviderExecutionResult, ProviderRuntimeEvent } from "../providers/provider-executor.js";
+import { providerSpendDenialMessage } from "../providers/provider-spend-policy.js";
 import type { ToolCallPlanner } from "../tools/tool-call-planner.js";
 import type { OpenAICompatibleToolSchema } from "../tools/tool-schema.js";
 import type { ToolExecutor, ToolExecutionRecord } from "../tools/tool-executor.js";
@@ -49,19 +51,19 @@ import type { SessionRuntimeContext } from "./session-runtime-context.js";
 import { buildFallbackResponse, cancelledResponse, buildResumeNote, renderToolPlanProgress } from "./response-builders.js";
 import { renderProviderExecutionSummary, summarizeProviderExecution } from "./provider-execution-summary.js";
 import {
-  sanitizeActiveTaskState,
-  updateActiveTaskState,
-  type ActiveTaskState
-} from "./active-task-state.js";
+  sanitizeConversationContinuationState,
+  updateConversationContinuationState,
+  type ConversationContinuationState
+} from "./conversation-continuation-state.js";
 import { emit, isAborted } from "../utils/runtime-helpers.js";
 import { appendArtifactSummary, renderArtifactProgress } from "../utils/artifact-formatting.js";
 import { summarizeProviderFailure } from "../providers/provider-diagnostics.js";
 import type { SessionCompressionService } from "../prompt/session-compression-service.js";
 import { estimateMessagesTokensRough, estimateTextTokensRough } from "../prompt/token-estimator.js";
 import { redactSensitiveText } from "../utils/redaction.js";
-import type { WorkflowRuntimeContext } from "../contracts/workflow-context.js";
 import type { MemoryCurationService } from "../memory/memory-curation-service.js";
 import { emitContextEstimate } from "./context-usage-events.js";
+import { unavailableUsageCostSummary, usageCostSummaryFromEntries } from "../providers/provider-usage-projection.js";
 
 export type AgentLoopInput = {
   text: string;
@@ -74,7 +76,6 @@ export type AgentLoopInput = {
   onSegmentBreak?: (reason?: string) => void | Promise<void>;
   signal?: AbortSignal;
   inputMetadata?: Record<string, unknown>;
-  workflow?: WorkflowRuntimeContext;
 };
 
 export type AgentLoopResponse = {
@@ -90,6 +91,7 @@ export type AgentLoopResponse = {
   context: ContextExpansionResult | undefined;
   projectContext: ProjectContextSnapshot | undefined;
   providerExecution?: ProviderExecutionResult;
+  turnUsage?: TurnUsageSummary;
   progress: string[];
   setupApprovals?: AgentLoopSetupApprovalRequest[];
 };
@@ -331,14 +333,13 @@ export class AgentLoop {
     });
     const attachments = route.attachments;
 
-    await this.#sessionDb.appendMessage({
+    const visibleTurn = await this.#sessionDb.appendMessage({
       sessionId: this.#currentSessionId(),
       role: "user",
       content: effectiveText,
       channel: input.channel,
       metadata: {
         ...input.inputMetadata,
-        ...(input.workflow === undefined ? {} : { workflow: input.workflow }),
         attachments: summarizeAttachments(attachments),
         contextReferences: context?.references.map((reference) => reference.raw) ?? [],
         projectContextFiles: this.#projectContext?.files.map((file) => file.source) ?? []
@@ -348,8 +349,7 @@ export class AgentLoop {
       text: effectiveText,
       channel: input.channel,
       attachments: summarizeAttachments(attachments),
-      contextReferences: context?.references.map((reference) => reference.raw) ?? [],
-      ...(input.workflow === undefined ? {} : { workflow: input.workflow })
+      contextReferences: context?.references.map((reference) => reference.raw) ?? []
     });
     await this.#emitLiveContextUsageEstimate({
       onEvent: input.onEvent,
@@ -402,7 +402,7 @@ export class AgentLoop {
       }), {
         success: false,
         summary: "Turn cancelled before routing."
-      });
+      }, visibleTurn.id);
     }
 
     if (route.attachmentFailureResponse !== undefined) {
@@ -478,7 +478,7 @@ export class AgentLoop {
       }, {
         success: false,
         summary: "Attachment preflight failed."
-      });
+      }, visibleTurn.id);
     }
 
     await emit(input.onEvent, {
@@ -510,6 +510,8 @@ export class AgentLoop {
     const shadowLlmRerank = await this.#shadowLlmRerank({
       intent,
       userText: routedText,
+      executionSessionId: this.#currentSessionId(),
+      visibleTurnId: visibleTurn.id,
       ...(input.signal === undefined ? {} : { signal: input.signal })
     });
     await this.#runRecorder.recordRouteUsage({
@@ -653,7 +655,7 @@ export class AgentLoop {
     const deterministicImageGenerationRan = deterministicNativeTools.executions.some((execution) => execution.tool.name === "image.generate");
     const providerTools = this.#model?.supportsTools === true ? this.#providerTools : [];
     const preflightCompression = await this.#compactBeforeProviderTurn(input.signal, input.onEvent);
-    const previousActiveTaskState = await this.#latestActiveTaskState();
+    const previousConversationContinuationState = await this.#latestConversationContinuationState();
     await this.#emitLiveContextUsageEstimate({
       onEvent: input.onEvent,
       routedText,
@@ -671,6 +673,7 @@ export class AgentLoop {
       stage: "preflight"
     });
     const providerLoop = await this.#providerTurnLoop.run({
+      visibleTurnId: visibleTurn.id,
       userText: effectiveText,
       routedText,
       selectedSkill,
@@ -694,7 +697,7 @@ export class AgentLoop {
       toolPlans,
       trustedWorkspace,
       initialRiskClass,
-      activeTaskState: previousActiveTaskState,
+      conversationContinuationState: previousConversationContinuationState,
       signal: input.signal
     });
     const effectiveProviderExecution = providerLoop.providerExecution;
@@ -741,7 +744,7 @@ export class AgentLoop {
       return await this.#completeAndReturn(response, {
         success: false,
         summary: "Turn cancelled during provider/tool loop."
-      });
+      }, visibleTurn.id);
     }
     const skillOutcomes = await this.#runRecorder.recordSkillOutcomes({
       selectedSkill,
@@ -799,11 +802,16 @@ export class AgentLoop {
           }
         : {
             ...fallbackResponse,
-            text: appendArtifactSummary([
-              fallbackResponse.text,
-              "",
-              `Provider note: ${summarizeProviderFailure(effectiveProviderExecution)}`
-            ].join("\n"), artifacts),
+            text: effectiveProviderExecution.spendDenialReason === undefined
+              ? appendArtifactSummary([
+                  fallbackResponse.text,
+                  "",
+                  `Provider note: ${summarizeProviderFailure(effectiveProviderExecution)}`
+                ].join("\n"), artifacts)
+              : appendArtifactSummary(
+                  providerSpendDenialMessage(effectiveProviderExecution.spendDenialReason),
+                  artifacts
+                ),
             toolExecutions,
             toolPlans,
             skillOutcomes,
@@ -817,8 +825,8 @@ export class AgentLoop {
             ...providerProgress
           ]
         };
-    const activeTaskState = updateActiveTaskState({
-      previous: previousActiveTaskState,
+    const conversationContinuationState = updateConversationContinuationState({
+      previous: previousConversationContinuationState,
       userText: effectiveText,
       agentText: response.text,
       toolExecutions,
@@ -885,7 +893,7 @@ export class AgentLoop {
           providerExecution: providerSummary,
           providerFallbackUsed: providerSummary.fallbackUsed,
           providerPrimaryFailureClass: providerSummary.primaryFailureClass,
-          ...(activeTaskState === undefined ? {} : { activeTaskState }),
+          ...(conversationContinuationState === undefined ? {} : { conversationContinuationState }),
           toolPlans: toolPlans.map((plan) => ({
             id: plan.id,
             tool: plan.tool,
@@ -913,7 +921,7 @@ export class AgentLoop {
       onEvent: input.onEvent
     }).catch(() => undefined);
 
-    return await this.#completeAndReturn(response, outcomeFromResponse(response));
+    return await this.#completeAndReturn(response, outcomeFromResponse(response), visibleTurn.id);
   }
 
 
@@ -967,13 +975,13 @@ export class AgentLoop {
       response.text === "I completed the requested actions but did not produce any visible output.";
   }
 
-  async #latestActiveTaskState(): Promise<ActiveTaskState | undefined> {
+  async #latestConversationContinuationState(): Promise<ConversationContinuationState | undefined> {
     const messages = await this.#sessionDb.listMessages(this.#currentSessionId()).catch(() => []);
     for (const message of [...messages].reverse()) {
       if (message.role !== "agent") {
         continue;
       }
-      const state = sanitizeActiveTaskState(message.metadata?.activeTaskState);
+      const state = sanitizeConversationContinuationState(message.metadata?.conversationContinuationState);
       if (state !== undefined) {
         return state.status === "open" ? state : undefined;
       }
@@ -1261,6 +1269,8 @@ export class AgentLoop {
   async #shadowLlmRerank(input: {
     intent: IntentRoute;
     userText: string;
+    executionSessionId?: string;
+    visibleTurnId?: string;
     signal?: AbortSignal;
   }): Promise<SkillRouteLlmRerankTelemetry | undefined> {
     if (this.#skillRouteShadowReranker === undefined) {
@@ -1293,13 +1303,59 @@ export class AgentLoop {
     return this.#sessionRuntimeContext?.currentSessionId() ?? this.#sessionId;
   }
 
-  async #completeAndReturn<T extends AgentLoopResponse>(response: T, outcome: {
+  async #completeAndReturn(response: AgentLoopResponse, outcome: {
     success: boolean;
     summary: string;
     userAccepted?: boolean;
-  }): Promise<T> {
+  }, visibleTurnId?: string): Promise<AgentLoopResponse> {
+    const completedResponse = visibleTurnId === undefined
+      ? response
+      : await this.#withTurnUsage(response, visibleTurnId);
     await this.#runRecorder.completeTrajectory(outcome, { bestEffort: true });
-    return response;
+    return completedResponse;
+  }
+
+  async #withTurnUsage(response: AgentLoopResponse, visibleTurnId: string): Promise<AgentLoopResponse> {
+    let mainAgent: UsageCostSummary;
+    let auxiliaryModels: UsageCostSummary;
+    let delegatedWork: UsageCostSummary;
+    let total: UsageCostSummary;
+    try {
+      const entries = await this.#sessionDb.listProviderUsageEntries(this.#profileId, {
+        visibleTurnId
+      });
+      const dispatchedProviderRequest = response.providerExecution?.attempts.some((attempt) => attempt.state === "dispatched") === true;
+      mainAgent = usageCostSummaryFromEntries(entries.filter((entry) =>
+        entry.taskId === undefined && entry.sourceKind === "main"
+      ), {
+        emptyUsageIsComplete: !dispatchedProviderRequest
+      });
+      auxiliaryModels = usageCostSummaryFromEntries(entries.filter((entry) =>
+        entry.taskId === undefined && entry.sourceKind === "auxiliary"
+      ), { emptyUsageIsComplete: true });
+      delegatedWork = usageCostSummaryFromEntries(entries.filter((entry) => entry.taskId !== undefined), {
+        emptyUsageIsComplete: true
+      });
+      total = usageCostSummaryFromEntries(entries, {
+        emptyUsageIsComplete: !dispatchedProviderRequest
+      });
+    } catch {
+      mainAgent = unavailableUsageCostSummary("turn-usage-read-failed");
+      auxiliaryModels = unavailableUsageCostSummary("turn-usage-read-failed");
+      delegatedWork = unavailableUsageCostSummary("turn-usage-read-failed");
+      total = unavailableUsageCostSummary("turn-usage-read-failed");
+    }
+    return {
+      ...response,
+      turnUsage: {
+        turnId: visibleTurnId,
+        mainAgent,
+        auxiliaryModels,
+        delegatedWork,
+        total,
+        provisional: false
+      }
+    };
   }
 
 

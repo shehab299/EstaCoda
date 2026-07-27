@@ -62,6 +62,7 @@ const primaryRoute: ResolvedModelRoute = {
   baseUrl: "https://primary.example.com/v1",
   apiKeyEnv: "PRIMARY_KEY"
 };
+const DISPATCHED_AT = "2030-01-01T00:00:00.000Z";
 
 const nativeHistoryRoute = {
   ...primaryRoute,
@@ -140,7 +141,7 @@ async function createProviderTurnLoopForTest(
 ): Promise<ProviderTurnLoop> {
   const registry = new ProviderRegistry();
   registry.register(createMockAdapter());
-  const providerExecutor = new ProviderExecutor({ registry });
+  const providerExecutor = new ProviderExecutor({ registry, allowUnenforcedAttributedSpend: true });
   const sessionDb = new InMemorySessionDB();
   const sessionId = `test-session-${Date.now()}-${Math.random()}`;
   await sessionDb.createSession({ id: sessionId, profileId: "default", title: "test" });
@@ -195,7 +196,7 @@ async function createProviderTurnLoopForTest(
 async function createCompressionHarness() {
   const registry = new ProviderRegistry();
   registry.register(createMockAdapter());
-  const providerExecutor = new ProviderExecutor({ registry });
+  const providerExecutor = new ProviderExecutor({ registry, allowUnenforcedAttributedSpend: true });
   const completeSpy = vi.spyOn(providerExecutor, "complete").mockResolvedValue({
     ok: true,
     response: {
@@ -214,6 +215,8 @@ async function createCompressionHarness() {
       {
         provider: "test-provider",
         model: "test-model",
+        state: "dispatched",
+        dispatchedAt: DISPATCHED_AT,
         ok: true,
         content: "mock-response"
       }
@@ -332,9 +335,11 @@ async function runBasicProviderTurn(
     onDelta?: (text: string) => void;
     onSegmentBreak?: (reason?: string) => void | Promise<void>;
     attachments?: ChannelAttachment[];
+    visibleTurnId?: string;
   } = {}
 ): Promise<Awaited<ReturnType<ProviderTurnLoop["run"]>>> {
   return await loop.run({
+    visibleTurnId: callbacks.visibleTurnId,
     userText: "current user request",
     routedText: "current user request",
     selectedSkill: undefined,
@@ -375,6 +380,8 @@ function providerExecution(
     {
       provider: "test-provider",
       model: "test-model",
+      state: "dispatched" as const,
+      dispatchedAt: DISPATCHED_AT,
       ok: true,
       content,
       ...(response.finishReason === undefined ? {} : { finishReason: response.finishReason }),
@@ -406,6 +413,8 @@ function incompleteStreamExecution(partialContent: string | undefined): Provider
       {
         provider: "test-provider",
         model: "test-model",
+        state: "dispatched",
+        dispatchedAt: DISPATCHED_AT,
         ok: false,
         errorClass: "incomplete-stream",
         content: "Provider stream ended before completion after partial output.",
@@ -820,6 +829,8 @@ function forwardingSessionDb(db: InMemorySessionDB, overrides: Partial<SessionDB
     replaceMessages: overrides.replaceMessages ?? db.replaceMessages.bind(db),
     rewriteTranscript: overrides.rewriteTranscript ?? db.rewriteTranscript.bind(db),
     appendEvent: overrides.appendEvent ?? db.appendEvent.bind(db),
+    recordProviderUsageEntries: overrides.recordProviderUsageEntries ?? db.recordProviderUsageEntries.bind(db),
+    listProviderUsageEntries: overrides.listProviderUsageEntries ?? db.listProviderUsageEntries.bind(db),
     listMessages: overrides.listMessages ?? db.listMessages.bind(db),
     listEvents: overrides.listEvents ?? db.listEvents.bind(db),
     search: overrides.search ?? db.search.bind(db),
@@ -992,6 +1003,50 @@ describe("ProviderTurnLoop streaming callbacks", () => {
 });
 
 describe("ProviderTurnLoop provider availability", () => {
+  it("passes the persisted visible user turn to the canonical provider boundary", async () => {
+    const harness = await createCompressionHarness();
+    await appendHistory(harness.sessionDb, harness.sessionId, "history");
+    harness.completeSpy.mockResolvedValueOnce({
+      ok: false,
+      fallbackUsed: true,
+      attempts: [
+        {
+          provider: "test-provider",
+          model: "test-model",
+          state: "dispatched",
+          dispatchedAt: "2030-01-01T00:00:00.000Z",
+          ok: false,
+          errorClass: "timeout",
+          content: "",
+          usage: { inputTokens: 25, outputTokens: 0, totalTokens: 25 }
+        },
+        {
+          provider: "fallback-provider",
+          model: "fallback-model",
+          state: "preflight",
+          ok: false,
+          errorClass: "auth",
+          content: ""
+        }
+      ],
+      toolCalls: []
+    });
+
+    await runBasicProviderTurn(harness.loop(), { visibleTurnId: `${harness.sessionId}-latest` });
+
+    expect(harness.completeSpy).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+      expect.objectContaining({
+        usage: expect.objectContaining({
+          sourceKind: "main",
+          executionSessionId: harness.sessionId,
+          visibleTurnId: `${harness.sessionId}-latest`
+        })
+      })
+    );
+  });
+
   it("can run provider when executor and configured model are present", async () => {
     const loop = await createProviderTurnLoopForTest();
 
@@ -1116,6 +1171,8 @@ describe("ProviderTurnLoop semantic session compression", () => {
         attempts: [{
           provider: primaryRoute.provider,
           model: primaryRoute.id,
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "response without usage"
         }],
@@ -1205,6 +1262,8 @@ describe("ProviderTurnLoop semantic session compression", () => {
         attempts: [{
           provider: fallbackRoute.provider,
           model: fallbackRoute.id,
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "fallback-response"
         }],
@@ -1367,7 +1426,7 @@ describe("ProviderTurnLoop OpenAI-compatible stream recovery", () => {
         }
       }));
 
-      const providerExecutor = new ProviderExecutor({ registry });
+      const providerExecutor = new ProviderExecutor({ registry, allowUnenforcedAttributedSpend: true });
       const openAIModel: ModelProfile = {
         id: "gpt-test",
         provider: "openai",
@@ -2280,6 +2339,8 @@ describe("ProviderTurnLoop post-tool empty response recovery", () => {
             {
               provider: "test-provider",
               model: "test-model",
+              state: "dispatched",
+              dispatchedAt: DISPATCHED_AT,
               ok: true,
               content: "streamed answer",
               streamDiagnostics
@@ -2977,6 +3038,8 @@ describe("ProviderTurnLoop length-truncated text continuation", () => {
         {
           provider: "test-provider",
           model: "test-model",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: false,
           errorClass: "server",
           content: "primary failed"
@@ -2984,6 +3047,8 @@ describe("ProviderTurnLoop length-truncated text continuation", () => {
         {
           provider: "test-provider",
           model: "test-model-fallback",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "Fallback par",
           finishReason: "length"
@@ -3034,6 +3099,8 @@ describe("ProviderTurnLoop length-truncated text continuation", () => {
         {
           provider: "test-provider",
           model: "test-model",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: false,
           errorClass: "server",
           content: "primary failed"
@@ -3041,6 +3108,8 @@ describe("ProviderTurnLoop length-truncated text continuation", () => {
         {
           provider: "test-provider",
           model: "test-model-fallback",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "FallbackA par",
           finishReason: "length"
@@ -3066,6 +3135,8 @@ describe("ProviderTurnLoop length-truncated text continuation", () => {
             {
               provider: "test-provider",
               model: "test-model-fallback",
+              state: "dispatched",
+              dispatchedAt: DISPATCHED_AT,
               ok: false,
               errorClass: "server",
               content: "fallback A continuation failed"
@@ -3073,6 +3144,8 @@ describe("ProviderTurnLoop length-truncated text continuation", () => {
             {
               provider: "test-provider",
               model: "test-model-second-fallback",
+              state: "dispatched",
+              dispatchedAt: DISPATCHED_AT,
               ok: true,
               content: "partial from fallbackB.",
               finishReason: "stop"
@@ -3337,6 +3410,8 @@ describe("ProviderTurnLoop truncated tool-call safety", () => {
         {
           provider: "test-provider",
           model: "test-model",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: false,
           errorClass: "server",
           content: "primary failed"
@@ -3344,6 +3419,8 @@ describe("ProviderTurnLoop truncated tool-call safety", () => {
         {
           provider: "test-provider",
           model: "test-model-fallback",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "",
           finishReason: "length"
@@ -3489,6 +3566,8 @@ describe("ProviderTurnLoop truncated tool-call safety", () => {
             {
               provider: "test-provider",
               model: "test-model",
+              state: "dispatched",
+              dispatchedAt: DISPATCHED_AT,
               ok: false,
               errorClass: "server",
               content: "retry failed"
@@ -3573,7 +3652,7 @@ describe("ProviderTurnLoop explicit route propagation", () => {
   it("uses the per-turn memory prompt context when assembling provider prompts", async () => {
     const registry = new ProviderRegistry();
     registry.register(createMockAdapter());
-    const providerExecutor = new ProviderExecutor({ registry });
+    const providerExecutor = new ProviderExecutor({ registry, allowUnenforcedAttributedSpend: true });
     const completeSpy = vi.spyOn(providerExecutor, "complete").mockResolvedValue({
       ok: true,
       response: {
@@ -3587,6 +3666,8 @@ describe("ProviderTurnLoop explicit route propagation", () => {
         {
           provider: "test-provider",
           model: "test-model",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "mock-response"
         }
@@ -3649,7 +3730,7 @@ describe("ProviderTurnLoop explicit route propagation", () => {
     const registry = new ProviderRegistry();
     registry.register(createMockAdapter());
 
-    const providerExecutor = new ProviderExecutor({ registry });
+    const providerExecutor = new ProviderExecutor({ registry, allowUnenforcedAttributedSpend: true });
     const completeSpy = vi.spyOn(providerExecutor, "complete").mockResolvedValue({
       ok: true,
       response: {
@@ -3663,6 +3744,8 @@ describe("ProviderTurnLoop explicit route propagation", () => {
         {
           provider: "test-provider",
           model: "test-model",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "mock-response"
         }
@@ -3774,7 +3857,7 @@ describe("ProviderTurnLoop explicit route propagation", () => {
     const registry = new ProviderRegistry();
     registry.register(createMockAdapter());
 
-    const providerExecutor = new ProviderExecutor({ registry });
+    const providerExecutor = new ProviderExecutor({ registry, allowUnenforcedAttributedSpend: true });
     const completeSpy = vi.spyOn(providerExecutor, "complete").mockResolvedValue({
       ok: true,
       response: {
@@ -3788,6 +3871,8 @@ describe("ProviderTurnLoop explicit route propagation", () => {
         {
           provider: "test-provider",
           model: "test-model",
+          state: "dispatched",
+          dispatchedAt: DISPATCHED_AT,
           ok: true,
           content: "mock-response"
         }

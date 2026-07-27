@@ -4,6 +4,8 @@ import type { Runtime } from "../runtime/create-runtime.js";
 import type { StatusRailState } from "../ui/papyrus/operator-console/index.js";
 import { buildSessionStatusRailViewModel } from "../ui/view-models/builders.js";
 import type { SessionRenderer } from "./session-renderer.js";
+import type { SessionCostSummary } from "../contracts/usage-cost.js";
+import type { WorkspaceStatusSnapshot } from "./workspace-status.js";
 
 export type ContextUsageSnapshot = NonNullable<SessionStatusRailViewModel["contextUsage"]>;
 export type RuntimeModelInfo = ReturnType<NonNullable<Runtime["getModelInfo"]>>;
@@ -35,6 +37,8 @@ export function operatorConsoleStatusRailState(input: {
   runtime: Runtime;
   renderer: SessionRenderer;
   contextUsage?: ContextUsageSnapshot;
+  sessionCost?: SessionCostSummary;
+  workspace?: WorkspaceStatusSnapshot;
   timing?: StatusRailTiming;
   providerExecutionSummary?: ProviderExecutionSummary;
 }): StatusRailState {
@@ -69,6 +73,16 @@ export function operatorConsoleStatusRailState(input: {
       elapsedMs: sessionElapsedMs ?? 0,
       startedAtMs: timing?.sessionStartedAtMs,
     },
+    ...(input.sessionCost === undefined ? {} : {
+      sessionCost: {
+        totalTokens: input.sessionCost.totalTokens,
+        usageComplete: input.sessionCost.usageComplete,
+        estimatedCostUsd: input.sessionCost.estimatedCostUsd,
+        costComplete: input.sessionCost.costComplete,
+        ...(input.sessionCost.budget === undefined ? {} : { budget: input.sessionCost.budget })
+      }
+    }),
+    ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
     ...(runtime.securityMode?.() === "open"
       ? { security: { yolo: true } }
       : {}),
@@ -93,6 +107,7 @@ export function sessionStatusRailViewModel(input: {
   runtime: Runtime;
   renderer: SessionRenderer;
   contextUsage?: ContextUsageSnapshot;
+  sessionCost?: SessionCostSummary;
   timing?: StatusRailTiming;
   providerExecutionSummary?: ProviderExecutionSummary;
 }): SessionStatusRailViewModel {
@@ -112,6 +127,11 @@ export function sessionStatusRailViewModel(input: {
     showTurnState,
     sessionElapsedMs,
     currentTurnSeconds,
+    sessionCost: input.sessionCost === undefined ? undefined : {
+      estimatedCostUsd: input.sessionCost.estimatedCostUsd,
+      costComplete: input.sessionCost.costComplete,
+      ...(input.sessionCost.budget === undefined ? {} : { budget: input.sessionCost.budget })
+    },
     contextUsage: input.contextUsage ?? (contextWindow !== undefined
       ? { total: contextWindow }
       : undefined),

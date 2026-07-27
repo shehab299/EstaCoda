@@ -6,6 +6,7 @@ import { measureTextWidth, measureVisibleWidth, padVisibleAlign, padVisibleEnd, 
 import type { UiLocale } from "../../ui/cli-ui-copy.js";
 import { chromeCopy } from "../../ui/cli-ui-copy.js";
 import { closeOpenBidiIsolates, isolateLtr, isolateRtl } from "../../ui/bidi.js";
+import { formatUsageCost } from "../usage-cost-format.js";
 import type {
   ActiveTurnSpinnerViewModel,
   ActivityTimelineViewModel,
@@ -146,8 +147,6 @@ export function renderStatus(vm: StatusViewModel): string {
     `skills: ${vm.skillCount}${vm.skillAutonomy !== undefined ? ` (${vm.skillAutonomy})` : ""}`,
     `tools: ${vm.toolCount}`,
     `mcp: ${vm.mcp.active}/${vm.mcp.total}`,
-    `workflow: ${vm.workflowAvailable ? "available" : "unavailable"}`,
-    `workflow run: ${vm.workflowRunActive ? "active" : "inactive"}`,
   ].filter((line): line is string => line !== undefined);
 
   for (const warning of vm.warnings) {
@@ -1159,6 +1158,10 @@ export function renderAssistantResponse(vm: AssistantResponseViewModel): string 
     ...vm.text.split("\n"),
   ];
 
+  if (vm.usageFooter !== undefined) {
+    lines.push("", vm.usageFooter);
+  }
+
   if (vm.matchedSkills !== undefined && vm.matchedSkills.length > 0) {
     lines.push("");
     lines.push(`skills: ${vm.matchedSkills.join(", ")}`);
@@ -1222,6 +1225,10 @@ export function renderSessionStatusRail(vm: SessionStatusRailViewModel, locale?:
       : `${vm.contextUsage.total > 0 ? Math.round((vm.contextUsage.filled / vm.contextUsage.total) * 100) : 0}%`);
   }
 
+  if (vm.sessionCost !== undefined) {
+    parts.push(`session ${formatUsageCost(vm.sessionCost, { compact: true })}`);
+  }
+
   if (vm.sessionElapsedMs !== undefined) {
     parts.push(`session ${formatRailDuration(vm.sessionElapsedMs)}`);
   }
@@ -1249,6 +1256,10 @@ function renderArabicSessionStatusRail(
     parts.push(vm.contextUsage.filled === undefined
       ? "--%"
       : `${vm.contextUsage.total > 0 ? Math.round((vm.contextUsage.filled / vm.contextUsage.total) * 100) : 0}%`);
+  }
+
+  if (vm.sessionCost !== undefined) {
+    parts.push(`${isolateRtl("الجلسة")} ${formatUsageCost(vm.sessionCost, { locale: "ar", compact: true })}`);
   }
 
   if (vm.sessionElapsedMs !== undefined) {

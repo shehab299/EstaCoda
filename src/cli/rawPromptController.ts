@@ -30,16 +30,28 @@ import {
   type PapyrusVimKeymapState,
 } from "../ui/papyrus/input/vim/vimKeymap.js";
 import {
+  createApprovalFocusTarget,
   createInitialFocusState,
   createInitialOperatorConsoleState,
   createPastedTextAttachment,
   formatSubmittedPromptWithAttachmentContent,
   formatSubmittedPromptWithAttachmentPreview,
+  isHardInterruptInput,
+  isMouseModeToggle,
+  isPromptEditingInput,
+  hasVisibleTaskMotion,
   removeAttachmentAndRepairFocus,
+  reconcileTaskSurfaceState,
+  routeApprovalKey,
   routeAttachmentKey,
+  routeOperatorConsoleInput,
+  setOperatorConsoleMouseMode,
   type AttachmentCardState,
+  type ApprovalCardState,
   type FocusState,
+  type OperatorConsoleRegionKind,
   type SlashMenuState,
+  type TaskSurfaceState,
 } from "../ui/papyrus/operator-console/index.js";
 
 type RawPromptDataListener = (chunk: string | Buffer | Uint8Array) => void;
@@ -109,6 +121,8 @@ export class RawPromptController {
   readonly #keymap: RawPromptKeymapOptions | undefined;
   readonly #operatorConsole: RawPromptOperatorConsoleOptions | undefined;
   readonly #escapeCancels: boolean;
+  #closeActiveRead: (() => void) | undefined;
+  #writeActiveRead: ((text: string) => void) | undefined;
 
   constructor(options: RawPromptControllerOptions) {
     this.#input = options.input;
@@ -125,22 +139,86 @@ export class RawPromptController {
     });
   }
 
+  close(): void {
+    this.#closeActiveRead?.();
+  }
+
+  writeDurable(text: string): boolean {
+    if (this.#writeActiveRead === undefined) return false;
+    this.#writeActiveRead(text);
+    return true;
+  }
+
   async read(question: string, options?: PromptOptions): Promise<RawPromptResult> {
     const renderLoop = new RawPromptRenderLoop(this.#output);
     let state = createLineEditorState();
     let attachmentSequence = 0;
     let attachments: readonly AttachmentCardState[] = [];
     let attachmentFocus: FocusState = createInitialFocusState();
+    let approvals: readonly ApprovalCardState[] = [];
+    const resolvingApprovalIds = new Set<string>();
+    const approvalErrors = new Set<string>();
+    let taskSurface: TaskSurfaceState = { cards: [], scrollOffset: 0 };
     let vimKeymapState: PapyrusVimKeymapState | undefined =
       this.#keymap?.mode === "vim" ? createPapyrusVimKeymapState() : undefined;
     let typeaheadState: TypeaheadState<SlashCommandSuggestionMetadata> = createTypeaheadControllerState();
-    let statusTicker: ReturnType<typeof setInterval> | undefined;
+    let settled = false;
+    const motionStartedAtMs = Date.now();
+    let statusTicker: ReturnType<typeof setTimeout> | undefined;
     const stopStatusTicker = () => {
       if (statusTicker === undefined) return;
-      clearInterval(statusTicker);
+      clearTimeout(statusTicker);
       statusTicker = undefined;
     };
-    const render = () => {
+    const currentTerminal = () => {
+      const terminal = this.#operatorConsole?.getTerminal?.() ?? this.#operatorConsole?.terminal;
+      return {
+        width: terminal?.width ?? this.#output.columns ?? 80,
+        height: terminal?.height ?? this.#output.rows ?? 24,
+        isTty: terminal?.isTty ?? this.#output.isTTY ?? true,
+      };
+    };
+    const render = (dirtyRegions?: readonly OperatorConsoleRegionKind[]) => {
+      const refreshedApprovals = this.#operatorConsole?.getApprovals?.() ?? approvals;
+      const refreshedIds = new Set(refreshedApprovals.map((approval) => approval.id));
+      for (const approvalId of resolvingApprovalIds) {
+        if (!refreshedIds.has(approvalId)) resolvingApprovalIds.delete(approvalId);
+      }
+      const focusedApproval = attachmentFocus.target.kind === "approval" ? attachmentFocus.target : undefined;
+      approvals = refreshedApprovals
+        .filter((approval) => !resolvingApprovalIds.has(approval.id))
+        .map((approval) => ({
+          ...approval,
+          ...(approvalErrors.has(approval.id)
+            ? { summary: "Approval could not be resolved. Try again." }
+            : {}),
+          ...(focusedApproval?.approvalId === approval.id
+            ? { focusedControl: focusedApproval.control }
+            : { focusedControl: undefined })
+        }));
+      if (focusedApproval !== undefined &&
+          !approvals.some((approval) => approval.id === focusedApproval.approvalId)) {
+        attachmentFocus = createInitialFocusState();
+      }
+      const cards = this.#operatorConsole?.getTasks?.() ?? this.#operatorConsole?.tasks?.cards ?? taskSurface.cards;
+      taskSurface = reconcileTaskSurfaceState(taskSurface, cards);
+      if (taskSurface.cards.length === 0 && taskSurface.mouseModeActive === true) {
+        this.#lifecycle.setMouseTracking(false);
+        taskSurface = setOperatorConsoleMouseMode(createInitialOperatorConsoleState({ tasks: taskSurface }), false).tasks;
+      }
+      const inspectedCard = taskSurface.cards.find((card) => card.taskId === taskSurface.inspectedTaskId);
+      const selectedSubagent = inspectedCard?.subagents.find((subagent) =>
+        subagent.stepId === taskSurface.inspection?.selectedSubagentStepId
+      ) ?? inspectedCard?.subagents[0];
+      if (inspectedCard !== undefined && attachmentFocus.target.kind === "taskSubagent") {
+        attachmentFocus = selectedSubagent === undefined
+          ? createInitialFocusState({ kind: "taskCard", taskId: inspectedCard.taskId })
+          : createInitialFocusState({
+              kind: "taskSubagent",
+              taskId: inspectedCard.taskId,
+              stepId: selectedSubagent.stepId,
+            });
+      }
       const slashMenu = this.#operatorConsole?.enabled === true
         ? typeaheadStateToSlashMenu(typeaheadState)
         : undefined;
@@ -153,38 +231,60 @@ export class RawPromptController {
         operatorConsole: this.#operatorConsole?.enabled === true
           ? {
             ...this.#operatorConsole,
-            terminal: {
-              width: this.#operatorConsole.terminal?.width ?? this.#output.columns ?? 80,
-              height: this.#operatorConsole.terminal?.height ?? this.#output.rows ?? 24,
-              isTty: this.#operatorConsole.terminal?.isTty ?? this.#output.isTTY ?? true,
-            },
+            terminal: currentTerminal(),
+            motionElapsedMs: Math.max(0, Date.now() - motionStartedAtMs),
             attachments,
+            approvals,
+            tasks: taskSurface,
             slash: slashMenu,
             placeholder: options?.placeholder,
             focus: attachmentFocus,
           }
           : undefined,
-      });
+      }, { dirtyRegions });
       options?.onRowsChange?.(rows);
     };
 
+    this.#writeActiveRead = (text) => {
+      renderLoop.clear();
+      this.#output.write(text.endsWith("\n") ? text : `${text}\n`);
+      render();
+    };
+
+    this.#operatorConsole?.refreshTasks?.();
     render();
 
     try {
       this.#lifecycle.start();
+      if (this.#operatorConsole?.enabled === true) this.#lifecycle.resetMouseTracking();
     } catch (error) {
       stopStatusTicker();
+      this.#writeActiveRead = undefined;
       renderLoop.clear();
       this.#lifecycle.stop();
       throw error;
     }
-    if (this.#operatorConsole?.enabled === true && this.#operatorConsole.getStatus !== undefined) {
-      statusTicker = setInterval(render, 1000);
+    if (this.#operatorConsole?.enabled === true &&
+        (this.#operatorConsole.getStatus !== undefined || this.#operatorConsole.getTasks !== undefined ||
+          this.#operatorConsole.getApprovals !== undefined)) {
+      const scheduleStatusTick = () => {
+        const workerCadenceMs = this.#operatorConsole?.style?.tokens.contract.motion.worker.cadenceMs ?? 105;
+        const animationAllowed = currentTerminal().isTty &&
+          this.#operatorConsole?.style?.tokens.contract.behavior.allowAnimation === true;
+        const delayMs = animationAllowed && hasVisibleTaskMotion(taskSurface) ? workerCadenceMs : 1_000;
+        statusTicker = setTimeout(() => {
+          statusTicker = undefined;
+          this.#operatorConsole?.refreshTasks?.();
+          render(["approvals", "taskCards", "taskInspection", "statusRail"]);
+          if (!settled) scheduleStatusTick();
+        }, delayMs);
+        const timer = statusTicker as { unref?: () => void };
+        timer.unref?.();
+      };
+      scheduleStatusTick();
     }
 
     return await new Promise<RawPromptResult>((resolve, reject) => {
-      let settled = false;
-
       const notifyTypeahead = () => {
         if (this.#operatorConsole?.enabled === true) {
           this.#overlayHost.clear();
@@ -297,6 +397,8 @@ export class RawPromptController {
       let keypressDispatcher: KeypressStreamDispatcher | undefined;
 
       const cleanup = () => {
+        this.#closeActiveRead = undefined;
+        this.#writeActiveRead = undefined;
         keypressDispatcher?.dispose();
         stopStatusTicker();
         detachDataListener(this.#input, onData);
@@ -319,6 +421,21 @@ export class RawPromptController {
           this.#output.write("\n");
           resolve(result);
         }
+      };
+
+      this.#closeActiveRead = () => finish({ type: "cancel" });
+
+      const setMouseMode = (active: boolean, shouldRender = true) => {
+        const consoleState = setOperatorConsoleMouseMode(createInitialOperatorConsoleState({
+          locale: this.#operatorConsole?.locale,
+          terminal: currentTerminal(),
+          tasks: taskSurface,
+          focus: attachmentFocus,
+        }), active);
+        const enabled = consoleState.tasks.mouseModeActive === true && this.#lifecycle.setMouseTracking(true);
+        if (!enabled) this.#lifecycle.setMouseTracking(false);
+        taskSurface = setOperatorConsoleMouseMode(consoleState, enabled).tasks;
+        if (shouldRender) render();
       };
 
       const updateState = (nextState: LineEditorState) => {
@@ -407,6 +524,91 @@ export class RawPromptController {
         return true;
       };
 
+      const handleApprovalFocusEntry = (event: ParsedKeypress) => {
+        if (this.#operatorConsole?.enabled !== true || approvals.length === 0 || state.text.length > 0 ||
+            attachmentFocus.target.kind !== "prompt" || event.type !== "key" || event.key !== "tab" ||
+            isTypeaheadActive()) {
+          return false;
+        }
+        const approval = approvals.find((candidate) => candidate.status === "pending");
+        if (approval === undefined) return false;
+        approvalErrors.delete(approval.id);
+        attachmentFocus = createInitialFocusState(createApprovalFocusTarget(approval.id, "approve"));
+        render();
+        return true;
+      };
+
+      const handleApprovalKeypress = (event: ParsedKeypress) => {
+        if (this.#operatorConsole?.enabled !== true || attachmentFocus.target.kind !== "approval") return false;
+        const routed = routeApprovalKey(createInitialOperatorConsoleState({
+          approvals,
+          focus: attachmentFocus,
+        }), event);
+        approvals = routed.state.approvals;
+        attachmentFocus = routed.state.focus;
+        const intent = routed.intent;
+        if (intent.type === "none" || intent.type === "inspect") {
+          render();
+          return true;
+        }
+        const resolveApproval = this.#operatorConsole.onApprovalIntent;
+        if (resolveApproval === undefined) {
+          approvalErrors.add(intent.approvalId);
+          render();
+          return true;
+        }
+        resolvingApprovalIds.add(intent.approvalId);
+        approvalErrors.delete(intent.approvalId);
+        attachmentFocus = createInitialFocusState();
+        render();
+        void Promise.resolve(resolveApproval(intent)).then(
+          () => {
+            if (!settled) render();
+          },
+          () => {
+            resolvingApprovalIds.delete(intent.approvalId);
+            approvalErrors.add(intent.approvalId);
+            if (!settled) render();
+          }
+        );
+        return true;
+      };
+
+      const routeSharedOperatorConsoleInput = (event: ParsedKeypress) => {
+        if (this.#operatorConsole?.enabled !== true) return undefined;
+        const consoleState = createInitialOperatorConsoleState({
+          locale: this.#operatorConsole.locale,
+          terminal: currentTerminal(),
+          attachments,
+          tasks: taskSurface,
+          focus: attachmentFocus,
+        });
+        const routed = routeOperatorConsoleInput({
+          state: consoleState,
+          event,
+          approval: attachmentFocus.target.kind === "approval",
+          typeahead: isTypeaheadActive(),
+          attachment: attachmentFocus.target.kind === "attachment" ||
+            (attachments.length > 0 && event.type === "key" && event.key === "tab"),
+          steer: false,
+        });
+        const inspectionClosed = taskSurface.inspectedTaskId !== undefined &&
+          routed.state.tasks.inspectedTaskId === undefined;
+        if (routed.releaseMouseMode === true || inspectionClosed) {
+          this.#lifecycle.setMouseTracking(false);
+        }
+        taskSurface = setOperatorConsoleMouseMode(
+          routed.state,
+          routed.releaseMouseMode !== true && !inspectionClosed && routed.state.tasks.mouseModeActive === true
+        ).tasks;
+        attachmentFocus = routed.state.focus;
+        if (!routed.handled) return routed;
+        // A handled navigation event is also an explicit projection refresh: Task
+        // data can change independently while the idle prompt is waiting.
+        render();
+        return routed;
+      };
+
       const formatSubmittedText = (text: string): RawPromptResult => {
         if (this.#operatorConsole?.enabled !== true || attachments.length === 0) {
           return { type: "submit", text };
@@ -421,13 +623,34 @@ export class RawPromptController {
       const dispatchParsedEvents = (events: readonly ParsedKeypress[]) => {
         if (settled) return;
         for (const event of events) {
+          if (isHardInterruptInput(event)) {
+            finish({ type: "cancel" });
+            return;
+          }
+          if (this.#operatorConsole?.enabled === true && isMouseModeToggle(event)) {
+            setMouseMode(taskSurface.mouseModeActive !== true);
+            continue;
+          }
+          if (taskSurface.mouseModeActive === true && event.type === "key" && event.key === "escape") {
+            setMouseMode(false);
+            continue;
+          }
+          if (taskSurface.mouseModeActive === true && isPromptEditingInput(event)) {
+            setMouseMode(false);
+          }
+          if (handleApprovalFocusEntry(event)) continue;
+          const sharedRoute = routeSharedOperatorConsoleInput(event);
+          if (sharedRoute?.handled === true) continue;
+          const inputSurface = sharedRoute?.surface ?? (isTypeaheadActive() ? "typeahead" : "prompt");
+          if (inputSurface === "approval" && handleApprovalKeypress(event)) continue;
+          if (inputSurface === "typeahead" && handleTypeaheadKeypress(event)) continue;
+          if (inputSurface === "attachment" && handleEmptyPromptAttachmentClear(event)) continue;
+          if (inputSurface === "attachment" && handleAttachmentKeypress(event)) continue;
           if (this.#operatorConsole?.enabled === true && event.type === "paste") {
             addPasteAttachment(event.text);
             continue;
           }
           if (handleEmptyPromptAttachmentClear(event)) continue;
-          if (handleAttachmentKeypress(event)) continue;
-          if (handleTypeaheadKeypress(event)) continue;
           if (vimKeymapState !== undefined) {
             const vimResult = applyPapyrusVimKeymap(vimKeymapState, state, event);
             vimKeymapState = vimResult.state;
@@ -491,7 +714,8 @@ export function createRawPrompt(options: RawPromptControllerOptions & { uiContex
     {
       uiContext,
       submit,
-      close: () => undefined,
+      writeDurable: (text: string) => controller.writeDurable(text),
+      close: () => controller.close(),
     }
   );
 }

@@ -6,6 +6,7 @@ import {
   loadRuntimeConfig,
   normalizeDelegationConfig,
   normalizeAuxiliaryModels,
+  normalizeBudgetConfig,
   normalizeExternalMemoryConfig,
   normalizeModelFallbacks,
   normalizeSessionCompressionConfig,
@@ -16,12 +17,12 @@ import {
   setupAuxiliaryModelConfig,
   setupImageGenerationConfig,
   setupWebConfig,
-  setupVoiceConfig
+  setupVoiceConfig,
+  setupBudgetConfig
 } from "./runtime-config.js";
 import { DEFAULT_DELEGATION_CONFIG } from "./delegation-defaults.js";
 import { DEFAULT_MEMORY_CONFIG } from "./memory-config.js";
 import { resolveProfileStateHome } from "./profile-home.js";
-import type { SessionEvent } from "../contracts/session.js";
 
 function profileConfigPath(homeDir: string): string {
   return resolveProfileStateHome({ homeDir, profileId: "default" }).configPath;
@@ -34,6 +35,77 @@ function profileEnvPath(homeDir: string): string {
 function whatsappAuthDir(homeDir: string): string {
   return join(resolveProfileStateHome({ homeDir, profileId: "default" }).gatewayStatePath, "whatsapp-auth");
 }
+
+describe("normalizeBudgetConfig", () => {
+  it("keeps Task and session spending limits disabled when omitted", () => {
+    expect(normalizeBudgetConfig(undefined)).toEqual({});
+  });
+
+  it("normalizes monetary limits and defaults the warning threshold", () => {
+    expect(normalizeBudgetConfig({
+      task: { maxEstimatedCostUsd: 5 },
+      session: { maxEstimatedCostUsd: 0, warningThresholdPercent: 60 }
+    })).toEqual({
+      task: { maxEstimatedCostUsd: 5, warningThresholdPercent: 80 },
+      session: { maxEstimatedCostUsd: 0, warningThresholdPercent: 60 }
+    });
+  });
+
+  it("rejects missing, negative, non-finite, and out-of-range monetary policy", () => {
+    expect(() => normalizeBudgetConfig({ task: {} })).toThrow(/requires/i);
+    expect(() => normalizeBudgetConfig({ task: { maxEstimatedCostUsd: -1 } })).toThrow(/non-negative/i);
+    expect(() => normalizeBudgetConfig({ task: { maxEstimatedCostUsd: Number.NaN } })).toThrow(/finite/i);
+    expect(() => normalizeBudgetConfig({
+      task: { maxEstimatedCostUsd: 1, warningThresholdPercent: 101 }
+    })).toThrow(/between 0 and 100/i);
+  });
+});
+
+describe("setupBudgetConfig", () => {
+  it("updates one monetary scope and preserves unrelated configuration", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "estacoda-budget-config-"));
+    try {
+      const configPath = profileConfigPath(homeDir);
+      await mkdir(dirname(configPath), { recursive: true });
+      await writeFile(configPath, JSON.stringify({
+        model: { provider: "local", id: "test" },
+        budgets: {
+          session: { maxEstimatedCostUsd: 20, warningThresholdPercent: 75 },
+        },
+        security: { approvalMode: "adaptive" },
+      }), "utf8");
+
+      const result = await setupBudgetConfig({
+        workspaceRoot: "/workspace",
+        homeDir,
+        input: {
+          scope: "task",
+          spendingLimit: { maxEstimatedCostUsd: 0, warningThresholdPercent: 80 },
+        },
+      });
+
+      expect(result.config.budgets).toEqual({
+        task: { maxEstimatedCostUsd: 0, warningThresholdPercent: 80 },
+        session: { maxEstimatedCostUsd: 20, warningThresholdPercent: 75 },
+      });
+      expect(result.config.model).toEqual({ provider: "local", id: "test" });
+      expect(result.config.security?.approvalMode).toBe("adaptive");
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects invalid spending values before writing config", async () => {
+    await expect(setupBudgetConfig({
+      workspaceRoot: "/workspace",
+      homeDir: "/not-used",
+      input: {
+        scope: "task",
+        spendingLimit: { maxEstimatedCostUsd: Number.POSITIVE_INFINITY, warningThresholdPercent: 80 },
+      },
+    })).rejects.toThrow(/finite/iu);
+  });
+});
 
 async function withAllowPrivateUrlsEnv<T>(value: string | undefined, run: () => Promise<T>): Promise<T> {
   const previous = process.env.ESTACODA_ALLOW_PRIVATE_URLS;
@@ -313,47 +385,6 @@ describe("normalizeDelegationConfig", () => {
     await rm(workspace, { recursive: true, force: true });
   });
 
-  it("keeps delegation session events backward-compatible", () => {
-    const legacyEvents: SessionEvent[] = [
-      {
-        kind: "delegation-started",
-        childSessionId: "child-1",
-        task: "Inspect files",
-        allowedToolsets: []
-      },
-      {
-        kind: "delegation-finished",
-        childSessionId: "child-1",
-        summary: "Done",
-        status: "completed"
-      }
-    ];
-    const extendedEvents: SessionEvent[] = [
-      {
-        kind: "delegation-started",
-        childSessionId: "child-2",
-        task: "Inspect files",
-        allowedToolsets: [],
-        role: "leaf",
-        depth: 1,
-        taskIndex: 0,
-        batchId: "batch-1"
-      },
-      {
-        kind: "delegation-finished",
-        childSessionId: "child-2",
-        summary: "Timed out",
-        status: "failed",
-        durationMs: 600_000,
-        error: "timeout",
-        taskIndex: 0,
-        batchId: "batch-1"
-      }
-    ];
-
-    expect(legacyEvents).toHaveLength(2);
-    expect(extendedEvents).toHaveLength(2);
-  });
 });
 
 describe("normalizeExternalMemoryConfig", () => {

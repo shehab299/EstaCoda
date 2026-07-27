@@ -1,4 +1,5 @@
 import type { ChannelKind } from "./channel.js";
+import type { SpendingLimit } from "./budget.js";
 import type { ContextReference } from "./context.js";
 import type { IntentRoute } from "./intent.js";
 import type { ProviderErrorClass } from "./provider.js";
@@ -16,7 +17,8 @@ import type {
   CompiledSkillPlaybook
 } from "./skill.js";
 import type { FailureRecord } from "./failure.js";
-import type { DelegateModelOverrideMetadata, DelegateRole, DelegationStaleFileWarning } from "./delegation.js";
+import type { ProviderUsageEntry, ProviderUsageQuery } from "./provider-usage.js";
+import type { DelegateRole } from "./delegation.js";
 import type {
   ModelProfile,
   ProviderApiMode,
@@ -24,6 +26,7 @@ import type {
   ProviderFinishReason,
   ProviderId,
   ProviderLoopRuntimeMetadata,
+  ProviderAttemptState,
   ProviderReasoningMetadata,
   ProviderRouteRole,
   ProviderStreamDiagnostics,
@@ -39,6 +42,9 @@ export type SessionRecord = {
   createdAt: string;
   updatedAt: string;
   parentSessionId?: string;
+  /** Owner Session for the optional immutable logical-session monetary scope. */
+  spendingScopeSessionId?: string;
+  spendingLimit?: SpendingLimit;
   endedAt?: string;
   endReason?: string;
   metadata?: Record<string, unknown>;
@@ -278,47 +284,6 @@ export type SessionEvent =
       warnings: string[];
     }
   | {
-      kind: "delegation-started";
-      childSessionId: string;
-      task: string;
-      allowedToolsets: string[];
-      allowedTools?: string[];
-      role?: DelegateRole;
-      depth?: number;
-      taskIndex?: number;
-      batchId?: string;
-      modelOverride?: DelegateModelOverrideMetadata;
-    }
-  | {
-      kind: "delegation-finished";
-      childSessionId: string;
-      summary: string;
-      status: "completed" | "blocked" | "failed";
-      reason?: "cancelled" | "blocked" | "provider-error" | "runtime-error" | "construction-error" | "spawn-depth-exceeded" | "spawn-paused" | "timeout" | "model-override-unsupported";
-      durationMs?: number;
-      error?: string;
-      taskIndex?: number;
-      batchId?: string;
-      diagnosticPath?: string;
-      usage?: ProviderUsage;
-	      aggregateUsage?: ProviderUsage;
-	      usageUnavailable?: boolean;
-        modelOverride?: DelegateModelOverrideMetadata;
-	      staleFileWarnings?: DelegationStaleFileWarning[];
-	      staleFileWarningCount?: number;
-	    }
-  | {
-      kind: "delegation-heartbeat";
-      childSessionId?: string;
-      activeChildCount: number;
-      completedCount: number;
-      failedCount: number;
-      lastActivityAt: string;
-      stale?: boolean;
-      taskIndex?: number;
-      batchId?: string;
-    }
-  | {
       kind: "delegation-diagnostic";
       childSessionId: string;
       reason: "timeout" | "stale-heartbeat";
@@ -365,7 +330,7 @@ export type SessionEvent =
       ok: boolean;
       finishReason?: ProviderFinishReason;
       incompleteReason?: string;
-      attempts: Array<{
+      attempts: Array<ProviderAttemptState & {
         provider: string;
         model: string;
         credentialId?: string;
@@ -387,7 +352,7 @@ export type SessionEvent =
       ok: boolean;
       finishReason?: ProviderFinishReason;
       incompleteReason?: string;
-      attempts: Array<{
+      attempts: Array<ProviderAttemptState & {
         provider: string;
         model: string;
         credentialId?: string;
@@ -484,6 +449,14 @@ export type SessionEvent =
       limit: number;
       observed: number;
       reason: string;
+    }
+  | {
+      kind: "provider-spending-warning";
+      warningId: string;
+      scopeKind: "session" | "root_task";
+      warningThresholdPercent: number;
+      maxEstimatedCostUsd: number;
+      committedCostUsd: number;
     }
   | {
       kind: "skill-route-usage";
@@ -653,6 +626,8 @@ export type CreateSessionInput = {
   profileId: string;
   title?: string;
   parentSessionId?: string;
+  spendingScopeSessionId?: string;
+  spendingLimit?: SpendingLimit;
   endedAt?: string;
   endReason?: string;
   metadata?: Record<string, unknown>;
@@ -695,6 +670,8 @@ export type SessionDB = {
   replaceMessages(input: RewriteSessionTranscriptInput): Promise<SessionMessage[]>;
   rewriteTranscript(input: RewriteSessionTranscriptInput): Promise<SessionMessage[]>;
   appendEvent(sessionId: string, event: SessionEvent): Promise<void>;
+  recordProviderUsageEntries(entries: readonly ProviderUsageEntry[]): Promise<void>;
+  listProviderUsageEntries(profileId: string, query?: ProviderUsageQuery): Promise<ProviderUsageEntry[]>;
   listMessages(sessionId: string): Promise<SessionMessage[]>;
   listEvents(sessionId: string): Promise<SessionEvent[]>;
   search(query: string, options?: SessionSearchOptions): Promise<SessionSearchResult[]>;

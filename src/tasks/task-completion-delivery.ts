@@ -1,0 +1,443 @@
+import { randomUUID } from "node:crypto";
+import type {
+  Task,
+  TaskDeliveryBinding,
+  TaskDeliveryDestination,
+  TaskResult
+} from "../contracts/task.js";
+import type { DeliveryTarget } from "../channels/delivery-router.js";
+import { TASK_RESULT_PAGE_MAX_CHARS, type TaskResultService } from "./task-result-service.js";
+import type { TaskStore } from "./task-store.js";
+import { taskPrimaryResult, taskPrimaryResultStepId } from "./task-primary-result.js";
+import { listStepTreeAttempts, listTaskTreeUsageEntries } from "./task-tree-accounting.js";
+import { taskUsageFromEntries } from "./task-agent-usage.js";
+import { formatUsageCost, formatUsageCostNotice, formatUsdAmount } from "../ui/usage-cost-format.js";
+import { spendingBudgetSummary } from "../providers/provider-spend-projection.js";
+import { formatSpendingThresholdWarning } from "../ui/spending-warning-format.js";
+import { isolateLtr, isolateRtl } from "../ui/bidi.js";
+
+const MAX_DELIVERY_TEXT_CHARS = 100_000;
+const MAX_DELIVERY_RESULTS = 64;
+
+export type TaskCompletionDeliveryRouter = {
+  deliverText(
+    targets: DeliveryTarget[],
+    text: string
+  ): Promise<Map<string, { success: boolean; error?: string }>>;
+};
+
+export type BindTaskCompletionDeliveryInput = {
+  taskId: string;
+  authorizedSessionId: string;
+  deliveryKey: string;
+  destination: TaskDeliveryDestination;
+};
+
+export type TaskCompletionDeliveryRunResult = {
+  recovered: number;
+  recoveryFailed: number;
+  claimed: number;
+  delivered: number;
+  failed: number;
+};
+
+export type TaskCompletionDeliveryRecoveryResult = {
+  recovered: number;
+  failed: number;
+};
+
+export class TaskCompletionDeliveryService {
+  readonly #store: TaskStore;
+  readonly #resultService: TaskResultService;
+  readonly #router: TaskCompletionDeliveryRouter;
+  readonly #now: () => Date;
+  readonly #id: () => string;
+  readonly #locale: "en" | "ar";
+
+  constructor(options: {
+    store: TaskStore;
+    resultService: TaskResultService;
+    router: TaskCompletionDeliveryRouter;
+    now?: () => Date;
+    id?: () => string;
+    locale?: "en" | "ar";
+  }) {
+    this.#store = options.store;
+    this.#resultService = options.resultService;
+    this.#router = options.router;
+    this.#now = options.now ?? (() => new Date());
+    this.#id = options.id ?? randomUUID;
+    this.#locale = options.locale ?? "en";
+  }
+
+  bind(input: BindTaskCompletionDeliveryInput): TaskDeliveryBinding {
+    const destination = validateDestination(input.destination);
+    const deliveryKey = boundedToken(input.deliveryKey, "delivery key", 256);
+    const now = this.#now().toISOString();
+    const binding: TaskDeliveryBinding = {
+      id: boundedToken(this.#id(), "delivery ID", 256),
+      profileId: this.#store.profileId,
+      taskId: boundedToken(input.taskId, "Task ID", 256),
+      authorizedSessionId: boundedToken(input.authorizedSessionId, "authorized session ID", 256),
+      deliveryKey,
+      destination,
+      status: "pending",
+      createdAt: now,
+      updatedAt: now
+    };
+    this.#store.atomicWrite((store) => store.createDeliveryBinding(binding));
+    return binding;
+  }
+
+  /**
+   * Explicitly retries a confirmed failed delivery. Ambiguous post-crash outcomes
+   * stay failed so an operator cannot accidentally duplicate an external message.
+   */
+  retry(bindingId: string, authorizedSessionId: string): TaskDeliveryBinding {
+    const id = boundedToken(bindingId, "delivery ID", 256);
+    const sessionId = boundedToken(authorizedSessionId, "authorized session ID", 256);
+    const binding = this.#store.getDeliveryBinding(id);
+    if (binding === null || binding.authorizedSessionId !== sessionId) {
+      throw new Error("Task completion delivery was not found or is not authorized for this session.");
+    }
+    return this.#store.retryDeliveryBinding(
+      id,
+      this.#now().toISOString()
+    );
+  }
+
+  /**
+   * A process may have sent an external message before crashing. Those outcomes are
+   * deliberately marked ambiguous and are never retried automatically.
+   */
+  recoverInterrupted(): TaskCompletionDeliveryRecoveryResult {
+    const result: TaskCompletionDeliveryRecoveryResult = { recovered: 0, failed: 0 };
+    for (const warning of this.#store.listProviderSpendingWarningDeliveries({
+      statuses: ["delivering"],
+      limit: 1_000
+    })) {
+      try {
+        this.#store.settleProviderSpendingWarningDelivery({
+          id: warning.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-outcome-unknown",
+          failureMessage: "The previous warning delivery process stopped before confirming the external outcome."
+        });
+        result.recovered++;
+      } catch {
+        result.failed++;
+      }
+    }
+    for (const binding of this.#store.listDeliveryBindings({ statuses: ["delivering"], limit: 1_000 })) {
+      if (binding.destination.platform === "cli") continue;
+      try {
+        this.#store.settleDeliveryBinding({
+          id: binding.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-outcome-unknown",
+          failureMessage: "The previous delivery process stopped before confirming the external outcome."
+        });
+        result.recovered++;
+      } catch {
+        result.failed++;
+      }
+    }
+    return result;
+  }
+
+  async runOnce(): Promise<TaskCompletionDeliveryRunResult> {
+    const result: TaskCompletionDeliveryRunResult = {
+      recovered: 0,
+      recoveryFailed: 0,
+      claimed: 0,
+      delivered: 0,
+      failed: 0
+    };
+    const warnings = this.#store.listProviderSpendingWarningDeliveries({ statuses: ["pending"], limit: 1_000 });
+    for (const candidate of warnings) {
+      const claimed = this.#store.claimProviderSpendingWarningDelivery(candidate.id, this.#now().toISOString());
+      if (claimed === null) continue;
+      result.claimed++;
+      const binding = this.#store.getDeliveryBinding(claimed.deliveryBindingId);
+      if (binding === null || binding.destination.platform === "cli") {
+        this.#store.settleProviderSpendingWarningDelivery({
+          id: claimed.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-preparation-failed",
+          failureMessage: "The authorized external warning destination is unavailable."
+        });
+        result.failed++;
+        continue;
+      }
+      const taskPrefix = claimed.rootTaskId === undefined
+        ? ""
+        : this.#locale === "ar"
+          ? `${isolateRtl("المهمة")} ${isolateLtr(claimed.rootTaskId)}\n`
+          : `Task ${claimed.rootTaskId}\n`;
+      let delivery: Map<string, { success: boolean; error?: string }>;
+      try {
+        delivery = await this.#router.deliverText(
+          [toDeliveryTarget(binding.destination)],
+          `${taskPrefix}${formatSpendingThresholdWarning(claimed, this.#locale)}`
+        );
+      } catch {
+        this.#store.settleProviderSpendingWarningDelivery({
+          id: claimed.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-outcome-unknown",
+          failureMessage: "Warning delivery ended without a confirmed external outcome."
+        });
+        result.failed++;
+        continue;
+      }
+      if (delivery.size !== 1 || [...delivery.values()].some((entry) => !entry.success)) {
+        this.#store.settleProviderSpendingWarningDelivery({
+          id: claimed.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-failed",
+          failureMessage: "Provider spending warning delivery failed."
+        });
+        result.failed++;
+        continue;
+      }
+      this.#store.settleProviderSpendingWarningDelivery({
+        id: claimed.id,
+        status: "delivered",
+        settledAt: this.#now().toISOString()
+      });
+      result.delivered++;
+    }
+    const pending = this.#store.listDeliveryBindings({ statuses: ["pending"], limit: 1_000 });
+    for (const candidate of pending) {
+      if (candidate.destination.platform === "cli") continue;
+      const claimed = this.#store.claimDeliveryBinding(candidate.id, this.#now().toISOString());
+      if (claimed === null) continue;
+      result.claimed++;
+      let text: string;
+      try {
+        const task = this.#store.getTask(claimed.taskId);
+        if (task === null) throw new Error("task-unavailable");
+        text = await this.#renderCompletion(task, claimed);
+      } catch {
+        this.#store.settleDeliveryBinding({
+          id: claimed.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-preparation-failed",
+          failureMessage: "Task completion delivery could not be prepared."
+        });
+        result.failed++;
+        continue;
+      }
+      let delivery: Map<string, { success: boolean; error?: string }>;
+      try {
+        delivery = await this.#router.deliverText([toDeliveryTarget(claimed.destination)], text);
+      } catch {
+        this.#store.settleDeliveryBinding({
+          id: claimed.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-outcome-unknown",
+          failureMessage: "Task completion delivery ended without a confirmed external outcome."
+        });
+        result.failed++;
+        continue;
+      }
+      if (delivery.size !== 1 || [...delivery.values()].some((entry) => !entry.success)) {
+        this.#store.settleDeliveryBinding({
+          id: claimed.id,
+          status: "failed",
+          settledAt: this.#now().toISOString(),
+          failureClass: "delivery-failed",
+          failureMessage: "Task completion delivery failed."
+        });
+        result.failed++;
+        continue;
+      }
+      this.#store.settleDeliveryBinding({
+        id: claimed.id,
+        status: "delivered",
+        settledAt: this.#now().toISOString()
+      });
+      result.delivered++;
+    }
+    return result;
+  }
+
+  async #renderCompletion(task: Task, binding: TaskDeliveryBinding): Promise<string> {
+    const lines = [
+      `Task ${task.id} ${task.status}.`,
+      `Objective: ${boundText(task.objective, 2_000)}`
+    ];
+    if (task.failure !== undefined) lines.push(`Failure: ${boundText(task.failure.class, 80)}`);
+    const usageEntries = listTaskTreeUsageEntries(this.#store, task.id);
+    const taskUsage = taskUsageFromEntries(usageEntries);
+    lines.push("", `${copy(this.#locale, "Task total", "إجمالي المهمة")}: ${formatTaskUsage(taskUsage, this.#locale)}`);
+    const pricingNotice = formatUsageCostNotice(taskUsageCostSummary(taskUsage), { locale: this.#locale });
+    if (pricingNotice !== undefined) lines.push(pricingNotice);
+    if (task.activePlanRevisionId !== undefined) {
+      for (const step of this.#store.listSteps(task.id, task.activePlanRevisionId)) {
+        const attemptIds = new Set(listStepTreeAttempts(this.#store, task.id, step.id).map((attempt) => attempt.id));
+        const stepUsage = taskUsageFromEntries(usageEntries.filter((entry) =>
+          entry.attemptId !== undefined && attemptIds.has(entry.attemptId)
+        ));
+        lines.push(`${boundText(step.title, 160)}: ${formatTaskUsage(stepUsage, this.#locale)}`);
+      }
+    }
+    const root = task.id === task.rootTaskId ? task : this.#store.getTask(task.rootTaskId);
+    if (root?.spendingLimit !== undefined) {
+      const budget = spendingBudgetSummary(root.spendingLimit, undefined, taskUsage.estimatedCostUsd);
+      lines.push(
+        "",
+        copy(this.#locale, "Task spending", "إنفاق المهمة"),
+        `${copy(this.#locale, "Spent", "المنفق")}: ${formatUsdAmount(budget.spentCostUsd, this.#locale)}`,
+        `${copy(this.#locale, "Reserved", "المحجوز")}: ${formatUsdAmount(budget.reservedCostUsd, this.#locale)}`,
+        `${copy(this.#locale, "Remaining", "المتبقي")}: ${formatUsdAmount(budget.remainingCostUsd, this.#locale)}`,
+        `${copy(this.#locale, "Limit", "الحد")}: ${formatUsdAmount(budget.maxEstimatedCostUsd, this.#locale)}`
+      );
+    }
+
+    const availableResults = this.#store.listResults(task.id)
+      .filter((result) => result.status === "available");
+    const acceptedResults = availableResults.filter((result) => result.disposition === "accepted");
+    const diagnosticResults = availableResults.filter((result) => result.disposition === "diagnostic");
+    const primaryResultStepId = taskPrimaryResultStepId(this.#store, task);
+    const primaryResult = taskPrimaryResult(this.#store, task);
+    const results = (primaryResultStepId === undefined
+      ? acceptedResults
+      : primaryResult === undefined ? [] : [primaryResult])
+      .slice(0, MAX_DELIVERY_RESULTS);
+    for (const result of results) {
+      lines.push("", resultHeading(result, result.id === primaryResult?.id));
+      if (result.kind === "artifact") {
+        lines.push(`Artifact handle: ${result.handle}`);
+        const summary = result.displaySummary ?? result.summary;
+        if (summary !== undefined) lines.push(boundText(summary, 1_000));
+        continue;
+      }
+      lines.push(await this.#readTextResult(task.id, result, binding.authorizedSessionId));
+    }
+    if (results.length === 0) {
+      lines.push("", primaryResultStepId === undefined
+        ? "No durable results were produced."
+        : "No durable primary result was produced.");
+    }
+    if (acceptedResults.length > results.length) {
+      const label = primaryResultStepId === undefined ? "additional" : "intermediate";
+      lines.push("", `${acceptedResults.length - results.length} ${label} result(s) remain available through task.result.read.`);
+    }
+    if (diagnosticResults.length > 0) {
+      lines.push(
+        "",
+        copy(this.#locale, "Recovered output", "المخرجات المستردة"),
+        copy(
+          this.#locale,
+          "The Attempt failed. This output may be incomplete and was not accepted as the successful Step result.",
+          "فشلت المحاولة. قد تكون هذه المخرجات غير مكتملة ولم تُقبل كنتيجة ناجحة للخطوة."
+        ),
+        ...diagnosticResults.slice(0, MAX_DELIVERY_RESULTS).map((result) =>
+          `${result.id} (${result.kind}, ${result.byteLength} bytes, handle ${result.handle})`
+        )
+      );
+    }
+    return boundText(lines.join("\n"), MAX_DELIVERY_TEXT_CHARS);
+  }
+
+  async #readTextResult(taskId: string, result: TaskResult, sessionId: string): Promise<string> {
+    let offset = 0;
+    let content = "";
+    do {
+      const page = await this.#resultService.readPage({
+        taskId,
+        resultId: result.id,
+        sessionId,
+        offset,
+        maxChars: Math.min(TASK_RESULT_PAGE_MAX_CHARS, MAX_DELIVERY_TEXT_CHARS - content.length)
+      });
+      content += page.content;
+      if (!page.hasMore || page.nextOffset === undefined || content.length >= MAX_DELIVERY_TEXT_CHARS) break;
+      offset = page.nextOffset;
+    } while (content.length < MAX_DELIVERY_TEXT_CHARS);
+    return content;
+  }
+}
+
+function formatTaskUsage(
+  usage: import("../contracts/task.js").TaskUsageTotals,
+  locale: "en" | "ar"
+): string {
+  return formatUsageCost(taskUsageCostSummary(usage), { locale });
+}
+
+function taskUsageCostSummary(
+  usage: import("../contracts/task.js").TaskUsageTotals
+): { estimatedCostUsd?: number; costComplete: boolean } {
+  return {
+    estimatedCostUsd: usage.pricingComplete || usage.estimatedCostUsd > 0
+      ? usage.estimatedCostUsd
+      : undefined,
+    costComplete: usage.pricingComplete
+  };
+}
+
+function copy(locale: "en" | "ar", english: string, arabic: string): string {
+  return locale === "ar" ? arabic : english;
+}
+
+function validateDestination(destination: TaskDeliveryDestination): TaskDeliveryDestination {
+  if (destination.platform === "cli") {
+    throw new Error("Local CLI Task delivery is handled by the authorized interactive session.");
+  }
+  if (destination.platform === "email") {
+    const address = boundedToken(destination.address, "email delivery address", 320);
+    if (destination.chatId !== undefined || destination.threadId !== undefined) {
+      throw new Error("Email Task delivery cannot include chat routing fields.");
+    }
+    return { platform: "email", address };
+  }
+  const chatId = boundedToken(destination.chatId, "delivery chat ID", 256);
+  const threadId = destination.threadId === undefined
+    ? undefined
+    : boundedToken(destination.threadId, "delivery thread ID", 256);
+  if (destination.address !== undefined) {
+    throw new Error("Chat Task delivery cannot include an email address.");
+  }
+  return { platform: destination.platform, chatId, ...(threadId === undefined ? {} : { threadId }) };
+}
+
+function toDeliveryTarget(destination: TaskDeliveryDestination): DeliveryTarget {
+  if (destination.platform === "cli") {
+    throw new Error("Local CLI Task delivery cannot be routed to an external channel.");
+  }
+  return destination.platform === "email"
+    ? { kind: "channel", platform: "email", address: destination.address }
+    : {
+        kind: "channel",
+        platform: destination.platform,
+        chatId: destination.chatId,
+        ...(destination.threadId === undefined ? {} : { threadId: destination.threadId })
+      };
+}
+
+function resultHeading(result: TaskResult, primary: boolean): string {
+  return `${primary ? "Primary result" : "Result"} ${result.id} (${result.kind}, ${result.byteLength} bytes, handle ${result.handle}):`;
+}
+
+function boundedToken(value: string | undefined, label: string, maxChars: number): string {
+  const normalized = value?.trim();
+  if (normalized === undefined || normalized.length === 0 || normalized.length > maxChars ||
+      /[\u0000-\u001F\u007F]/u.test(normalized)) {
+    throw new Error(`Task ${label} is invalid.`);
+  }
+  return normalized;
+}
+
+function boundText(value: string, maxChars: number): string {
+  const normalized = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, " ");
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars - 3)}...`;
+}

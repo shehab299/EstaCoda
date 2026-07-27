@@ -19,6 +19,7 @@ export async function assessCommandRisk(
     mainRoute: ResolvedModelRoute;
     providerExecutor: ProviderExecutor;
     scopeKey: string;
+    executionSessionId?: string;
     signal?: AbortSignal;
   }
 ): Promise<SmartApprovalDecision> {
@@ -32,6 +33,7 @@ export async function assessCommandRiskDetailed(
     mainRoute: ResolvedModelRoute;
     providerExecutor: ProviderExecutor;
     scopeKey: string;
+    executionSessionId?: string;
     signal?: AbortSignal;
   }
 ): Promise<SmartApprovalAssessment> {
@@ -50,6 +52,11 @@ export async function assessCommandRiskDetailed(
         providerOrder: undefined
       },
       signal: options.signal,
+      ...(options.executionSessionId === undefined ? {} : {
+        usage: {
+          executionSessionId: options.executionSessionId,
+        }
+      }),
       request: {
         model: options.assessorRoute.route?.id,
         messages: [

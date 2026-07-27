@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { AuxiliaryModelConfig, ModelProfile, ResolvedModelRoute } from "../contracts/provider.js";
@@ -18,7 +19,7 @@ import { normalizeMemoryConfig } from "../config/memory-config.js";
 import { ContextReferenceExpander } from "../context/context-reference-expander.js";
 import { ProjectContextLoader, renderProjectContext } from "../context/project-context-loader.js";
 import { CronStore } from "../cron/cron-store.js";
-import { DelegationManager } from "../delegation/delegation-manager.js";
+import { DurableDelegationService } from "../delegation/durable-delegation-service.js";
 import { FileStateTracker } from "../delegation/file-state-tracker.js";
 import { SubagentRegistry, type OperatorSubagentStatus } from "../delegation/subagent-registry.js";
 import { MemoryFileCompactionService } from "../memory/memory-file-compaction-service.js";
@@ -49,8 +50,10 @@ import { ProviderRegistry } from "../providers/provider-registry.js";
 import { getDefaultApiKeyEnv, getProviderMetadata } from "../providers/provider-metadata.js";
 import type { SecurityApprovalMode, SecurityPolicy, SecurityRequest } from "../contracts/security.js";
 import type { SessionContextWindowUsage, SessionDB } from "../contracts/session.js";
+import type { SessionCostSummary } from "../contracts/usage-cost.js";
 import { InMemorySessionDB } from "../session/in-memory-session-db.js";
 import { loadSessionContextWindowUsage } from "../session/session-context-window-usage.js";
+import { loadSessionCostUsage } from "../session/session-cost-usage.js";
 import { SQLiteSessionDB } from "../session/sqlite-session-db.js";
 import {
   SessionFinalizationQueue,
@@ -59,6 +62,8 @@ import {
 } from "../session/session-finalization-queue.js";
 import { SessionRecallService, type SessionRecallResult } from "../session/session-recall-service.js";
 import { ProviderExecutor } from "../providers/provider-executor.js";
+import { createProviderUsageRecorder } from "../providers/provider-usage-ledger.js";
+import { SQLiteProviderSpendController } from "../tasks/sqlite-provider-spend.js";
 import { SessionCompressionService, type CompactResult } from "../prompt/session-compression-service.js";
 import { WorkspaceTrustStore } from "../security/workspace-trust-store.js";
 import { createSecurityPolicyForMode } from "../security/security-policy-factory.js";
@@ -69,16 +74,18 @@ import { SkillEvolutionStore } from "../skills/skill-evolution.js";
 import { ChangeManifestStore } from "../skills/change-manifest-store.js";
 import { SkillLearningManager, type SkillAutonomy } from "../skills/skill-learning.js";
 import { availableToolsetsFromTools } from "../cron/cron-runtime-validation.js";
-
-// Workflow module v0.8 imports
-import { SQLiteWorkflowStore } from "../workflow/sqlite-workflow-store.js";
-import { WorkflowLockService } from "../workflow/workflow-lock-service.js";
-import { WorkflowEngine } from "../workflow/workflow-engine.js";
-import { WorkflowCommandDispatcher } from "../workflow/workflow-command-dispatcher.js";
-import { WorkflowProcessRegistry } from "../workflow/workflow-process-registry.js";
-import { WorkflowEventSummaryService, DEFAULT_WORKFLOW_EVENT_SUMMARY_CONFIG } from "../workflow/workflow-event-summary-service.js";
-import { WorkflowRestartRecovery } from "../workflow/workflow-restart-recovery.js";
-import { WorkflowAgentLoopAdapter } from "../workflow/workflow-agent-loop-adapter.js";
+import { SQLiteTaskStore } from "../tasks/sqlite-task-store.js";
+import { TaskResultService } from "../tasks/task-result-service.js";
+import {
+  TaskSessionCompletionService,
+  type TaskSessionCompletionMessage,
+} from "../tasks/task-session-completion.js";
+import { TaskOperatorService, type TaskStatusProjection } from "../tasks/task-operator-service.js";
+import type { InitialTaskHostLeaseInput } from "../tasks/task-store.js";
+import { AgentStepExecutor } from "../tasks/agent-step-executor.js";
+import { TaskApprovalService } from "../tasks/task-approval-service.js";
+import { createTaskArtifactContentResolver } from "../tasks/task-artifact-content.js";
+import { resolveTaskWorkspaceBinding } from "../tasks/task-workspace.js";
 
 import type { ImageGenerationFetchLike } from "../tools/image-generation-tools.js";
 import { defaultImageGenerationConfig, verifyImageGeneration, type ImageGenerationVerification } from "../tools/image-generation-verify.js";
@@ -100,6 +107,27 @@ import { readCachedUpdateInfo } from "../lifecycle/update-engine.js";
 import { detectInstallMethod } from "../lifecycle/install-method.js";
 import { buildStartupUpdateHint } from "../lifecycle/startup-update.js";
 import { createSessionId } from "../session/session-id.js";
+import { isTaskDeliveryDestination, type TaskDeliveryDestination, type TaskExecutionPreference, type TaskSource } from "../contracts/task.js";
+
+export type TaskCreationOrigin = {
+  source: Extract<TaskSource, "cli" | "gateway" | "runtime">;
+  completionDestination?: TaskDeliveryDestination;
+};
+
+function normalizeTaskCreationOrigin(origin: TaskCreationOrigin | undefined): TaskCreationOrigin {
+  if (origin === undefined) return { source: "cli" };
+  if (origin.source !== "cli" && origin.source !== "gateway" && origin.source !== "runtime") {
+    throw new Error("Task creation origin is invalid.");
+  }
+  if (origin.completionDestination === undefined) return { source: origin.source };
+  if (!isTaskDeliveryDestination(origin.completionDestination)) {
+    throw new Error("Task completion destination is invalid.");
+  }
+  return {
+    source: origin.source,
+    completionDestination: structuredClone(origin.completionDestination)
+  };
+}
 
 export type RuntimeOptions = {
   tokens: ResolvedTokens;
@@ -129,6 +157,7 @@ export type RuntimeOptions = {
   projectMemoryRoot?: string;
   auxiliaryModels?: AuxiliaryModelConfig;
   compression?: LoadedRuntimeConfig["compression"];
+  budgets?: LoadedRuntimeConfig["budgets"];
   homeDir?: string;
   workspaceTrusted?: boolean;
   webFetch?: WebFetchLike;
@@ -183,6 +212,16 @@ export type RuntimeOptions = {
   delegationConfig?: DelegationConfig;
   workspaceFsAdapter?: WorkspaceFsAdapter;
   sessionMetadata?: Record<string, unknown>;
+  /** Optional authorized origin for Tasks created outside the local CLI. */
+  taskCreationOrigin?: TaskCreationOrigin;
+  /** Process-level activation hook invoked after a durable Task graph is committed. */
+  onTaskCreated?: (taskId: string) => Promise<void>;
+  /** Supplies foreground ownership to persist atomically with an interactive Task graph. */
+  taskHostAdmission?: () => InitialTaskHostLeaseInput | undefined;
+  /** Process-local view of whether a compatible gateway can continue durable Tasks. */
+  taskBackgroundContinuation?: TaskStatusProjection["backgroundContinuation"];
+  /** Enables a durable local completion outbox for the interactive CLI session. */
+  enableTaskSessionCompletion?: boolean;
 };
 
 type RuntimeBranding = Pick<
@@ -220,6 +259,7 @@ export type Runtime = {
   resolveSkill?(name: string): LoadedSkill | SkillDefinition | undefined;
   latestResumeNote(): Promise<string | undefined>;
   currentContextWindowUsage?(): Promise<SessionContextWindowUsage | undefined>;
+  currentSessionCost?(): Promise<SessionCostSummary | undefined>;
   inspectMemoryPromotions(): Promise<MemoryPromotionRecord[]>;
   recallSession?(query: string): Promise<SessionRecallResult>;
   compactSession?(input?: {
@@ -241,6 +281,7 @@ export type Runtime = {
   executeTool?(input: {
     tool: string;
     toolInput: Record<string, unknown>;
+    toolCallId?: string;
     signal?: AbortSignal;
   }): Promise<import("../tools/tool-executor.js").ToolExecutionRecord | undefined>;
   transcribeAudio?(input: {
@@ -283,21 +324,14 @@ export type Runtime = {
   readonly trajectoryId: string | undefined;
   consumeSessionRotation?(): { originalSessionId: string; activeSessionId: string } | undefined;
 
-  // Workflow module v0.8 integration (available when SQLiteSessionDB is used)
-  workflow?: {
-    engine: import("../workflow/workflow-engine.js").WorkflowEngine;
-    store: import("../workflow/workflow-store.js").WorkflowStore;
-    dispatcher: import("../workflow/workflow-command-dispatcher.js").WorkflowCommandDispatcher;
-    processRegistry: import("../workflow/workflow-process-registry.js").WorkflowProcessRegistry;
-    compactionService: import("../workflow/workflow-event-summary-service.js").WorkflowEventSummaryService;
-    adapter: import("../workflow/workflow-agent-loop-adapter.js").WorkflowAgentLoopAdapter;
-    activeRunId: string | null;
-    setActiveRunId(runId: string | null): void;
-    recoverFromRestart(): Promise<{
-      interruptedFlows: number;
-      recoveredLocks: number;
-    }>;
-  };
+  /** Available only for profile-backed runtimes that can host durable agent Steps. */
+  taskAgentExecutor?: AgentStepExecutor;
+  taskOperator?: TaskOperatorService;
+  beginTask?(objective: string, options?: { executionPreference?: TaskExecutionPreference }): Promise<TaskStatusProjection>;
+  drainTaskSessionCompletions?(): Promise<readonly TaskSessionCompletionMessage[]>;
+  acknowledgeTaskSessionCompletion?(input: { bindingId: string; messageId: string }): Promise<void>;
+  /** Scopes Task provenance to one authorized surface invocation, including cached runtimes. */
+  withTaskCreationOrigin?<T>(origin: TaskCreationOrigin, work: () => Promise<T>): Promise<T>;
 };
 
 export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
@@ -311,10 +345,52 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
   const profilePaths = resolveProfileStateHome({ homeDir: options.homeDir, profileId });
   const sessionId = options.sessionId ?? createSessionId();
   const sessionRuntimeContext = createSessionRuntimeContext(sessionId);
+  const defaultTaskCreationOrigin = normalizeTaskCreationOrigin(options.taskCreationOrigin);
+  const taskCreationOriginContext = new AsyncLocalStorage<TaskCreationOrigin>();
+  const currentTaskCreationOrigin = () => taskCreationOriginContext.getStore() ?? defaultTaskCreationOrigin;
+  const currentTaskCompletionDestination = (): TaskDeliveryDestination | undefined => {
+    const origin = currentTaskCreationOrigin();
+    if (origin.completionDestination !== undefined) return origin.completionDestination;
+    return options.enableTaskSessionCompletion === true && origin.source === "cli"
+      ? { platform: "cli" }
+      : undefined;
+  };
   let observedRuntimeSessionId = sessionId;
   const sessionDb = options.sessionDb ?? new InMemorySessionDB();
+  const taskStore = sessionDb instanceof SQLiteSessionDB
+    ? new SQLiteTaskStore({ db: sessionDb.db, profileId })
+    : undefined;
+  const providerSpendController = sessionDb instanceof SQLiteSessionDB
+    ? new SQLiteProviderSpendController({ db: sessionDb.db, profileId })
+    : undefined;
+  const taskResultService = taskStore === undefined
+    ? undefined
+    : new TaskResultService({
+        store: taskStore,
+        profileId,
+        contentRoot: profilePaths.taskResultsPath,
+        sessionDb
+      });
+  const taskSessionCompletionService = !(sessionDb instanceof SQLiteSessionDB) || taskStore === undefined || taskResultService === undefined ||
+      options.enableTaskSessionCompletion !== true
+    ? undefined
+    : new TaskSessionCompletionService({
+        store: taskStore,
+        resultService: taskResultService,
+        sessionDb,
+        profileId,
+      });
+  const taskOperatorService = taskStore === undefined ? undefined : new TaskOperatorService({
+    store: taskStore,
+    defaultTaskSpendingLimit: options.budgets?.task,
+    ...(providerSpendController === undefined ? {} : {
+      spendingScope: (kind, ownerId) => providerSpendController.getScope(kind, ownerId)
+    }),
+    backgroundContinuation: () => options.taskBackgroundContinuation ?? "unknown"
+  });
   const closeSessionDbOnDispose = options.closeSessionDbOnDispose ?? true;
   const workspaceRoot = options.workspaceRoot ?? process.cwd();
+  const taskWorkspace = taskStore === undefined ? undefined : await resolveTaskWorkspaceBinding(workspaceRoot);
   const localSkillsRoot = options.localSkillsRoot ?? profilePaths.skillsPath;
   const profileMemoryRoot = profilePaths.profileRoot;
   const memoryPersistenceService = new MemoryPersistenceService();
@@ -405,7 +481,18 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
   const providerExecutor = new ProviderExecutor({
     registry: providerRegistry,
     homeDir: globalPaths.homeDir,
-    profileId
+    profileId,
+    ...(providerSpendController === undefined
+      ? { allowUnenforcedAttributedSpend: true }
+      : { spendController: providerSpendController }),
+    usageRecorder: createProviderUsageRecorder({
+      profileId,
+      record: (entries) => sessionDb.recordProviderUsageEntries(entries),
+      resolveSessionBudgetScopeId: async (executionSessionId) => {
+        const session = await sessionDb.getSession(executionSessionId);
+        return session?.profileId === profileId ? session.spendingScopeSessionId : undefined;
+      }
+    })
   });
   const processManager = new ProcessManager({ workspaceRoot });
   const pythonStateRoot = globalPaths.stateRoot;
@@ -434,6 +521,7 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
       id: sessionId,
       profileId,
       title: "EstaCoda session",
+      ...(options.budgets?.session === undefined ? {} : { spendingLimit: options.budgets.session }),
       metadata: {
         workspaceRoot,
         ...(options.sessionMetadata ?? {})
@@ -705,8 +793,9 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
           enabled: true,
           assessorRoute: effectiveSecurityAssessor.auxiliaryRoute ?? assessorRoute,
           mainRoute,
-          providerExecutor: effectiveSecurityAssessor.providerExecutor ?? providerExecutor,
-          scopeKey: profileId
+          providerExecutor,
+          scopeKey: profileId,
+          executionSessionId: sessionRuntimeContext.currentSessionId()
         } satisfies SmartApprovalAssessorRuntimeConfig
         : undefined;
 
@@ -716,6 +805,18 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
           mode: activeSecurityMode,
           smartApproval
         });
+    }
+  };
+  const taskBaseSecurityPolicy: SecurityPolicy = {
+    decide: (request) => baseSecurityPolicyForActiveMode().decide(request),
+    assess: async (request) => {
+      const policy = baseSecurityPolicyForActiveMode();
+      return await policy.assess?.(request) ?? {
+        decision: policy.decide(request),
+        mode: activeSecurityMode,
+        reason: "Decided by the active security policy.",
+        risk: "medium"
+      };
     }
   };
   const fileStateTracker = new FileStateTracker();
@@ -775,6 +876,7 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
         profileId,
         workspaceRoot,
         excludeSessionIds: () => [sessionRuntimeContext.currentSessionId()],
+        currentSessionId: () => sessionRuntimeContext.currentSessionId(),
         route: sessionSearchRoute,
         mainRoute,
         providerExecutor
@@ -837,6 +939,8 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
       browserBackend,
       browserConfig: options.browser,
       artifactStore,
+      taskResultService,
+      taskOperatorService,
       trustStore,
       cronStore,
       disableCronTools: options.disableCronTools,
@@ -885,12 +989,14 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
     responseLabel: runtimeBranding.responseLabel,
     workspaceRoot,
     delegationConfig: options.delegationConfig,
+    defaultTaskSpendingLimit: options.budgets?.task,
     skillConfig: options.skillConfig,
     ui: options.ui,
     agentProfile: options.agentProfile,
-    subagentRegistry,
-    diagnosticsRoot: profilePaths.tempPath,
-    fileStateTracker
+    taskStore,
+    taskWorkspace,
+    taskHostAdmission: options.taskHostAdmission,
+    onTaskCreated: options.onTaskCreated
   });
   const builtSession = await builder.buildSession({
     sessionId,
@@ -904,17 +1010,21 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
     ui: options.ui,
     agentProfile: options.agentProfile,
     securityPolicy,
-    delegationManagerFactory: ({ toolRegistry }) => new DelegationManager({
-      sessionDb,
-      childFactory,
-      trajectoryRecorder,
-      delegationConfig: options.delegationConfig,
-      currentDepth: 0,
-      subagentRegistry,
-      diagnosticsRoot: profilePaths.tempPath,
-      fileStateTracker,
-      parentVisibleTools: () => toolRegistry.list()
-    }),
+    delegationServiceFactory: taskStore === undefined || taskWorkspace === undefined
+      ? undefined
+      : ({ toolRegistry, sessionRuntimeContext }) => new DurableDelegationService({
+          store: taskStore,
+          creatorSessionId: () => sessionRuntimeContext.currentSessionId(),
+          workspace: taskWorkspace,
+          config: options.delegationConfig ?? DEFAULT_DELEGATION_CONFIG,
+          defaultTaskSpendingLimit: options.budgets?.task,
+          visibleTools: () => toolRegistry.list(),
+          completionDestination: currentTaskCompletionDestination,
+          executionPreference: () => currentTaskCreationOrigin().source === "gateway" ? "background" : "auto",
+          backgroundContinuation: () => options.taskBackgroundContinuation ?? "unknown",
+          taskHostAdmission: options.taskHostAdmission,
+          onTaskCreated: options.onTaskCreated
+        }),
     trustedWorkspace: async () => activeTrustedWorkspace || await trustStore.isTrusted(workspaceRoot),
     disabledToolsets: options.disabledToolsets,
     toolRegistryFilter: options.enabledToolsets === undefined
@@ -948,76 +1058,75 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
     sessionRecallService,
     memoryCurationService
   } = builtSession;
-
-  // ─── Workflow module v0.8 Integration ───
-  let workflow: Runtime["workflow"] | undefined;
-
-  // Only wire the workflow module when using SQLiteSessionDB (real persistence required)
-  try {
-    if (sessionDb instanceof SQLiteSessionDB) {
-      const workflowStore = new SQLiteWorkflowStore({ db: sessionDb.db, profileId });
-      const lockService = new WorkflowLockService({ store: workflowStore });
-      const workflowEngine = new WorkflowEngine({ store: workflowStore, lockService, ownerId: "runtime" });
-      const processRegistry = new WorkflowProcessRegistry({ store: workflowStore });
-      const compactionService = new WorkflowEventSummaryService({
-        store: workflowStore,
-        config: DEFAULT_WORKFLOW_EVENT_SUMMARY_CONFIG
+  const taskAgentExecutor = taskStore === undefined
+    ? undefined
+    : new AgentStepExecutor({
+        childFactory,
+        sessionDb,
+        taskStore,
+        approvalService: new TaskApprovalService({ store: taskStore }),
+        securityPolicy: taskBaseSecurityPolicy,
+        hostWorkspace: taskWorkspace!,
+        isWorkspaceTrusted: (workspace) => trustStore.isTrusted(workspace.canonicalPath),
+        parentVisibleTools: () => toolRegistry.list(),
+        delegationConfig: options.delegationConfig,
+        subagentRegistry,
+        diagnosticsRoot: profilePaths.tempPath,
+        resolveArtifactContent: await createTaskArtifactContentResolver([
+          workspaceRoot,
+          channelMediaRoot,
+          audioCacheRoot,
+          imageCacheRoot,
+          profilePaths.tempPath
+        ])
       });
-      const dispatcher = new WorkflowCommandDispatcher({
-        engine: workflowEngine,
-        store: workflowStore,
-        processRegistry,
-        compactionService
-      });
-      const adapter = new WorkflowAgentLoopAdapter({
-        agentLoop,
-        store: workflowStore,
-        compactionService
-      });
-
-      // Run restart recovery on startup
-      const restartRecovery = new WorkflowRestartRecovery({
-        store: workflowStore,
-        lockService,
-        now: () => new Date()
-      });
-
-      const recoveryResult = await restartRecovery.recover();
-      if (recoveryResult.interrupted > 0 || recoveryResult.staleLocksReleased > 0) {
-        // Non-critical diagnostic; do not write to stdout to avoid breaking CLI output contracts
-        // eslint-disable-next-line no-console
-        console.error(
-          `[Workflow] Restart recovery: ${recoveryResult.interrupted} workflow runs interrupted, ${recoveryResult.staleLocksReleased} stale locks recovered.`
-        );
-      }
-
-      workflow = {
-        engine: workflowEngine,
-        store: workflowStore,
-        dispatcher,
-        processRegistry,
-        compactionService,
-        adapter,
-        activeRunId: null,
-        setActiveRunId(runId: string | null) {
-          this.activeRunId = runId;
-        },
-        async recoverFromRestart() {
-          const result = await restartRecovery.recover();
-          return {
-            interruptedFlows: result.interrupted,
-            recoveredLocks: result.staleLocksReleased
-          };
-        }
-      };
-    }
-  } catch {
-    // Workflow module integration is best-effort for v0.8. Do not block runtime creation.
-    workflow = undefined;
-  }
 
   return {
     sessionDb,
+    taskAgentExecutor,
+    taskOperator: taskOperatorService,
+    drainTaskSessionCompletions: taskSessionCompletionService === undefined
+      ? undefined
+      : () => taskSessionCompletionService.deliverPending(sessionRuntimeContext.currentSessionId()),
+    acknowledgeTaskSessionCompletion: taskSessionCompletionService === undefined
+      ? undefined
+      : (input) => taskSessionCompletionService.acknowledge({
+          sessionId: sessionRuntimeContext.currentSessionId(),
+          ...input,
+        }),
+    beginTask: taskOperatorService === undefined || taskWorkspace === undefined
+      ? undefined
+      : async (objective, beginOptions = {}) => {
+          if (!activeTrustedWorkspace && !(await trustStore.isTrusted(workspaceRoot))) {
+            throw new Error("Task creation requires a trusted workspace.");
+          }
+          const origin = currentTaskCreationOrigin();
+          const executionPreference = beginOptions.executionPreference ?? (origin.source === "gateway" ? "background" : "auto");
+          const initialHostLease = executionPreference === "auto" ? options.taskHostAdmission?.() : undefined;
+          const task = taskOperatorService.begin({
+            objective,
+            workspace: taskWorkspace,
+            creatorSessionId: sessionRuntimeContext.currentSessionId(),
+            source: origin.source,
+            executionPreference,
+            ...(initialHostLease === undefined ? {} : { initialHostLease }),
+            completionDestination: currentTaskCompletionDestination()
+          });
+          if (task.executionPreference === "auto" && options.onTaskCreated !== undefined) {
+            try {
+              await options.onTaskCreated(task.taskId);
+            } catch {
+              return {
+                ...task,
+                activationFailure: "post-commit-activation-failed"
+              };
+            }
+          }
+          return taskOperatorService.status(task.taskId, sessionRuntimeContext.currentSessionId());
+        },
+    withTaskCreationOrigin(origin, work) {
+      return taskCreationOriginContext.run(normalizeTaskCreationOrigin(origin), work);
+    },
     agentEvolutionPolicy() {
       return agentEvolutionPolicy;
     },
@@ -1059,6 +1168,17 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
         sessionDb,
         sessionId: sessionRuntimeContext.currentSessionId(),
         profileId
+      });
+    },
+    async currentSessionCost() {
+      return await loadSessionCostUsage({
+        sessionDb,
+        taskStore,
+        sessionId: sessionRuntimeContext.currentSessionId(),
+        profileId,
+        ...(providerSpendController === undefined ? {} : {
+          spendingScope: (ownerId) => providerSpendController.getScope("session", ownerId)
+        })
       });
     },
     async inspectMemoryPromotions() {
@@ -1105,30 +1225,6 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
       const trustedWorkspace = input.trustedWorkspace ?? await trustStore.isTrusted(workspaceRoot);
       activeTrustedWorkspace = trustedWorkspace;
 
-      // If an active workflow run is set, route through the adapter
-      if (workflow?.activeRunId) {
-        const run = await workflow.store.getWorkflowRun(workflow.activeRunId);
-        if (run && run.status === "running") {
-          const steps = await workflow.store.listWorkflowSteps(run.id);
-          const activeStep = steps.find((s) => s.status === "running");
-          const turnResult = await workflow.adapter.runTurn({
-            run,
-            step: activeStep,
-            text: input.text,
-            channel: input.channel,
-            signal: input.signal,
-            onEvent: input.onEvent,
-            onDelta: input.onDelta,
-            onSegmentBreak: input.onSegmentBreak
-          });
-          await memoryCurationService?.observeCompletedTurn({
-            signal: input.signal,
-            onEvent: input.onEvent
-          }).catch(() => undefined);
-          return turnResult.response;
-        }
-      }
-
       return agentLoop.handle({
         ...input,
         trustedWorkspace
@@ -1142,6 +1238,7 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
         input: input.toolInput,
         trustedWorkspace,
         sessionId: sessionRuntimeContext.currentSessionId(),
+        toolCallId: input.toolCallId,
         signal: input.signal
       });
     },
@@ -1246,6 +1343,7 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
       await localWhisper?.dispose?.();
       await Promise.all(loadedMcpServers.map((server) => server.stop().catch(() => undefined)));
       memoryIndexSync?.dispose();
+      await providerExecutor.dispose();
       const closeSessionDb = closeSessionDbOnDispose
         ? (sessionDb as { close?: () => void | Promise<void> }).close
         : undefined;
@@ -1263,12 +1361,54 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
         `tools: ${toolRegistry.list().length}`,
         `mcp: ${loadedMcpServers.filter((server) => server.snapshot.available).length}/${loadedMcpServers.length}`,
         skillLoadWarnings.length === 0 ? undefined : `skill load warnings: ${skillLoadWarnings.length}`,
-        workflow ? `workflow: available (SQLite)` : undefined,
         "status: ready"
       ].filter((line) => line !== undefined).join("\n");
     },
     getStatus() {
       const activeSubagents = subagentRegistry.operatorStatus({ parentSessionId: sessionId });
+      const sections = [];
+      if (taskStore !== undefined) {
+        const tasks = taskStore.listTasks({ limit: 1_000 });
+        const active = tasks.filter((task) => !["completed", "partial", "failed", "cancelled"].includes(task.status));
+        sections.push(buildKeyValueBlockViewModel({
+          title: "Durable tasks",
+          entries: [
+            kv("Active", active.length),
+            kv("Queued", tasks.filter((task) => task.status === "queued").length),
+            kv("Running", tasks.filter((task) => task.status === "running").length),
+            kv("Waiting", active.filter((task) => task.status.startsWith("waiting_")).length)
+          ]
+        }));
+      }
+      if (activeSubagents.activeCount > 0) {
+        sections.push(buildTableViewModel({
+          title: activeSubagents.omittedCount === 0
+            ? `Active subagents (${activeSubagents.activeCount})`
+            : `Active subagents (${activeSubagents.activeCount}, ${activeSubagents.omittedCount} omitted)`,
+          columns: [
+            { key: "child", header: "Child" },
+            { key: "parent", header: "Parent" },
+            { key: "role", header: "Role" },
+            { key: "depth", header: "Depth", alignment: "right" },
+            { key: "model", header: "Model" },
+            { key: "status", header: "Status" },
+            { key: "duration", header: "Duration" },
+            { key: "batch", header: "Batch" }
+          ],
+          rows: activeSubagents.subagents.map((subagent) => ({
+            child: subagent.childSessionId,
+            parent: subagent.parentSessionId,
+            role: subagent.role,
+            depth: subagent.depth,
+            model: `${subagent.provider}/${subagent.model}`,
+            status: subagent.cancellationState === undefined
+              ? subagent.status
+              : `${subagent.status} (${subagent.cancellationState})`,
+            duration: formatSubagentDuration(subagent.durationMs),
+            batch: formatSubagentBatch(subagent.batchId, subagent.taskIndex)
+          }))
+        }));
+      }
       return buildStatusViewModel({
         agentName: runtimeBranding.responseLabel,
         model: { provider: options.model.provider, id: options.model.id },
@@ -1279,42 +1419,10 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
         toolCount: toolRegistry.list().length,
         mcpActive: loadedMcpServers.filter((server) => server.snapshot.available).length,
         mcpTotal: loadedMcpServers.length,
-        workflowAvailable: workflow !== undefined,
-        workflowRunActive: (workflow?.activeRunId ?? null) !== null,
         warnings: skillLoadWarnings.map((message) =>
           buildWarningErrorViewModel({ severity: "warn", title: "Skill load", message })
         ),
-        sections: activeSubagents.activeCount === 0
-          ? undefined
-          : [
-              buildTableViewModel({
-                title: activeSubagents.omittedCount === 0
-                  ? `Active subagents (${activeSubagents.activeCount})`
-                  : `Active subagents (${activeSubagents.activeCount}, ${activeSubagents.omittedCount} omitted)`,
-                columns: [
-                  { key: "child", header: "Child" },
-                  { key: "parent", header: "Parent" },
-                  { key: "role", header: "Role" },
-                  { key: "depth", header: "Depth", alignment: "right" },
-                  { key: "model", header: "Model" },
-                  { key: "status", header: "Status" },
-                  { key: "duration", header: "Duration" },
-                  { key: "batch", header: "Batch" }
-                ],
-                rows: activeSubagents.subagents.map((subagent) => ({
-                  child: subagent.childSessionId,
-                  parent: subagent.parentSessionId,
-                  role: subagent.role,
-                  depth: subagent.depth,
-                  model: `${subagent.provider}/${subagent.model}`,
-                  status: subagent.cancellationState === undefined
-                    ? subagent.status
-                    : `${subagent.status} (${subagent.cancellationState})`,
-                  duration: formatSubagentDuration(subagent.durationMs),
-                  batch: formatSubagentBatch(subagent.batchId, subagent.taskIndex)
-                }))
-              })
-            ],
+        sections: sections.length === 0 ? undefined : sections,
       });
     },
     getModelInfo() {
@@ -1371,8 +1479,7 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
         versionStatus: cachedUpdate.versionStatus,
         updateHint,
       });
-    },
-    workflow
+    }
   };
 }
 

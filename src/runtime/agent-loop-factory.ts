@@ -15,13 +15,15 @@ import { assessSecurityPolicy, capabilityFirstDefaults } from "../contracts/secu
 import type { SessionDB, SessionRecord } from "../contracts/session.js";
 import type { ToolDefinition, ToolsetName } from "../contracts/tool.js";
 import { DEFAULT_DELEGATION_CONFIG } from "../config/delegation-defaults.js";
-import type { FileStateTracker } from "../delegation/file-state-tracker.js";
 import type { AgentEvolutionPolicy } from "../contracts/agent-evolution.js";
-import { DelegationManager } from "../delegation/delegation-manager.js";
-import type { SubagentRegistry } from "../delegation/subagent-registry.js";
+import { DurableDelegationService } from "../delegation/durable-delegation-service.js";
+import type { TaskWorkspaceBinding } from "../contracts/task.js";
+import type { InitialTaskHostLeaseInput, TaskStore } from "../tasks/task-store.js";
+import type { SpendingLimit } from "../contracts/budget.js";
 import {
   applyChildToolAccessResult,
   resolveChildToolAccess,
+  resolveTaskStepToolAccess,
   type ChildToolAccessResult
 } from "../delegation/toolset-security.js";
 import {
@@ -44,6 +46,7 @@ import { createSessionRuntimeContext, type SessionRuntimeContext } from "./sessi
 
 export const CHILD_DELEGATION_CONFIG_VERSION = "delegation.v0.1.0";
 export const CHILD_APPROVAL_MODE = "non-interactive-fail-closed";
+export const TASK_STEP_APPROVAL_MODE = "durable-task-approval";
 
 export type ChildRuntimeFeature =
   | "memoryRecall"
@@ -65,6 +68,19 @@ export type CreateChildAgentLoopInput = {
   channel?: ChannelKind;
   trustedWorkspace: boolean;
   parentVisibleTools: readonly ToolDefinition[];
+  taskExecution?: {
+    taskId: string;
+    rootTaskId: string;
+    planRevisionId: string;
+    stepId: string;
+    attemptId: string;
+    attemptFencingToken: number;
+    originSessionId?: string;
+    originTurnId?: string;
+  };
+  securityPolicy?: SecurityPolicy;
+  /** Existing open Task worker session resumed after a durable host handoff. */
+  resumeSessionId?: string;
 };
 
 export type ChildAgentLoopRuntime = {
@@ -75,7 +91,7 @@ export type ChildAgentLoopRuntime = {
   agentLoop: AgentLoop;
   suppressedRuntimeFeatures: ChildRuntimeFeature[];
   enabledRuntimeFeatures: string[];
-  approvalMode: typeof CHILD_APPROVAL_MODE;
+  approvalMode: typeof CHILD_APPROVAL_MODE | typeof TASK_STEP_APPROVAL_MODE;
   toolAccess: ChildToolAccessResult;
   modelOverride?: DelegateModelOverrideMetadata;
   handle(input: AgentLoopInput): Promise<AgentLoopResponse>;
@@ -111,9 +127,11 @@ export type DefaultChildAgentLoopFactoryOptions = {
   skillConfig?: Record<string, Record<string, unknown>>;
   ui?: ConstructorParameters<typeof AgentLoop>[0]["ui"];
   agentProfile?: ConstructorParameters<typeof AgentLoop>[0]["agentProfile"];
-  subagentRegistry?: SubagentRegistry;
-  diagnosticsRoot?: string;
-  fileStateTracker?: FileStateTracker;
+  taskStore?: TaskStore;
+  taskWorkspace?: TaskWorkspaceBinding;
+  taskHostAdmission?: () => InitialTaskHostLeaseInput | undefined;
+  onTaskCreated?: (taskId: string) => Promise<void>;
+  defaultTaskSpendingLimit?: SpendingLimit;
   id?: () => string;
 };
 
@@ -142,9 +160,11 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
   readonly #skillConfig: Record<string, Record<string, unknown>> | undefined;
   readonly #ui: ConstructorParameters<typeof AgentLoop>[0]["ui"];
   readonly #agentProfile: ConstructorParameters<typeof AgentLoop>[0]["agentProfile"];
-  readonly #subagentRegistry: SubagentRegistry | undefined;
-  readonly #diagnosticsRoot: string | undefined;
-  readonly #fileStateTracker: FileStateTracker | undefined;
+  readonly #taskStore: TaskStore | undefined;
+  readonly #taskWorkspace: TaskWorkspaceBinding | undefined;
+  readonly #taskHostAdmission: (() => InitialTaskHostLeaseInput | undefined) | undefined;
+  readonly #onTaskCreated: ((taskId: string) => Promise<void>) | undefined;
+  readonly #defaultTaskSpendingLimit: SpendingLimit | undefined;
   readonly #id: () => string;
 
   constructor(options: DefaultChildAgentLoopFactoryOptions) {
@@ -162,18 +182,34 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
     this.#skillConfig = options.skillConfig;
     this.#ui = options.ui;
     this.#agentProfile = options.agentProfile;
-    this.#subagentRegistry = options.subagentRegistry;
-    this.#diagnosticsRoot = options.diagnosticsRoot;
-    this.#fileStateTracker = options.fileStateTracker;
+    this.#taskStore = options.taskStore;
+    this.#taskWorkspace = options.taskWorkspace;
+    this.#taskHostAdmission = options.taskHostAdmission;
+    this.#onTaskCreated = options.onTaskCreated;
+    this.#defaultTaskSpendingLimit = options.defaultTaskSpendingLimit;
     this.#id = options.id ?? (() => `child_${crypto.randomUUID()}`);
   }
 
   async createChild(input: CreateChildAgentLoopInput): Promise<ChildAgentLoopRuntime> {
-    const childSessionId = this.#id();
+    const childSessionId = input.resumeSessionId ?? this.#id();
+    const resumedSession = input.resumeSessionId === undefined
+      ? undefined
+      : await this.#sessionDb.getSession(childSessionId);
+    if (input.resumeSessionId !== undefined && (
+      resumedSession === undefined ||
+      resumedSession.profileId !== input.profileId ||
+      resumedSession.parentSessionId !== input.parentSessionId ||
+      resumedSession.endedAt !== undefined ||
+      resumedSession.metadata?.kind !== "task-step-worker" ||
+      resumedSession.metadata.attemptId !== input.taskExecution?.attemptId
+    )) {
+      throw new Error("Durable Task worker session cannot be resumed outside its original Attempt.");
+    }
     const depth = input.depth ?? 1;
     const role = input.role ?? "leaf";
     const allowedToolsets = input.allowedToolsets ?? [];
     const allowedTools = input.allowedTools ?? [];
+    const approvalMode = input.taskExecution === undefined ? CHILD_APPROVAL_MODE : TASK_STEP_APPROVAL_MODE;
     const modelOverride = await deriveChildRoutes({
       parentRoutes: this.#parentRoutes,
       providerRegistry: this.#providerRegistry,
@@ -206,18 +242,20 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
       responseLabel: this.#responseLabel,
       ui: this.#ui,
       agentProfile: this.#agentProfile,
-      securityPolicy: createChildFailClosedSecurityPolicy(),
-      delegationManagerFactory: () => new DelegationManager({
-        sessionDb: this.#sessionDb,
-        childFactory: this,
-        trajectoryRecorder,
-        delegationConfig: this.#delegationConfig,
-        currentDepth: depth,
-        subagentRegistry: this.#subagentRegistry,
-        diagnosticsRoot: this.#diagnosticsRoot,
-        fileStateTracker: this.#fileStateTracker,
-        parentVisibleTools: () => builtSession?.toolRegistry.list() ?? []
-      }),
+      securityPolicy: input.securityPolicy ?? createChildFailClosedSecurityPolicy(),
+      delegationServiceFactory: this.#taskStore === undefined || this.#taskWorkspace === undefined
+        ? undefined
+        : ({ toolRegistry, sessionRuntimeContext }) => new DurableDelegationService({
+            store: this.#taskStore!,
+            creatorSessionId: () => sessionRuntimeContext.currentSessionId(),
+            workspace: this.#taskWorkspace!,
+            config: this.#delegationConfig,
+            defaultTaskSpendingLimit: this.#defaultTaskSpendingLimit,
+            visibleTools: () => toolRegistry.list(),
+            activeTaskExecution: input.taskExecution,
+            taskHostAdmission: this.#taskHostAdmission,
+            onTaskCreated: this.#onTaskCreated
+          }),
       trustedWorkspace: async () => input.trustedWorkspace,
       memoryRecall: "disabled",
       sessionCompression: "disabled",
@@ -229,18 +267,22 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
       skillLearningManager: undefined,
       agentEvolutionPolicy: undefined as AgentEvolutionPolicy | undefined,
       providerRoutes: modelOverride.routes,
+      taskExecution: input.taskExecution,
       toolRegistryFilter: ({ registry, availableTools }) => {
-        const result = resolveChildToolAccess({
-          parentVisibleTools: input.parentVisibleTools,
-          childCandidateTools: availableTools,
-          config: this.#delegationConfig,
-          request: {
-            allowedToolsets,
-            allowedTools,
-            role,
-            depth
-          }
-        });
+        const result = input.taskExecution === undefined
+          ? resolveChildToolAccess({
+              parentVisibleTools: input.parentVisibleTools,
+              childCandidateTools: availableTools,
+              config: this.#delegationConfig,
+              request: { allowedToolsets, allowedTools, role, depth }
+            })
+          : resolveTaskStepToolAccess({
+              parentVisibleTools: input.parentVisibleTools,
+              childCandidateTools: availableTools,
+              allowedToolsets,
+              allowedTools,
+              allowDelegation: role === "orchestrator"
+            });
         applyChildToolAccessResult(registry, result);
         toolAccess = result;
         return result;
@@ -254,14 +296,22 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
       rejectedRequestedTools: [],
       rejectedRequestedToolsets: []
     };
-    const childSession = await this.#sessionDb.createSession({
+    const spendingOrigin = input.taskExecution === undefined
+      ? await this.#sessionDb.getSession(input.parentSessionId)
+      : await this.#taskSpendingOrigin(input.taskExecution.taskId);
+    const childSession = resumedSession ?? await this.#sessionDb.createSession({
       id: childSessionId,
       profileId: input.profileId,
       parentSessionId: input.parentSessionId,
-      title: `Delegated: ${input.task.slice(0, 60)}`,
+      ...(spendingOrigin?.spendingScopeSessionId === undefined ? {} : {
+        spendingScopeSessionId: spendingOrigin.spendingScopeSessionId,
+        spendingLimit: spendingOrigin.spendingLimit
+      }),
+      title: `${input.taskExecution === undefined ? "Delegated" : "Task Step"}: ${input.task.slice(0, 60)}`,
       metadata: {
-        kind: "delegated-child",
+        kind: input.taskExecution === undefined ? "delegated-child" : "task-step-worker",
         parentSessionId: input.parentSessionId,
+        ...(input.taskExecution ?? {}),
         role,
         depth,
         allowedToolsets,
@@ -276,7 +326,7 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
         delegationConfigVersion: CHILD_DELEGATION_CONFIG_VERSION,
         suppressedRuntimeFeatures,
         enabledRuntimeFeatures,
-        approvalMode: CHILD_APPROVAL_MODE,
+        approvalMode,
         workspaceRoot: this.#workspaceRoot,
         context: input.context ?? ""
       }
@@ -290,7 +340,7 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
       agentLoop: builtSession.agentLoop,
       suppressedRuntimeFeatures,
       enabledRuntimeFeatures,
-      approvalMode: CHILD_APPROVAL_MODE,
+      approvalMode,
       toolAccess: effectiveToolAccess,
       modelOverride: modelOverride.metadata,
       handle: async (handleInput) => await builtSession.agentLoop.handle(handleInput),
@@ -298,6 +348,12 @@ export class DefaultChildAgentLoopFactory implements ChildAgentLoopFactory {
         await this.#builder.cleanupSession(builtSession);
       }
     };
+  }
+
+  async #taskSpendingOrigin(taskId: string): Promise<SessionRecord | undefined> {
+    const task = this.#taskStore?.getTask(taskId);
+    if (task === null || task === undefined) return undefined;
+    return await this.#sessionDb.getSession(task.originSessionId);
   }
 }
 

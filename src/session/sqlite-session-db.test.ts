@@ -44,6 +44,139 @@ describe("SQLiteSessionDB", () => {
     }
   });
 
+  it("persists immutable logical-session spending scopes", async () => {
+    const db = new SQLiteSessionDB({ path: dbPath });
+    try {
+      const root = await db.createSession({
+        id: "spend-root",
+        profileId: "alpha",
+        spendingLimit: { maxEstimatedCostUsd: 12, warningThresholdPercent: 75 }
+      });
+      const child = await db.createSession({
+        id: "spend-child",
+        profileId: "alpha",
+        parentSessionId: root.id,
+        spendingScopeSessionId: root.id,
+        spendingLimit: root.spendingLimit
+      });
+      expect(child).toMatchObject({ spendingScopeSessionId: root.id, spendingLimit: root.spendingLimit });
+      expect(() => db.db.query(
+        "update sessions set spending_limit_json = ? where id = ?"
+      ).run(JSON.stringify({ maxEstimatedCostUsd: 99, warningThresholdPercent: 75 }), root.id))
+        .toThrow(/immutable/i);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("persists and projects one canonical provider ledger by visible turn and session", async () => {
+    const db = new SQLiteSessionDB({ path: dbPath });
+    try {
+      await db.createSession({ id: "session-usage", profileId: "alpha" });
+      await db.createSession({ id: "other-session", profileId: "alpha" });
+      await db.appendMessage({ id: "turn-usage", sessionId: "session-usage", role: "user", content: "Run it" });
+      await db.appendMessage({ id: "other-turn", sessionId: "other-session", role: "user", content: "Other" });
+      const entry = {
+        id: "usage-1",
+        profileId: "alpha",
+        sessionId: "session-usage",
+        visibleTurnId: "turn-usage",
+        requestKey: "session-usage:turn-usage:0:0",
+        provider: "openai",
+        model: "gpt-test",
+        routeRole: "primary" as const,
+        routeIndex: 0,
+        providerAttemptIndex: 0,
+        sourceKind: "main" as const,
+        pricing: { currency: "USD" as const, fingerprint: "test-pricing" },
+        pricingFingerprint: "test-pricing",
+        inputTokens: 100,
+        outputTokens: 20,
+        reasoningTokens: 5,
+        cacheReadTokens: 40,
+        cacheWriteTokens: 10,
+        totalTokens: 120,
+        estimatedCostUsd: 0.0003,
+        usageComplete: true,
+        pricingComplete: true,
+        incompleteReasons: [],
+        dispatchedAt: "2030-01-01T00:00:00.000Z"
+      };
+
+      await db.recordProviderUsageEntries([entry]);
+      await db.recordProviderUsageEntries([entry]);
+
+      await expect(db.listProviderUsageEntries("alpha", { sessionId: "session-usage" })).resolves.toEqual([entry]);
+      await expect(db.listProviderUsageEntries("alpha", { visibleTurnId: "turn-usage" })).resolves.toEqual([entry]);
+      await expect(db.listProviderUsageEntries("alpha", { sessionId: "other-session" })).resolves.toEqual([]);
+      await expect(db.recordProviderUsageEntries([{ ...entry, totalTokens: 121 }])).rejects.toThrow(/conflicts/);
+      await expect(db.recordProviderUsageEntries([{ ...entry, id: "usage-2", requestKey: "bad-turn", visibleTurnId: "missing" }]))
+        .rejects.toThrow(/visible-turn/);
+      await expect(db.recordProviderUsageEntries([{
+        ...entry,
+        id: "usage-3",
+        requestKey: "unrelated-turn",
+        visibleTurnId: "other-turn"
+      }])).rejects.toThrow(/lineage/);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("accepts provider usage attributed to a verified compressed-session ancestor", async () => {
+    const db = new SQLiteSessionDB({ path: dbPath });
+    try {
+      const spendingLimit = { maxEstimatedCostUsd: 5, warningThresholdPercent: 80 };
+      await db.createSession({
+        id: "parent",
+        profileId: "alpha",
+        endReason: "compression",
+        spendingLimit
+      });
+      await db.appendMessage({ id: "parent-turn", sessionId: "parent", role: "user", content: "Original turn" });
+      await db.createSession({
+        id: "child",
+        profileId: "alpha",
+        parentSessionId: "parent",
+        spendingScopeSessionId: "parent",
+        spendingLimit,
+        metadata: { compactedFromSessionId: "parent" }
+      });
+      const entry = {
+        id: "compressed-usage",
+        profileId: "alpha",
+        sessionId: "child",
+        sessionBudgetScopeId: "parent",
+        visibleTurnId: "parent-turn",
+        requestKey: "compressed-request",
+        provider: "openai",
+        model: "gpt-test",
+        routeRole: "primary" as const,
+        routeIndex: 0,
+        providerAttemptIndex: 0,
+        sourceKind: "main" as const,
+        pricing: { currency: "USD" as const, fingerprint: "test-pricing" },
+        pricingFingerprint: "test-pricing",
+        inputTokens: 10,
+        outputTokens: 2,
+        reasoningTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 12,
+        estimatedCostUsd: 0.001,
+        usageComplete: true,
+        pricingComplete: true,
+        incompleteReasons: [],
+        dispatchedAt: "2030-01-01T00:00:00.000Z"
+      };
+
+      await expect(db.recordProviderUsageEntries([entry])).resolves.toBeUndefined();
+      await expect(db.listProviderUsageEntries("alpha", { sessionId: "child" })).resolves.toEqual([entry]);
+    } finally {
+      db.close();
+    }
+  });
+
   it("round-trips provider execution metadata on messages", async () => {
     const db = new SQLiteSessionDB({ path: dbPath });
     try {

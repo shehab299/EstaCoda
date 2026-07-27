@@ -34,13 +34,15 @@ import type {
   ToolActivityRailViewModel,
   ToolActivityRailEvent,
 } from "../../contracts/view-model.js";
-import type { ResolvedTokens, TokenGlyph } from "../../contracts/ui-tokens.js";
+import type { ResolvedTokens, SemanticMotionToken, TokenGlyph } from "../../contracts/ui-tokens.js";
 import { measureTextWidth, measureVisibleWidth, padVisibleEnd, padVisibleStart, padVisibleAlign, truncateVisible, wrapText } from "./layout.js";
 import type { UiLocale } from "../../ui/cli-ui-copy.js";
 import { chromeCopy } from "../../ui/cli-ui-copy.js";
 import { closeOpenBidiIsolates, isolateLtr, isolateRtl } from "../../ui/bidi.js";
 import type { TextDirection } from "../../contracts/ui.js";
 import { formatSessionDisplayId } from "../../session/session-id.js";
+import { semanticMotionForPhase, semanticMotionFrame } from "../semantic-motion.js";
+import { formatUsageCost } from "../usage-cost-format.js";
 
 const STARTUP_TITLE_SEPARATOR = "  𓂀  ";
 const STARTUP_TITLE_SEPARATOR_ASCII = "  *  ";
@@ -71,17 +73,23 @@ export class StandardRenderer {
   }
 
   // ──────────────────────────────────────
-  // Spinner / animation primitives
+  // Semantic motion primitives
   // ──────────────────────────────────────
 
-  /** Returns a time-based spinner frame when animation is supported, otherwise the first frame. */
-  #spinnerFrame(frames: readonly string[]): string {
+  /** Resolves one themed semantic motion from elapsed time and its own cadence. */
+  #motion(token: SemanticMotionToken, elapsedMs = Date.now()): string {
+    const definition = this.#tokens.contract.motion[token];
+    const frame = semanticMotionFrame(
+      definition,
+      this.#capabilities.supportsAnimation ? elapsedMs : 0
+    );
+    return this.#color(frame, definition.color);
+  }
+
+  #asciiMotion(frames: readonly string[], cadenceMs: number, elapsedMs = Date.now()): string {
     if (frames.length === 0) return "";
-    if (!this.#capabilities.supportsAnimation) {
-      return frames[0] ?? "";
-    }
-    const index = Math.floor(Date.now() / 80) % frames.length;
-    return frames[index] ?? "";
+    if (!this.#capabilities.supportsAnimation) return frames[0] ?? "";
+    return frames[Math.floor(Math.max(0, elapsedMs) / cadenceMs) % frames.length] ?? "";
   }
 
   // ──────────────────────────────────────
@@ -423,8 +431,6 @@ export class StandardRenderer {
       this.#rail(`skills: ${vm.skillCount}${vm.skillAutonomy !== undefined ? ` (${vm.skillAutonomy})` : ""}`),
       this.#rail(`tools: ${vm.toolCount}`),
       this.#rail(`mcp: ${vm.mcp.active}/${vm.mcp.total}`),
-      this.#rail(`workflow: ${vm.workflowAvailable ? this.#severity("available", "ok") : this.#dim("unavailable")}`),
-      this.#rail(`workflow run: ${vm.workflowRunActive ? this.#severity("active", "ok") : this.#dim("inactive")}`),
     ].filter((line): line is string => line !== undefined);
 
     for (const warning of vm.warnings) {
@@ -1266,7 +1272,7 @@ export class StandardRenderer {
       case "pending":
         return this.#dim("○");
       case "running":
-        return this.#action(this.#spinnerFrame(this.#tokens.contract.glyph.spinner.waiting));
+        return this.#motion("waiting");
       case "done":
         return this.#severity("✓", "ok");
       case "failed":
@@ -1339,7 +1345,7 @@ export class StandardRenderer {
       case "pending":
         return this.#dim("○");
       case "active":
-        return this.#action(this.#spinnerFrame(this.#tokens.contract.glyph.spinner.waiting));
+        return this.#motion("waiting");
       case "done":
         return this.#severity("✓", "ok");
       case "failed":
@@ -1393,10 +1399,12 @@ export class StandardRenderer {
       return this.#useUnicode ? this.#caution("⚠") : "[?]";
     }
     if (event.status === "running") {
-      const frames = this.#useUnicode
-        ? this.#tokens.contract.glyph.spinner.tool
-        : ["[>]", "[>.]", "[>..]", "[>...]", "[>..]", "[>.]"];
-      return this.#action(this.#spinnerFrame(frames));
+      return this.#useUnicode
+        ? this.#motion("tool")
+        : this.#color(
+          this.#asciiMotion(["[>]", "[>.]", "[>..]", "[>...]", "[>..]", "[>.]"], 90),
+          this.#tokens.contract.motion.tool.color
+        );
     }
     const icon = this.#tokens.contract.toolIcon[event.tool];
     if (icon) {
@@ -1944,7 +1952,11 @@ export class StandardRenderer {
     const requestedWidth = Math.max(24, this.#capabilities.terminalWidth);
     const rawTitle = this.#assistantResponseTitle(vm.label, Math.max(1, requestedWidth - 4));
     const titleWidth = measureVisibleWidth(` ${rawTitle} `);
-    const maxRawContent = Math.max(0, ...vm.text.split("\n").map((line) => measureVisibleWidth(line)));
+    const maxRawContent = Math.max(
+      0,
+      ...vm.text.split("\n").map((line) => measureVisibleWidth(line)),
+      measureVisibleWidth(vm.usageFooter ?? "")
+    );
     const width = Math.min(
       requestedWidth,
       Math.max(40, titleWidth + 4, maxRawContent + 4)
@@ -1959,6 +1971,18 @@ export class StandardRenderer {
           : this.#agentMessage(this.#isRtl() ? this.#natural(wrappedLine) : wrappedLine);
         contentLines.push(bodyLine);
       }
+    }
+
+    if (vm.usageFooter !== undefined) {
+      const rawFooterRows = !this.#isRtl()
+        && measureVisibleWidth(vm.usageFooter) > contentWidth
+        && vm.usageFooter.includes(" · ")
+        ? vm.usageFooter.split(" · ").flatMap((segment) => wrapVisibleLine(segment, contentWidth))
+        : wrapVisibleLine(vm.usageFooter, contentWidth);
+      const footerRows = rawFooterRows.map((row) =>
+        this.#muted(this.#isRtl() ? this.#natural(row) : row)
+      );
+      contentLines.push("", ...footerRows);
     }
 
     const frameTitle = this.#isRtl() ? this.#natural(rawTitle, Math.max(1, width - 4)) : rawTitle;
@@ -2046,6 +2070,10 @@ export class StandardRenderer {
         : this.#contextBeads(vm.contextUsage.filled, vm.contextUsage.total));
     }
 
+    if (vm.sessionCost !== undefined) {
+      parts.push(`session ${formatUsageCost(vm.sessionCost, { compact: true })}`);
+    }
+
     if (vm.sessionElapsedMs !== undefined) {
       const glyph = this.#useUnicode ? "◷" : "session";
       parts.push(`${glyph} ${formatRailDuration(vm.sessionElapsedMs)}`);
@@ -2062,6 +2090,13 @@ export class StandardRenderer {
     const rail = parts.length > 0
       ? `${modelPart}${this.#secondary(` | ${parts.join(" | ")}`)}`
       : modelPart;
+    if (vm.sessionCost !== undefined && measureVisibleWidth(rail) > this.#capabilities.terminalWidth) {
+      const cost = formatUsageCost(vm.sessionCost, { compact: true });
+      const labeledCost = `session ${cost}`;
+      const narrowParts = [measureVisibleWidth(labeledCost) <= this.#capabilities.terminalWidth ? labeledCost : cost];
+      if (vm.sessionElapsedMs !== undefined) narrowParts.push(formatRailDuration(vm.sessionElapsedMs));
+      return this.#truncateVisibleStable(this.#secondary(narrowParts.join(" | ")), this.#capabilities.terminalWidth);
+    }
     return this.#truncateVisibleStable(rail, this.#capabilities.terminalWidth);
   }
 
@@ -2077,6 +2112,10 @@ export class StandardRenderer {
       parts.push(vm.contextUsage.filled === undefined
         ? this.#unknownContextBeads()
         : this.#contextBeads(vm.contextUsage.filled, vm.contextUsage.total));
+    }
+
+    if (vm.sessionCost !== undefined) {
+      parts.push(`${isolateRtl("الجلسة")} ${formatUsageCost(vm.sessionCost, { locale: "ar", compact: true })}`);
     }
 
     if (vm.sessionElapsedMs !== undefined) {
@@ -2096,6 +2135,13 @@ export class StandardRenderer {
     const rail = parts.length > 0
       ? `${modelPart}${this.#secondary(` | ${parts.join(" | ")}`)}`
       : modelPart;
+    if (vm.sessionCost !== undefined && measureVisibleWidth(rail) > this.#capabilities.terminalWidth) {
+      const cost = formatUsageCost(vm.sessionCost, { locale: "ar", compact: true });
+      const labeledCost = `${isolateRtl("الجلسة")} ${cost}`;
+      const narrowParts = [measureVisibleWidth(labeledCost) <= this.#capabilities.terminalWidth ? labeledCost : cost];
+      if (vm.sessionElapsedMs !== undefined) narrowParts.push(isolateLtr(formatRailDuration(vm.sessionElapsedMs, "ar")));
+      return this.#truncateVisibleStable(isolateLtr(this.#secondary(narrowParts.join(" | "))), this.#capabilities.terminalWidth);
+    }
     return this.#truncateVisibleStable(isolateLtr(rail), this.#capabilities.terminalWidth);
   }
 
@@ -2134,15 +2180,19 @@ export class StandardRenderer {
   }
 
   renderActiveTurnSpinner(vm: ActiveTurnSpinnerViewModel): string {
-    const eyeFrames = this.#useUnicode
-      ? this.#tokens.contract.glyph.spinner.thinking
-      : ["*", "*.", "*..", "*...", "*..", "*."];
-    const eye = this.#spinnerFrame(eyeFrames);
+    const token = semanticMotionForPhase(vm.phase);
+    const elapsedMs = vm.elapsedMs ?? Date.now();
+    const eye = this.#useUnicode
+      ? this.#motion(token, elapsedMs)
+      : this.#color(
+        this.#asciiMotion(["*", "*.", "*..", "*...", "*..", "*."], this.#tokens.contract.motion[token].cadenceMs, elapsedMs),
+        this.#tokens.contract.motion[token].color
+      );
     const label = vm.label ?? (vm.phase !== undefined ? ((this.#copy as unknown) as Record<string, string>)[vm.phase] : undefined);
     if (label !== undefined) {
-      return `${this.#brand(eye)} ${this.#action(label)}`;
+      return `${eye} ${this.#action(label)}`;
     }
-    return this.#brand(eye);
+    return eye;
   }
 
   #turnStateLabel(state: SessionStatusRailViewModel["turnState"]): string {

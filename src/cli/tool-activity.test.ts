@@ -784,8 +784,8 @@ describe("Session-loop tool activity rail wiring", () => {
     }, builder, renderer, streamState, undefined, turnOutput);
 
     const written = (output.write as ReturnType<typeof vi.fn>).mock.calls.map((call: unknown[]) => call[0]).join("");
-    expect(written).toContain("Worker 2: started");
-    expect(written).toContain("Worker 2: failed");
+    expect(written).toContain("Subagent 2: started");
+    expect(written).toContain("Subagent 2: failed");
     expect(written).not.toContain("Read File");
     expect(written).not.toContain("child-session-secret");
     expect(written).not.toContain("batch-secret");
@@ -804,17 +804,17 @@ describe("Animation gating", () => {
     const output2 = renderer.render(vm);
     // Static frame: both renders produce identical output
     expect(output1).toBe(output2);
-    expect(output1).toContain("⌦");
+    expect(output1).toContain("⠋");
   });
 
-  it("returns a spinner frame when animation is enabled", () => {
+  it("returns the first semantic waiting frame when animation is enabled", () => {
     const spy = vi.spyOn(Date, "now").mockReturnValue(0);
     const renderer = standardDarkRenderer();
     const vm = singleRunningVm();
     const output = renderer.render(vm);
     spy.mockRestore();
     // With Date.now() = 0, first frame should be returned
-    expect(output).toContain("⌦");
+    expect(output).toContain("⠋");
   });
 });
 

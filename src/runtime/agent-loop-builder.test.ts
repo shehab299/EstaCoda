@@ -545,7 +545,7 @@ describe("AgentLoopBuilder", () => {
 
     const built = await harness.build("explicit-session", {
       sessionRuntimeContext,
-      delegationManagerFactory: ({ sessionRuntimeContext: ctx }) => {
+      delegationServiceFactory: ({ sessionRuntimeContext: ctx }) => {
         captured.delegationSessionId = ctx.currentSessionId();
         return {} as never;
       }
@@ -673,7 +673,10 @@ async function createBuilderHarness(input: {
     homeDir
   });
   const providerRegistry = new ProviderRegistry();
-  const providerExecutor = new ProviderExecutor({ registry: providerRegistry });
+  const providerExecutor = new ProviderExecutor({
+    registry: providerRegistry,
+    allowUnenforcedAttributedSpend: true
+  });
   const promotionStore = new MemoryPromotionStore({
     path: join(workspaceRoot, "promotions.json"),
     persistence: memoryPersistenceService
@@ -801,7 +804,7 @@ async function createBuilderHarness(input: {
         agentEvolutionPolicy: deriveAgentEvolutionPolicy("none"),
         responseLabel: "EstaCoda",
         securityPolicy,
-        delegationManagerFactory: () => ({} as never),
+        delegationServiceFactory: () => ({} as never),
         trustedWorkspace: async () => true,
         ...overrides
       });

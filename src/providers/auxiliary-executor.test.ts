@@ -60,6 +60,8 @@ function executionResult(route: ResolvedModelRoute, ok: boolean, content = ok ? 
       {
         provider: route.provider,
         model: route.id,
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         ok,
         errorClass: ok ? undefined : "server",
         content,
@@ -119,14 +121,61 @@ describe("executeAuxiliaryTask", () => {
       mainRoute: fakeRoute({ id: "gpt-4o" }),
       providerExecutor: { complete },
       request,
+      usage: {
+        executionSessionId: "session-1",
+        sessionBudgetScopeId: "session-1",
+        visibleTurnId: "turn-1"
+      }
     });
 
     expect(complete).toHaveBeenCalledTimes(1);
     expect(complete.mock.calls[0]![2]!.primaryRoute).toEqual(route);
+    expect(complete.mock.calls[0]![2]!.usage).toMatchObject({
+      sourceKind: "auxiliary",
+      auxiliaryKind: "compression",
+      routeRole: "primary",
+      routeIndex: 0,
+      executionSessionId: "session-1",
+      visibleTurnId: "turn-1"
+    });
     expect(result.ok).toBe(true);
     expect(result.attempts).toEqual([
       { role: "primary", provider: "openai", model: "gpt-4.1-mini", ok: true, errorClass: undefined, content: "primary ok" }
     ]);
+  });
+
+  it("propagates an exact spending denial without attempting the auxiliary fallback", async () => {
+    const route = fakeRoute({ id: "auxiliary-model" });
+    const mainRoute = fakeRoute({ id: "main-model" });
+    const complete = vi.fn(async (): Promise<ProviderExecutionResult> => ({
+      ok: false,
+      fallbackUsed: false,
+      attempts: [{
+        provider: route.provider,
+        model: route.id,
+        state: "preflight",
+        ok: false,
+        errorClass: "spend-denied",
+        content: "No provider request was sent."
+      }],
+      spendDenialReason: "SESSION_CAPACITY_RESERVED",
+      toolCalls: []
+    }));
+
+    const result = await executeAuxiliaryTask({
+      route: fakeAuxiliaryRoute({ route, fallbackToMain: true }),
+      mainRoute,
+      providerExecutor: { complete },
+      request
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: "failed",
+      fallbackUsed: false,
+      spendDenialReason: "SESSION_CAPACITY_RESERVED"
+    });
+    expect(complete).toHaveBeenCalledOnce();
   });
 
   it("preserves safe provider final-state metadata without copying raw reasoning", async () => {
@@ -217,6 +266,10 @@ describe("executeAuxiliaryTask", () => {
     expect(complete).toHaveBeenCalledTimes(2);
     expect(complete.mock.calls[0]![2]!.primaryRoute).toEqual(route);
     expect(complete.mock.calls[1]![2]!.primaryRoute).toEqual(mainRoute);
+    expect(complete.mock.calls.map((call) => call[2]!.usage)).toEqual([
+      expect.objectContaining({ routeRole: "primary", routeIndex: 0 }),
+      expect.objectContaining({ routeRole: "fallback", routeIndex: 1 })
+    ]);
     expect(result.ok).toBe(true);
     expect(result.fallbackUsed).toBe(true);
     expect(result.attempts.map((attempt) => attempt.role)).toEqual(["primary", "fallback"]);

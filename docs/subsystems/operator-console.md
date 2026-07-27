@@ -70,12 +70,22 @@ setup/select panels where applicable
 The persistent status rail contains only:
 
 - model
-- context usage / context bar
-- session timer
+- one identity badge: `YOLO` when active, otherwise the bounded workspace label
+- context usage / context bar, followed immediately by the session timer
+- cumulative session tokens and cost aligned at the far right
 
-Tools, approvals, attachments, steering, workspace/trust, setup state, channel
-state, and active-turn noise must not be added to the persistent rail. They get
-contextual surfaces.
+Tools, approvals, attachments, steering, workspace trust/configuration, setup
+state, channel state, and active-turn noise must not be added to the persistent
+rail. They get contextual surfaces. The workspace identity is a sanitized label,
+not a trust or configuration indicator.
+
+Session cost is a projection of persisted canonical provider-request rows. The
+rail keeps `used/total` context counts instead of falling back to a percentage;
+it shortens the workspace identity and removes branch/bar detail before removing
+the bounded workspace label or those counts. At the narrowest widths, cumulative
+cost remains the final priority. Session telemetry is restored after restart and
+follows only verified transcript-compression ancestry; an ordinary parent or
+delegated worker-session relationship does not join session totals.
 
 ## State Model Sketch
 
@@ -134,6 +144,8 @@ Focus rules locked for v1:
 - `Enter` opens an attachment preview only when attachment focus is active.
 - `Esc` removes a focused attachment or cancels steer draft/queued steer.
 - `Ctrl+C` remains the hard active-turn interrupt.
+- Typing or using prompt-editing controls while a main-session Task/Subagent is
+  focused returns focus to the prompt before applying the edit.
 
 ## Phase-Mapped Target Renders
 
@@ -322,69 +334,189 @@ Attachments:
 - file excerpt · src/cli/session-loop.ts · 184 lines
 ```
 
-### Phase E: Delegated Active Work
+### Phase E: Durable Task Creation
 
-Normal tool activity remains in the compact turn status while work is live. A
-running `delegate_task` is the exception: its bounded child rows use the active
-work region so the operator can see that isolated subagents are still running.
+`delegate_task` is a short Task-creation operation in the active turn. It
+persists a fixed graph and returns a bounded Task handle; it does not keep the
+turn open while worker Steps execute. Running Attempts belong to the Task host
+and use Task/background-work surfaces rather than nested child cards owned by
+the creating tool row.
 
-```text
-Delegated work · 2 active · 1 done · 00:53
-╭─ • Worker 1 · inspect delegation ───────╮  ╭─ ● Worker 2 · inspect tools ───────────╮
-│ ✓ Search Files  src/delegation           │  │ · Read File  src/tools/delegation...   │
-│ · Read File     progress-relay.ts        │  │                                         │
-│                                         │  │                                         │
-│                                         │  │                                         │
-│                                         │  │                                         │
-│                                         │  │                                         │
-├─────────────────────────────────────────┤  ├─────────────────────────────────────────┤
-│ running · 2 activities · 00:53          │  │ running · 1 activity · 00:53           │
-╰─────────────────────────────────────────╯  ╰─────────────────────────────────────────╯
-╭─ ✓ Worker 3 · inspect docs ─────────────╮
-│ ✓ Search Files  docs/**/*delegation*     │
-│                                         │
-│                                         │
-│                                         │
-│                                         │
-│                                         │
-├─────────────────────────────────────────┤
-│ completed · 1 activity · 00:47          │
-╰─────────────────────────────────────────╯
-╭─ Prompt ─────────────────────────────────────────────────────────────╮
-│ ›                                                                     │
-╰──────────────────────────────────────────────────────────────────────╯
-kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 7% │ session 01:12
-```
+The completed turn retains the ordinary `delegate_task` row and its bounded
+handle metadata. Task progress, approval waits, cancellation, result bodies,
+and terminal settlement are sourced from the durable Task journal.
 
-Assistant prose emitted before `delegate_task` remains visible above the
-delegated-work region. When the parent delegation settles, or a new live
-assistant tail begins streaming, the child rows leave the live frame. The
-durable turn-end surface keeps one parent tool row with the bounded outcome
-counts:
+The delivered response also prints the durable Task handle and current bounded
+status. As asynchronous work settles, its retained Task card and the current
+session total refresh from persisted accounting; old assistant transcript
+messages are not rewritten. Task cards use the same complete/lower-bound/
+unavailable cost language as turns and never present missing pricing as zero.
 
-Each worker card keeps a rolling maximum of six bounded activity rows. Cards
-render two per row when two minimum-width cards fit and stack on narrower
-terminals. At most three cards are visible: active workers take precedence and
-recent completions fill remaining slots, while the header reports aggregate
-active, completed, failed, and not-yet-observed queue counts for the whole
-batch. Constrained layouts reduce activity rows before falling back to compact
-worker lines. Running workers use the phase-shifted `worker` pulse token; plain
-mode uses a stable ASCII marker with animation disabled. Worker timers begin
-when each child starts, completion recency follows settlement time, and card
-footers preserve distinct completed, blocked, failed, timed-out, and cancelled
-outcomes.
+Linked Tasks also render as retained Task cards in the interactive console.
+The card footer and inspection projection distinguish Task lifecycle from live
+foreground/background/waiting ownership, show the immutable preference and
+background-continuation readiness, and include only a bounded safe wait reason.
+Expired leases and Task status alone are never presented as active ownership.
+Cards remain available after completion, failure, partial settlement, or
+cancellation; they are not transient worker rows. The main-session Task region
+shows stable `Subagent N` identities beneath the live assistant stream. Each
+full Subagent card occupies exactly seven rows, including its title and truthful
+status/elapsed/tokens/cost footer. The interior continually refreshes with the
+latest retained safe activity. Cards use the elevated grey surface token,
+whitespace gutters instead of permanent perimeter borders, and the existing
+worker motion token while running. Focus adds the action-color leading rail and
+title treatment. The main card is a presentation projection: lifecycle and
+accounting events such as `Worker finished`, Step-state changes, Attempt
+bookkeeping, and usage recording remain available in inspection but do not
+consume its activity rows. Running cards show semantic safe work such as
+searching, reading, writing, or preparing an answer. Completed cards replace
+those transient rows with `Result ready` and up to three wrapped lines from the
+accepted result summary, falling back to the retained assistant preview only
+when no result summary exists.
 
-```text
-╭─ Tools completed ─────────────────────────────────────────────────────╮
-│ ✗ Delegate Task    1 completed · 1 timed out · 1 failed        00:10  │
-╰───────────────────────────────────────────────────────────────────────╯
-```
+The main-session Task header uses a compact display identity: generated
+`task_<uuid>` values render as `task_` plus the first eight UUID characters,
+matching the established short session-ID convention while preserving the Task
+namespace. The exact durable Task ID remains visible in inspection and remains
+the only value used for focus, hit regions, routing, commands, and persistence.
 
-Child prompts, transcripts, raw tool arguments, provider/model identifiers,
-cancellation reasons, and child session identifiers are not rendered. Plain and
-one-shot CLI modes emit at most two lifecycle lines per child, for example
-`Worker 1: started` and `Worker 1: completed`; intermediate child
-tool and provider events remain silent.
+When every delegated Subagent is settled and the durable synthesis Step is
+`ready`, `running`, `waiting_for_input`, or `waiting_for_approval`, the
+main-session Task region gives the parent stage visual priority. It shows a
+distinct `Parent synthesis` panel sourced from that Step's persisted status,
+current Attempt, safe activity, usage, and semantic trace. The panel reports
+the factual number of Subagent results being synthesized and the worker-only
+settlement fact, such as `3 of 3 delegated Steps completed`. The live Task
+header and whole-Task view derive a read-only user phase from the persisted
+graph, so a durable lifecycle of `running` is presented as `delegating` or
+`synthesizing` when the Step state proves it. This projection does not mutate
+the Task, scheduler, or API lifecycle. It never invents intermediate prose or
+a completion percentage. Audit-only lifecycle events do not become its
+selected activity callout.
+
+The rich Papyrus session does not retain a one-time `running` transcript notice
+above a live Task card because that snapshot would become stale. The live card
+is authoritative. Plain and non-TTY sessions instead print the current derived
+phase and worker settlement as a bounded snapshot because no live card exists.
+
+While that parent stage is active, settled seven-row Subagent cards collapse to
+individually focusable one-row summaries beneath it. Their exact Step IDs and
+mouse/keyboard routes do not change, and their complete safe activity and
+accepted result summaries remain available in inspection. The parent panel
+opens whole-Task inspection. Before synthesis becomes active, and after it
+settles, the ordinary seven-row Subagent presentation remains in effect.
+
+An interactive CLI delegation with one worker receives a durable local
+completion binding, as does a batch with its default synthesis Step. Once the
+Task has settled and its accepted single-worker or synthesis Result is
+available, the authorized creator session appends that Result once as an
+ordinary assistant transcript message. Intermediate batch worker Results remain
+in Task inspection and are never concatenated into the session reply.
+`synthesis: false` explicitly creates inspection-only work without that local
+final-answer binding. A terminal Task without an accepted answer settles its
+binding once as unavailable rather than retrying forever. Delivery follows
+verified transcript-compression lineage, preserves an
+in-progress prompt draft, and uses a deterministic message identity so a crash
+between append and outbox settlement cannot duplicate the transcript message.
+The outbox is acknowledged only after display; if that display was interrupted,
+recovery may safely show the same durable answer again after the claim becomes
+stale. A settled Result is displayed normally; the CLI does not replay
+completed text as fake token streaming.
+
+Completed Subagent cards prefer the Result's dedicated `displaySummary` over
+generic Result metadata or streaming previews. The field is immutable,
+single-line plain text bounded to 480 Unicode characters; Agent Steps populate
+it from the deliberately requested opening summary paragraph. Results created
+before this contract remain compatible: Papyrus safely extracts the first
+complete usable paragraph from their generic `summary` metadata. It never uses
+an arbitrary assistant-stream tail as the settled summary.
+
+One to three Subagents stack vertically. Four to six use two equal-width,
+column-major columns when both remain readable. A third column is added only at
+a readable width; otherwise the surface keeps complete seven-row cards and
+shows `+N more Subagents`. Narrow and height-constrained terminals use the
+single-column or compact deterministic fallback instead of clipping a card.
+The Task header opens the whole-Task view; a Subagent card opens that Subagent.
+
+The whole-Task inspection workspace shows the objective, lifecycle, elapsed
+time, aggregate usage/cost, factual Step state, Subagent summaries, approvals,
+blockers, dependencies, results, child Tasks, and safe artifacts. Its activity
+trace is an event sequence, not a completion meter: one semantic-color square
+per retained `Terminal`, `Search`, `Plan`, `Read`, `Edit`, `Answer`, `Wait`,
+`Finish`, or `Failed` event, plus all-time category counters. The outlined
+square is the inspected event; the separate live-tail marker is the newest
+event. Selecting history disables follow-live and exposes `Return to live`.
+Overflow uses a bounded readable window with an earlier-event count. The view
+may state `N of M Steps settled`, but never derives or renders a Task completion
+percentage. All-time counters come from profile-scoped aggregate metadata; the
+projection does not load or expose omitted Event payloads.
+
+Subagent inspection reuses the workspace filtered by stable Step ID. It shows
+the Subagent objective, current safe activity, usage/cost, complete retained
+safe trace, assistant preview/final result, retry Attempts, dependencies,
+blockers, results, and artifacts. `Complete retained safe trace` does not mean
+raw reasoning, raw prompts, credentials, tool arguments/results, or unbounded
+provider text. The Results and artifacts section is limited to projected result
+handles and summaries; it does not claim a separate file-access history.
+
+`Tab` (when no higher-priority typeahead or attachment surface owns it) or
+`Ctrl+T` focuses the Task header. `Up`/`Down` change Tasks, `Right` enters the
+visible Subagent grid, and the arrow keys then move among complete visible
+Subagent cards. `Enter` opens the focused Task header or opens a focused
+Subagent directly. Native terminal selection, copy/paste, and scroll behavior
+remains available by default. `Ctrl+G` explicitly enables temporary Mouse Mode
+for the Task region; while active, Task/Subagent cards, breadcrumbs, trace
+events, and `Return to live` use the same actions as their keyboard routes.
+`Up`/`Down`, `Page Up`/`Page Down`,
+`Home`, and `End` navigate or scroll according to the active inspection target;
+`Escape` first releases an active Mouse Mode, then unwinds Subagent to Task to
+main session without losing the underlying session state. Typing, pasting, or
+using prompt-editing controls such as Backspace, Delete, and line-edit shortcuts,
+clicking outside an interactive Task region, closing inspection, or losing the
+Task region also releases Mouse Mode. Whole-Task selection adjusts scroll to
+keep the selected Subagent visible. Wheel input scrolls only inside inspection
+while Mouse Mode is active. Terminal startup defensively resets stale tracking,
+and cleanup disables it on normal exit, failure, and suspend.
+
+The existing Task refresh updates projections and newly settled provider usage
+in place. Established cards retain their order, selected Task/Subagent/event
+IDs remain selected while present, history remains frozen when follow-live is
+off, and terminal resize recomputes the layout without closing inspection.
+
+The inspection view reads only the session-authorized Task projection: bounded
+objective and Step labels, status, plan revision, dependencies, active Attempt
+metadata, elapsed time, whitelisted activity labels, coarse tool category,
+usage/cost totals, opaque result handles, and bounded wait/failure classes. It
+never reads raw session events, worker transcripts, provider token streams,
+tool input/output, result bodies, workspace paths, credentials, lease-owner
+identities, or unbounded child text.
+
+Worker progress persists only categorical, bounded transition labels (for
+example provider wait/fallback and tool category). Child Tasks appear only as
+bounded handles, statuses, and parent-Attempt attribution. The originating
+session receives an observer link at child creation; raw child prompts,
+transcripts, and provider-token text remain excluded. Provider fallback text is
+not buffered into Task cards or inspection. Consequently, abandoned text from
+a failed provider route cannot remain visible as accepted worker output; the
+Task result becomes readable only through the verified result surface after
+settlement. Tool-call transitions update the safe activity checkpoint without
+persisting tool arguments, previews, or result bodies.
+
+Every completed response owns one compact, muted usage footer inside the
+assistant message frame, for example `15k tokens · ≈ $0.55`. If trustworthy
+pricing is unavailable, the footer shows tokens only; incomplete totals use a
+`≥` lower bound. Per-route accounting remains available in Task inspection and
+is not repeated in the main transcript or completed-work surface. Multiple
+runtime turns caused by one CLI steering submission are summed before the final
+visible response is delivered.
+
+Interactive input precedence is centralized as: modal Task inspection,
+approval prompt, autocomplete/typeahead, attachment selection, then ordinary
+prompt or steering input. Plain, CI, dumb-terminal, and non-TTY Task inspection
+continues through deterministic `task` and `/task` text commands without
+animation, background paint, mouse dependence, or cursor-managed UI. Arabic
+inspection isolates technical tokens such as Task IDs, Subagent labels, result
+handles, costs, and counts so mixed-direction output remains readable.
 
 ### Phase E2: Live Assistant Streaming
 
@@ -647,6 +779,22 @@ kimi-k2.7-code ● │ ctx [▰▱▱▱▱▱▱▱▱▱] 18.4k/262k 7% │ se
 | Setup/select panels | `src/ui/papyrus/operator-console/setupPanelSurface.ts`, `src/ui/papyrus/operator-console/setupSelectRuntimeMapper.ts`, `src/cli/interactive-select.ts` |
 | Session integration | `src/cli/session-loop.ts`, `src/cli/create-interactive-prompt.ts`, `src/cli/rawPromptController.ts`, `src/cli/rawPromptRenderLoop.ts` |
 
+## Semantic Motion
+
+The live console uses one elapsed-time animation clock. Surfaces calculate their visible frame from the selected token's cadence and redraw only when that visible frame changes. There are no per-spinner timers.
+
+| Runtime activity | Motion token |
+|------------------|--------------|
+| Provider or generic wait | `waiting` |
+| Thinking | `thinking` |
+| Intent routing | `routing` |
+| Tool execution | `tool` |
+| Delegated worker | `worker` |
+| Finalizing | `finalizing` |
+| Background maintenance | `background` |
+
+Each token has its own frames, cadence, and theme-specific foreground color under `UiTokenContract.motion`. Approval, queued, success, failure, cancellation, and blocked states remain static status symbols. Plain, CI, dumb-terminal, and non-TTY paths remain non-animated and color-free.
+
 `src/cli/rawPromptRenderLoop.ts` is now a terminal diff adapter. It may write
 cursor movement and clear-line escape sequences as part of the managed TTY
 adapter, but it does not own prompt/status/slash/attachment composition.
@@ -668,7 +816,8 @@ Do not reintroduce:
 - tool activity caps in the live active-work model;
 - approval controls that grant permission directly from UI state;
 - steering paths that treat `Ctrl+C` as steer submit/cancel;
-- workspace/trust/setup/tool/approval/steer/channel data in the persistent rail.
+- workspace trust/configuration, setup, tool, approval, steer, or channel data
+  in the persistent rail; only the bounded workspace identity label belongs there.
 
 ## Failure, Debug, And Audit Guidance
 

@@ -1,20 +1,23 @@
 import type { RegisteredTool, SessionToolProvider, ToolExecutionContext, ToolsetName } from "../contracts/tool.js";
-import type { DelegateModelOverride, DelegateRole, DelegateTaskItem, DelegationConfig } from "../contracts/delegation.js";
+import type {
+  DelegateModelOverride,
+  DelegateRole,
+  DelegateSynthesis,
+  DelegateTaskItem,
+  DelegationConfig
+} from "../contracts/delegation.js";
 import {
   DELEGATE_TASK_MAX_RESULT_CHARS,
   MAX_DELEGATION_BATCH_TASKS,
   MAX_DELEGATE_MODEL_OVERRIDE_ID_LENGTH,
   MAX_DELEGATE_PROVIDER_OVERRIDE_ID_LENGTH
 } from "../contracts/delegation.js";
-import type { BatchDelegationSummary, DelegationManager } from "../delegation/delegation-manager.js";
+import type { DurableDelegationService } from "../delegation/durable-delegation-service.js";
+import type { TaskExecutionPreference } from "../contracts/task.js";
 import { DEFAULT_DELEGATION_CONFIG } from "../config/delegation-defaults.js";
 
-const FAILED_DELEGATION_DETAIL_MAX_CHARS = 800;
-
 export type DelegationToolOptions = {
-  manager: DelegationManager;
-  parentSessionId: string | (() => string);
-  profileId: string;
+  service: DurableDelegationService;
   trustedWorkspace: () => Promise<boolean> | boolean;
   delegationConfig?: DelegationConfig;
 };
@@ -27,6 +30,9 @@ type DelegateTaskInput = {
   allowedTools?: string[];
   role?: DelegateRole;
   modelOverride?: DelegateModelOverride;
+  synthesis?: unknown;
+  executionPreference?: TaskExecutionPreference;
+  spendingLimit?: unknown;
 };
 
 export function createDelegationTools(options: DelegationToolOptions): RegisteredTool[] {
@@ -39,9 +45,12 @@ export function createDelegationTools(options: DelegationToolOptions): Registere
     {
       name: "delegate_task",
       description: [
-        "Create isolated child sessions for bounded subtasks with explicit context and tool access.",
+        "Create durable Tasks for bounded subtasks with explicit context and tool access.",
+        "Returns a Task handle immediately; use Task status and result surfaces to follow completion.",
         `Supports one task or up to ${delegationConfig.maxBatchTasks} batch tasks.`,
-        `Runs at most ${delegationConfig.maxConcurrentChildren} children in parallel.`,
+        "Batches add one fixed terminal synthesis Step by default; pass synthesis: false only for inspection-only work.",
+        "A synthesis object can provide a custom final-answer objective and model.",
+        `The durable scheduler runs at most ${delegationConfig.maxConcurrentChildren} Steps in parallel.`,
         `Child delegation depth is limited to ${delegationConfig.maxSpawnDepth}.`
       ].join(" "),
       inputSchema: {
@@ -88,7 +97,36 @@ export function createDelegationTools(options: DelegationToolOptions): Registere
             type: "string",
             enum: ["leaf", "orchestrator"]
           },
-          modelOverride: modelOverrideSchema()
+          modelOverride: modelOverrideSchema(),
+          synthesis: {
+            description: "Batch default: synthesize all worker Results into one final answer. Use false only when no combined answer should be produced.",
+            oneOf: [
+              {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  objective: { type: "string", minLength: 1 },
+                  modelOverride: modelOverrideSchema()
+                },
+                required: ["objective"]
+              },
+              { type: "boolean", const: false }
+            ]
+          },
+          executionPreference: {
+            type: "string",
+            enum: ["auto", "background"],
+            description: "auto starts in the interactive host when available; background sends the Task directly to the gateway."
+          },
+          spendingLimit: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              maxEstimatedCostUsd: { type: "number", minimum: 0 }
+            },
+            required: ["maxEstimatedCostUsd"],
+            description: "Optional estimated-cost ceiling for this root Task. It may narrow, but never widen, the configured default."
+          }
         }
       },
       riskClass: "shared-state-mutation",
@@ -101,47 +139,61 @@ export function createDelegationTools(options: DelegationToolOptions): Registere
         if (!parsed.ok) {
           return parsed.error;
         }
-
-        const common = {
-          parentSessionId: typeof options.parentSessionId === "function" ? options.parentSessionId() : options.parentSessionId,
-          profileId: options.profileId,
-          trustedWorkspace: await options.trustedWorkspace(),
-          signal: context?.signal,
-          onEvent: context?.onEvent
-        };
-
-        if (parsed.mode === "batch") {
-          const summary = await options.manager.delegateBatch({
-            ...common,
-            tasks: parsed.tasks,
-            recoveredTasksFromJsonString: parsed.recoveredTasksFromJsonString
-          });
-
-          return {
-            ok: summary.status === "completed",
-            content: renderBatchContent(summary),
-            metadata: summary
-          };
+        if (context?.toolCallId === undefined) {
+          return structuredValidationError(
+            "delegate_task requires a stable provider tool call ID for idempotent Task creation.",
+            "missing-tool-call-id"
+          );
         }
-
-        const summary = await options.manager.delegate({
-          ...common,
+        const tasks: DelegateTaskItem[] = parsed.mode === "batch" ? parsed.tasks : [{
           task: parsed.task,
           context: input.context,
           allowedToolsets: input.allowedToolsets,
           allowedTools: input.allowedTools,
           role: input.role ?? "leaf",
           modelOverride: parsed.modelOverride
+        }];
+        const handle = await options.service.createAndActivate({
+          toolCallId: context.toolCallId,
+          ...(context.visibleTurnId === undefined ? {} : { originTurnId: context.visibleTurnId }),
+          tasks,
+          ...(parsed.synthesis === undefined ? {} : { synthesis: parsed.synthesis }),
+          trustedWorkspace: await options.trustedWorkspace(),
+          executionPreference: input.executionPreference,
+          ...(parsed.spendingLimit === undefined ? {} : { spendingLimit: parsed.spendingLimit }),
+          ...(parsed.mode === "batch" && parsed.recoveredTasksFromJsonString === true
+            ? { recoveredTasksFromJsonString: true }
+            : {})
         });
-
+        const settled = ["completed", "partial", "failed", "cancelled"].includes(handle.status);
         return {
-          ok: summary.status === "completed",
+          ok: true,
           content: [
-            `Delegated to child session ${summary.childSessionId}.`,
-            `Status: ${summary.status}`,
-            summary.summary
+            `Created durable Task ${handle.taskId}.`,
+            `Status: ${handle.status}`,
+            `Execution: ${settled ? "settled" : handle.execution}`,
+            `Execution preference: ${handle.executionPreference}`,
+            `Background continuation: ${handle.backgroundContinuation}`,
+            ...(handle.activationFailure === undefined ? [] : [
+              "Foreground activation failed after durable Task creation; use this Task handle to inspect or resume it."
+            ]),
+            ...(handle.executionWaitingReason === undefined ? [] : [`Waiting reason: ${handle.executionWaitingReason}`]),
+            `Steps: ${handle.stepCount}`,
+            ...(handle.synthesisStepId === undefined ? [] : [
+              `Workers: ${handle.workerStepIds.length}`,
+              `Synthesis Step: ${handle.synthesisStepId}`
+            ]),
+            handle.childTask
+              ? `Parent Task: ${handle.parentTaskId}`
+              : settled
+                ? "Task is settled and its durable results are available through Task result surfaces."
+                : handle.execution === "foreground"
+                  ? "Task is running in this session and its progress is durable."
+                  : handle.backgroundContinuation === "available"
+                    ? "Task is durable and available for background continuation."
+                    : "Task is durable, but no active background continuation was detected."
           ].join("\n"),
-          metadata: summary
+          metadata: handle
         };
       }
     }
@@ -152,10 +204,9 @@ export const delegationToolProvider: SessionToolProvider = {
   name: "delegation",
   kind: "session",
   createTools(ctx) {
+    if (ctx.delegationService === undefined) return [];
     return createDelegationTools({
-      manager: requireProviderDependency("delegation", "delegationManager", ctx.delegationManager),
-      parentSessionId: ctx.currentSessionId,
-      profileId: ctx.profileId,
+      service: ctx.delegationService,
       trustedWorkspace: requireProviderDependency("delegation", "trustedWorkspace", ctx.trustedWorkspace),
       delegationConfig: ctx.delegationConfig
     });
@@ -169,12 +220,31 @@ function requireProviderDependency<T>(provider: string, dependency: string, valu
   return value;
 }
 
+type ParsedSpendingLimit = { maxEstimatedCostUsd: number };
+
 type ParsedDelegateTaskInput =
-  | { ok: true; mode: "single"; task: string; modelOverride?: DelegateModelOverride }
-  | { ok: true; mode: "batch"; tasks: DelegateTaskItem[]; recoveredTasksFromJsonString?: boolean }
+  | { ok: true; mode: "single"; task: string; modelOverride?: DelegateModelOverride; synthesis?: DelegateSynthesis | false; spendingLimit?: ParsedSpendingLimit }
+  | { ok: true; mode: "batch"; tasks: DelegateTaskItem[]; synthesis?: DelegateSynthesis | false; spendingLimit?: ParsedSpendingLimit; recoveredTasksFromJsonString?: boolean }
   | { ok: false; error: { ok: false; content: string; metadata: Record<string, unknown> } };
 
 function parseDelegateTaskInput(input: DelegateTaskInput, config: DelegationConfig): ParsedDelegateTaskInput {
+  if (input.executionPreference !== undefined && input.executionPreference !== "auto" && input.executionPreference !== "background") {
+    return {
+      ok: false,
+      error: structuredValidationError(
+        "delegate_task executionPreference must be auto or background.",
+        "invalid-execution-preference"
+      )
+    };
+  }
+  const spendingLimit = normalizeSpendingLimit(input.spendingLimit);
+  if (!spendingLimit.ok) {
+    return { ok: false, error: structuredValidationError(spendingLimit.message, spendingLimit.code) };
+  }
+  const synthesis = normalizeSynthesis(input.synthesis);
+  if (!synthesis.ok) {
+    return { ok: false, error: structuredValidationError(synthesis.message, synthesis.code) };
+  }
   if (input.tasks !== undefined) {
     const recovered = recoverTasks(input.tasks, config);
     if (!recovered.ok) {
@@ -194,6 +264,8 @@ function parseDelegateTaskInput(input: DelegateTaskInput, config: DelegationConf
       ok: true,
       mode: "batch",
       tasks: normalized.tasks,
+      synthesis: synthesis.value,
+      spendingLimit: spendingLimit.value,
       recoveredTasksFromJsonString: recovered.recoveredTasksFromJsonString
     };
   }
@@ -225,7 +297,67 @@ function parseDelegateTaskInput(input: DelegateTaskInput, config: DelegationConf
     ok: true,
     mode: "single",
     task,
-    modelOverride: modelOverride.value
+    modelOverride: modelOverride.value,
+    synthesis: synthesis.value,
+    spendingLimit: spendingLimit.value
+  };
+}
+
+function normalizeSpendingLimit(
+  value: unknown
+): { ok: true; value?: ParsedSpendingLimit } | { ok: false; code: string; message: string } {
+  if (value === undefined) return { ok: true };
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ok: false, code: "invalid-spending-limit", message: "delegate_task spendingLimit must be an object." };
+  }
+  const record = value as Record<string, unknown>;
+  const unknownKeys = Object.keys(record).filter((key) => key !== "maxEstimatedCostUsd");
+  if (unknownKeys.length > 0) {
+    return {
+      ok: false,
+      code: "invalid-spending-limit",
+      message: `delegate_task spendingLimit contains unknown fields: ${unknownKeys.join(", ")}.`
+    };
+  }
+  if (typeof record.maxEstimatedCostUsd !== "number" ||
+      !Number.isFinite(record.maxEstimatedCostUsd) || record.maxEstimatedCostUsd < 0) {
+    return {
+      ok: false,
+      code: "invalid-spending-limit",
+      message: "delegate_task spendingLimit.maxEstimatedCostUsd must be a finite non-negative number."
+    };
+  }
+  return { ok: true, value: { maxEstimatedCostUsd: record.maxEstimatedCostUsd } };
+}
+
+function normalizeSynthesis(
+  value: unknown
+): { ok: true; value?: DelegateSynthesis | false } | { ok: false; code: string; message: string } {
+  if (value === undefined) return { ok: true };
+  if (value === false) return { ok: true, value: false };
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ok: false, code: "invalid-synthesis", message: "delegate_task synthesis must be an object or false." };
+  }
+  const record = value as Record<string, unknown>;
+  const unknownKeys = Object.keys(record).filter((key) => key !== "objective" && key !== "modelOverride");
+  if (unknownKeys.length > 0) {
+    return {
+      ok: false,
+      code: "invalid-synthesis",
+      message: `delegate_task synthesis contains unknown fields: ${unknownKeys.join(", ")}.`
+    };
+  }
+  if (typeof record.objective !== "string" || record.objective.trim().length === 0) {
+    return { ok: false, code: "invalid-synthesis", message: "delegate_task synthesis.objective must be non-empty." };
+  }
+  const modelOverride = normalizeModelOverride(record.modelOverride, "delegate_task synthesis.modelOverride");
+  if (!modelOverride.ok) return modelOverride;
+  return {
+    ok: true,
+    value: {
+      objective: record.objective.trim(),
+      ...(modelOverride.value === undefined ? {} : { modelOverride: modelOverride.value })
+    }
   };
 }
 
@@ -449,90 +581,4 @@ function structuredValidationError(message: string, code: string): { ok: false; 
       code
     }
   };
-}
-
-function renderBatchContent(summary: BatchDelegationSummary): string {
-  const batchHeader = [
-    `Delegated batch ${summary.batchId}.`,
-    `Status: ${summary.status}`,
-    summary.summary
-  ].join("\n");
-  if (summary.results.length === 0) {
-    return batchHeader;
-  }
-
-  const resultPrefixes = summary.results.map((result) => `\n${result.index + 1}. ${result.childStatus}\n`);
-  const detailBudget = Math.max(
-    0,
-    DELEGATE_TASK_MAX_RESULT_CHARS - batchHeader.length - resultPrefixes.reduce((total, prefix) => total + prefix.length, 0)
-  );
-  const requestedBudgets = summary.results.map((result) =>
-    result.childStatus === "completed"
-      ? result.summary.length
-      : Math.min(result.summary.length, FAILED_DELEGATION_DETAIL_MAX_CHARS)
-  );
-  const allocatedBudgets = allocateFairBudgets(requestedBudgets, detailBudget);
-
-  return summary.results.reduce(
-    (content, result, index) =>
-      `${content}${resultPrefixes[index]}${renderBoundedDelegationDetail(result.summary, allocatedBudgets[index] ?? 0)}`,
-    batchHeader
-  );
-}
-
-function allocateFairBudgets(requestedBudgets: readonly number[], totalBudget: number): number[] {
-  const allocations = requestedBudgets.map(() => 0);
-  const pending = requestedBudgets.map((_, index) => index);
-  let remainingBudget = Math.max(0, totalBudget);
-
-  while (pending.length > 0 && remainingBudget > 0) {
-    const equalShare = Math.floor(remainingBudget / pending.length);
-    const satisfied = pending.filter((index) => (requestedBudgets[index] ?? 0) <= equalShare);
-
-    if (satisfied.length === 0) {
-      for (const index of pending) {
-        allocations[index] = equalShare;
-      }
-      let remainder = remainingBudget - equalShare * pending.length;
-      for (const index of pending) {
-        if (remainder === 0) break;
-        allocations[index] = (allocations[index] ?? 0) + 1;
-        remainder -= 1;
-      }
-      break;
-    }
-
-    const satisfiedIndexes = new Set(satisfied);
-    for (const index of satisfied) {
-      const allocation = requestedBudgets[index] ?? 0;
-      allocations[index] = allocation;
-      remainingBudget -= allocation;
-    }
-    for (let index = pending.length - 1; index >= 0; index -= 1) {
-      if (satisfiedIndexes.has(pending[index]!)) {
-        pending.splice(index, 1);
-      }
-    }
-  }
-
-  return allocations;
-}
-
-function renderBoundedDelegationDetail(detail: string, maxChars: number): string {
-  if (detail.length <= maxChars) {
-    return detail;
-  }
-  if (maxChars <= 0) {
-    return "";
-  }
-
-  const marker = `\n... (${detail.length} chars total, truncated)`;
-  if (marker.length <= maxChars) {
-    return `${detail.slice(0, maxChars - marker.length)}${marker}`;
-  }
-
-  const compactMarker = "[truncated]";
-  return compactMarker.length <= maxChars
-    ? compactMarker
-    : ".".repeat(maxChars);
 }

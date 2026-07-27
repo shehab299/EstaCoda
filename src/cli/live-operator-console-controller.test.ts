@@ -4,6 +4,7 @@ import {
   createDefaultStatusRailState,
   createOperatorConsoleRuntimeHost,
   createOperatorConsoleStyle,
+  type TaskCardState,
 } from "../ui/papyrus/operator-console/index.js";
 import { LiveOperatorConsoleController } from "./live-operator-console-controller.js";
 
@@ -12,18 +13,71 @@ describe("LiveOperatorConsoleController", () => {
     vi.useRealTimers();
   });
 
-  it("advances visible spinner frames on a timer while activity is active", () => {
+  it("advances visible motion from elapsed time and the token cadence", () => {
+    vi.useFakeTimers();
+    const output = createOutput();
+    const { controller, runtimeHost } = createControllerFixture(output);
+
+    controller.setTurnActivity({ phase: "thinking" });
+    expect(stripAnsi(output.text())).toContain("◜");
+
+    output.clear();
+    vi.advanceTimersByTime(120);
+
+    expect(stripAnsi(output.text())).toContain("◠");
+    expect(runtimeHost.getState().motionElapsedMs).toBe(120);
+  });
+
+  it("does not redraw between visible frame changes", () => {
     vi.useFakeTimers();
     const output = createOutput();
     const controller = createController(output);
 
     controller.setTurnActivity({ phase: "thinking" });
-    expect(stripAnsi(output.text())).toContain("⣾⣷");
+    output.clear();
+    vi.advanceTimersByTime(105);
 
+    expect(output.text()).toBe("");
+  });
+
+  it("retries a frame change that was temporarily coalesced", () => {
+    vi.useFakeTimers();
+    const output = createOutput();
+    const controller = createController(output);
+
+    controller.setTurnActivity({ phase: "thinking" });
+    vi.advanceTimersByTime(115);
+    controller.refresh();
+    output.clear();
+
+    vi.advanceTimersByTime(20);
+
+    expect(stripAnsi(output.text())).toContain("◠");
+  });
+
+  it("does not run the motion clock for hidden tool activity", () => {
+    vi.useFakeTimers();
+    const output = createOutput();
+    const controller = createController(output);
+
+    controller.applyActiveWorkEvent({ id: "read", toolName: "read_file", status: "running" });
+    output.clear();
+    vi.advanceTimersByTime(180);
+
+    expect(output.text()).toBe("");
+  });
+
+  it("animates a running tool once its inline trail is visible", () => {
+    vi.useFakeTimers();
+    const output = createOutput();
+    const controller = createController(output);
+
+    controller.appendStreamingText("I will inspect this first.");
+    controller.applyActiveWorkEvent({ id: "read", toolName: "read_file", status: "running" });
     output.clear();
     vi.advanceTimersByTime(90);
 
-    expect(stripAnsi(output.text())).toContain("⣽⣯");
+    expect(stripAnsi(output.text())).toContain("◷");
   });
 
   it("stops the animation timer when the live frame is cleared", () => {
@@ -106,6 +160,185 @@ describe("LiveOperatorConsoleController", () => {
     nowMs = 9_000;
     const completed = controller.completeActiveWork();
     expect(completed?.completedAtMs).toBe(9_000);
+  });
+
+  it("renders retained durable Task cards while the foreground turn is active", () => {
+    const output = createOutput();
+    const { controller, runtimeHost } = createControllerFixture(output, {
+      getTasks: () => [makeLiveTask()],
+    });
+
+    controller.setTurnActivity({ phase: "provider" });
+
+    expect(runtimeHost.getState().tasks.cards[0]?.taskId).toBe("T-live-1");
+    expect(stripAnsi(output.text())).toContain("Research competitor");
+  });
+
+  it("keeps durable Subagent motion active without transient delegation work", () => {
+    vi.useFakeTimers();
+    const output = createOutput();
+    const task = makeLiveTaskWithSubagent();
+    const { controller, runtimeHost } = createControllerFixture(output, {
+      getTasks: () => [task],
+    });
+
+    controller.refresh();
+    expect(stripAnsi(output.text())).toContain("• Subagent 1");
+    controller.resetActiveWork();
+    output.clear();
+    vi.advanceTimersByTime(105);
+
+    expect(runtimeHost.getState().activeWork.items).toEqual([]);
+    expect(stripAnsi(output.text())).toContain("● Subagent 1");
+  });
+
+  it("refreshes durable Task snapshots on their own timer", () => {
+    vi.useFakeTimers();
+    const output = createOutput();
+    let task = makeLiveTaskWithSubagent();
+    const refreshTasks = vi.fn(() => {
+      if (refreshTasks.mock.calls.length > 1) {
+        task = makeLiveTask({ status: "completed", phase: { name: "completed" } });
+      }
+      return true;
+    });
+    const { controller, runtimeHost } = createControllerFixture(output, {
+      getTasks: () => [task],
+      refreshTasks,
+      taskRefreshIntervalMs: 750,
+    });
+
+    expect(refreshTasks).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(750);
+
+    expect(refreshTasks).toHaveBeenCalledTimes(2);
+    expect(runtimeHost.getState().tasks.cards[0]?.status).toBe("completed");
+    controller.clear();
+  });
+
+  it("preserves Task inspection across live usage refresh and terminal resize", () => {
+    const output = createOutput();
+    let task = makeLiveTask({
+      trace: {
+        events: [
+          { eventId: "event-1", kind: "read", label: "Read first file", category: "read", timestamp: "2026-07-20T10:00:00.000Z" },
+          { eventId: "event-2", kind: "answer", label: "Summarized first file", category: "answer", timestamp: "2026-07-20T10:01:00.000Z" },
+        ],
+        hasEarlierEvents: false,
+      },
+    });
+    const { controller, runtimeHost } = createControllerFixture(output, {
+      getTasks: () => [task],
+    });
+
+    controller.refresh();
+    controller.routeInput({ type: "key", key: "tab" });
+    controller.routeInput({ type: "key", key: "enter" });
+    controller.routeInput({ type: "key", key: "left" });
+    expect(runtimeHost.getState().tasks.inspection).toMatchObject({
+      followLive: false,
+      selectedTraceEventId: "event-1",
+    });
+
+    output.resize(48, 16);
+    task = {
+      ...task,
+      status: "completed",
+      usage: {
+        providerCalls: 2,
+        totalTokens: 900,
+        estimatedCostUsd: 0.042,
+        usageComplete: true,
+        pricingComplete: true,
+      },
+      trace: {
+        events: [
+          ...task.trace.events,
+          { eventId: "event-3", kind: "finish", label: "Finished Task", category: "finish", timestamp: "2026-07-20T10:02:00.000Z" },
+        ],
+        hasEarlierEvents: false,
+      },
+    };
+    controller.refresh();
+
+    const state = runtimeHost.getState();
+    expect(state.terminal).toMatchObject({ width: 48, height: 16, isTty: true });
+    expect(state.tasks.inspectedTaskId).toBe("T-live-1");
+    expect(state.tasks.inspection).toMatchObject({
+      followLive: false,
+      selectedTraceEventId: "event-1",
+    });
+    expect(state.tasks.cards[0]).toMatchObject({
+      status: "completed",
+      usage: { totalTokens: 900, estimatedCostUsd: 0.042 },
+    });
+    const text = stripAnsi(output.text());
+    expect(text).toContain("Read first file");
+    expect(text).toContain("Return to live");
+    expect(text).not.toContain("Finished Task");
+  });
+
+  it("returns prompt editing and hard interrupts after active Task inspection", () => {
+    const output = createOutput();
+    const { controller, runtimeHost } = createControllerFixture(output, {
+      getTasks: () => [makeLiveTask()],
+    });
+    controller.setTurnActivity({ phase: "provider" });
+
+    expect(controller.routeInput({ type: "text", text: "a" })).toBe(false);
+    expect(controller.routeInput({ type: "key", key: "tab" })).toBe(true);
+    expect(runtimeHost.getState().focus.target.kind).toBe("taskCard");
+    expect(controller.routeInput({ type: "key", key: "enter" })).toBe(true);
+    expect(runtimeHost.getState().tasks.inspectedTaskId).toBe("T-live-1");
+    expect(controller.routeInput({ type: "key", key: "escape" })).toBe(true);
+    expect(runtimeHost.getState().tasks.inspectedTaskId).toBeUndefined();
+    expect(runtimeHost.getState().focus.target).toEqual({ kind: "taskCard", taskId: "T-live-1" });
+
+    output.clear();
+    expect(controller.routeInput({ type: "key", key: "backspace" })).toBe(false);
+    expect(runtimeHost.getState().focus.target).toEqual({ kind: "prompt" });
+    expect(output.text()).not.toBe("");
+
+    expect(controller.routeInput({ type: "key", key: "tab" })).toBe(true);
+    expect(controller.routeInput({ type: "key", key: "c", ctrl: true })).toBe(false);
+    expect(runtimeHost.getState().focus.target).toEqual({ kind: "taskCard", taskId: "T-live-1" });
+
+    output.clear();
+    expect(controller.routeInput({ type: "key", key: "down" })).toBe(true);
+    expect(output.text()).toBe("");
+  });
+
+  it("captures the mouse only for explicit Task interaction and releases before steering text", () => {
+    const output = createOutput();
+    const mouseChanges: boolean[] = [];
+    const { controller, runtimeHost } = createControllerFixture(output, {
+      getTasks: () => [makeLiveTask()],
+      onMouseModeChange: (active) => mouseChanges.push(active),
+    });
+    controller.setTurnActivity({ phase: "provider" });
+
+    expect(controller.routeInput({ type: "key", key: "g", ctrl: true })).toBe(true);
+    expect(mouseChanges).toEqual([true]);
+    expect(runtimeHost.getState().tasks.mouseModeActive).toBe(true);
+    expect(stripAnsi(output.text())).toContain("[Mouse Mode]");
+
+    output.clear();
+    expect(controller.routeInput({
+      type: "mouse",
+      action: "release",
+      button: "primary",
+      x: 0,
+      y: 0,
+    })).toBe(true);
+    expect(output.text()).toBe("");
+
+    expect(controller.routeInput({ type: "text", text: "x" })).toBe(false);
+    expect(mouseChanges).toEqual([true, false]);
+    expect(runtimeHost.getState().tasks.mouseModeActive).toBeUndefined();
+
+    expect(controller.routeInput({ type: "key", key: "g", ctrl: true })).toBe(true);
+    expect(controller.routeInput({ type: "key", key: "escape" })).toBe(true);
+    expect(mouseChanges).toEqual([true, false, true, false]);
   });
 
   it("batches streaming text into the live frame", () => {
@@ -462,8 +695,8 @@ describe("LiveOperatorConsoleController", () => {
     const lines = runtimeHost.render().lines;
     const text = stripAnsi(lines.join("\n"));
 
-    expect(runtimeHost.getState().terminal.height).toBe(12);
-    expect(lines.length).toBeLessThanOrEqual(12);
+    expect(runtimeHost.getState().terminal.height).toBe(24);
+    expect(lines.length).toBeLessThanOrEqual(24);
     expect(text).not.toContain("Running tools");
     expect(text).toContain("read_file");
     expect(text).toContain("src/file-19.ts");
@@ -478,6 +711,7 @@ function createController(
   options: Pick<
     ConstructorParameters<typeof LiveOperatorConsoleController>[0],
     "animationIntervalMs" | "now" | "streamingRefreshIntervalMs" | "turnStartedAtMs"
+      | "getTasks" | "refreshTasks" | "taskRefreshIntervalMs" | "onMouseModeChange"
   > = {}
 ): LiveOperatorConsoleController {
   return createControllerFixture(output, options).controller;
@@ -488,6 +722,7 @@ function createControllerFixture(
   options: Pick<
     ConstructorParameters<typeof LiveOperatorConsoleController>[0],
     "animationIntervalMs" | "now" | "streamingRefreshIntervalMs" | "turnStartedAtMs"
+      | "getTasks" | "refreshTasks" | "taskRefreshIntervalMs" | "onMouseModeChange"
   > = {}
 ): {
   readonly controller: LiveOperatorConsoleController;
@@ -508,7 +743,7 @@ function createControllerFixture(
     runtimeHost,
     terminal: { width: 80, height: 12, isTty: true },
     capabilities: { supportsAnimation: true },
-    animationIntervalMs: 90,
+    animationIntervalMs: 15,
     getStatus: () => status,
     ...options,
   });
@@ -522,11 +757,18 @@ function createOutput(): {
   write: (chunk: string | Uint8Array) => boolean;
   text: () => string;
   clear: () => void;
+  resize: (columns: number, rows: number) => void;
 } {
   const writes: string[] = [];
+  let columns = 80;
+  let rows = 24;
   return {
-    columns: 80,
-    rows: 24,
+    get columns() {
+      return columns;
+    },
+    get rows() {
+      return rows;
+    },
     isTTY: true,
     write: (chunk: string | Uint8Array) => {
       writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
@@ -536,6 +778,91 @@ function createOutput(): {
     clear: () => {
       writes.length = 0;
     },
+    resize: (nextColumns: number, nextRows: number) => {
+      columns = nextColumns;
+      rows = nextRows;
+    },
+  };
+}
+
+function makeLiveTask(overrides: Partial<TaskCardState> = {}): TaskCardState {
+  const usage = {
+    providerCalls: 1,
+    totalTokens: 100,
+    estimatedCostUsd: 0.001,
+    usageComplete: true,
+    pricingComplete: true,
+  } as const;
+  return {
+    taskId: "T-live-1",
+    objective: "Research competitor",
+    status: "running",
+    executionPreference: "auto",
+    execution: "foreground",
+    foregroundOwnerActive: true,
+    backgroundContinuation: "available",
+    progress: { completed: 0, skipped: 0, total: 1 },
+    steps: [{
+      stepId: "step-1",
+      position: 0,
+      title: "Research Company A",
+      objective: "Research Company A",
+      executorRole: "worker",
+      status: "running",
+      dependsOn: [],
+      childTaskPolicy: "forbid",
+      usage,
+      attempts: [],
+      activeAttempt: {
+        attemptId: "attempt-1",
+        taskId: "T-live-1",
+        stepId: "step-1",
+        attemptNumber: 1,
+        status: "running",
+        createdAt: "2026-07-20T10:00:00.000Z",
+        updatedAt: "2026-07-20T10:00:03.000Z",
+        startedAt: "2026-07-20T10:00:00.000Z",
+        elapsedMs: 3_000,
+        usage,
+      },
+    }],
+    subagents: [],
+    trace: { events: [], hasEarlierEvents: false },
+    childTasks: [],
+    recentActivity: [],
+    currentToolCategory: "browser",
+    elapsedMs: 3_000,
+    usage,
+    results: [],
+    createdAt: "2026-07-20T10:00:00.000Z",
+    updatedAt: "2026-07-20T10:00:03.000Z",
+    ...overrides,
+    phase: overrides.phase ?? { name: "running" },
+  };
+}
+
+function makeLiveTaskWithSubagent(): TaskCardState {
+  const card = makeLiveTask();
+  return {
+    ...card,
+    subagents: [{
+      stepId: "step-1",
+      position: 0,
+      displayIndex: 1,
+      displayLabel: "Subagent 1",
+      title: "Research Company A",
+      objective: "Research Company A",
+      role: "worker",
+      status: "running",
+      dependsOn: [],
+      elapsedMs: 3_000,
+      currentActivity: "Inspecting the repository",
+      currentToolCategory: "read",
+      usage: { total: card.usage, currentAttempt: card.usage },
+      attempts: [],
+      trace: [],
+      results: [],
+    }],
   };
 }
 

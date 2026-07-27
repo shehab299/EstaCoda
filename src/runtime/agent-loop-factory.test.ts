@@ -26,6 +26,11 @@ import {
 describe("DefaultChildAgentLoopFactory", () => {
   it("creates a child session with delegated metadata and suppressed runtime features", async () => {
     const db = new InMemorySessionDB();
+    await db.createSession({
+      id: "parent-1",
+      profileId: "default",
+      spendingLimit: { maxEstimatedCostUsd: 20, warningThresholdPercent: 80 }
+    });
     const built = fakeBuiltSession();
     const builder = fakeBuilder(built);
     const factory = new DefaultChildAgentLoopFactory({
@@ -54,6 +59,8 @@ describe("DefaultChildAgentLoopFactory", () => {
     expect(session).toMatchObject({
       id: "child-1",
       parentSessionId: "parent-1",
+      spendingScopeSessionId: "parent-1",
+      spendingLimit: { maxEstimatedCostUsd: 20, warningThresholdPercent: 80 },
       metadata: {
         kind: "delegated-child",
         parentSessionId: "parent-1",
@@ -77,6 +84,99 @@ describe("DefaultChildAgentLoopFactory", () => {
       "workflowAdapter",
       "projectContext"
     ]));
+  });
+
+  it("records durable Task ownership in Task Step worker sessions", async () => {
+    const db = new InMemorySessionDB();
+    const factory = new DefaultChildAgentLoopFactory({
+      builder: fakeBuilder(fakeBuiltSession()) as never,
+      parentRoutes: parentRoutes(),
+      sessionDb: db,
+      trajectoryRecorderFactory: ({ profileId, sessionId }) => new TrajectoryRecorder({ profileId, sessionId, modelId: "model" }),
+      responseLabel: "EstaCoda",
+      workspaceRoot: "/workspace",
+      id: () => "task-child-1"
+    });
+
+    await factory.createChild({
+      parentSessionId: "parent-1",
+      profileId: "default",
+      task: "Run the durable Step",
+      depth: 3,
+      trustedWorkspace: true,
+      parentVisibleTools: readOnlyParentTools(),
+      taskExecution: {
+        taskId: "task-1",
+        rootTaskId: "task-1",
+        planRevisionId: "revision-1",
+        stepId: "step-1",
+        attemptId: "attempt-1",
+        attemptFencingToken: 1
+      }
+    });
+
+    await expect(db.getSession("task-child-1")).resolves.toMatchObject({
+      title: "Task Step: Run the durable Step",
+      metadata: {
+        kind: "task-step-worker",
+        taskId: "task-1",
+        planRevisionId: "revision-1",
+        stepId: "step-1",
+        attemptId: "attempt-1",
+        depth: 3
+      }
+    });
+  });
+
+  it("reopens only the original open worker session for the same durable Attempt", async () => {
+    const db = new InMemorySessionDB();
+    const factory = new DefaultChildAgentLoopFactory({
+      builder: fakeBuilder(fakeBuiltSession()) as never,
+      parentRoutes: parentRoutes(),
+      sessionDb: db,
+      trajectoryRecorderFactory: ({ profileId, sessionId }) => new TrajectoryRecorder({ profileId, sessionId, modelId: "model" }),
+      responseLabel: "EstaCoda",
+      workspaceRoot: "/workspace",
+      id: () => "task-child-resume"
+    });
+    const taskExecution = {
+      taskId: "task-1",
+      rootTaskId: "task-1",
+      planRevisionId: "revision-1",
+      stepId: "step-1",
+      attemptId: "attempt-1",
+      attemptFencingToken: 1
+    };
+    const first = await factory.createChild({
+      parentSessionId: "parent-1",
+      profileId: "default",
+      task: "Run the durable Step",
+      trustedWorkspace: true,
+      parentVisibleTools: readOnlyParentTools(),
+      taskExecution
+    });
+
+    const resumed = await factory.createChild({
+      parentSessionId: "parent-1",
+      profileId: "default",
+      task: "Continue the durable Step",
+      trustedWorkspace: true,
+      parentVisibleTools: readOnlyParentTools(),
+      taskExecution,
+      resumeSessionId: first.childSessionId
+    });
+
+    expect(resumed.childSessionId).toBe(first.childSessionId);
+    await expect(db.listSessions("default")).resolves.toHaveLength(1);
+    await expect(factory.createChild({
+      parentSessionId: "parent-1",
+      profileId: "default",
+      task: "Wrong Attempt",
+      trustedWorkspace: true,
+      parentVisibleTools: readOnlyParentTools(),
+      taskExecution: { ...taskExecution, attemptId: "attempt-2" },
+      resumeSessionId: first.childSessionId
+    })).rejects.toThrow("cannot be resumed outside its original Attempt");
   });
 
   it("builds a runnable child loop without parent recall, compression, learning, or full project context", async () => {
@@ -880,7 +980,7 @@ function fakeBuiltSession(): BuiltAgentLoopSession {
     sessionSkillCatalog: [],
     providerTools: [],
     providerRoutes: {},
-    delegationManager: {},
+    delegationService: {},
     sessionRecallService: {},
     memoryFileCompactionService: {}
   } as never;

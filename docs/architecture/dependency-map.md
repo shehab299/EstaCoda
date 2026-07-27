@@ -11,7 +11,7 @@ This page maps the current source directories and the main dependency flow betwe
 
 | Area | Primary files | Role |
 |---|---|---|
-| Contracts | `src/contracts/*.ts` | Shared TypeScript types for providers, tools, channels, sessions, memory, workflow, security, and trajectories. |
+| Contracts | `src/contracts/*.ts` | Shared TypeScript types for providers, tools, channels, sessions, memory, durable Tasks, security, and trajectories. |
 | Runtime | `src/runtime/create-runtime.ts`, `src/runtime/agent-loop.ts`, `src/runtime/provider-turn-loop.ts`, `src/runtime/tool-plan-runner.ts`, `src/runtime/runtime-router.ts` | Runtime composition, turn orchestration, provider turns, tool execution, routing, and runtime cache/fingerprint behavior. |
 | Config | `src/config/runtime-config.ts`, `src/config/profile-home.ts`, `src/config/env-secret-store.ts` | Profile config loading, state-home resolution, credential references, numeric coercion, diagnostics, and config mutation helpers. |
 | Providers | `src/providers/provider-executor.ts`, `src/providers/openai-compatible-provider.ts`, `src/providers/openai-responses-provider.ts`, `src/providers/runtime-credential-resolver.ts` | Provider adapters, route execution, OAuth/credential resolution, model selection, auxiliary routes, and native replay support. |
@@ -21,7 +21,7 @@ This page maps the current source directories and the main dependency flow betwe
 | Session | `src/session/sqlite-session-db.ts`, `src/session/session-recall-service.ts`, `src/session/session-search-service.ts` | Global SQLite session persistence, recall/search, compression state, and profile isolation. |
 | Memory | `src/memory/*` | Profile-local identity/memory files, shared memory, curation, promotion, indexing, recall orchestration, and memory pressure controls. |
 | Skills | `src/skills/*`, `skills/official/**` | Skill loading, registry, playbooks, usage telemetry, proposals, mutation policy, bundled sync, and catalog generation. |
-| Workflow | `src/workflow/*`, `src/cli/workflow-commands.ts` | Explicit durable workflow runs, steps, events, checkpoints, locks, process registry, restart recovery, and operator commands. |
+| Durable Tasks | `src/contracts/task.ts`, `src/tasks/task-*`, `src/cli/task-commands.ts` | Profile-scoped Tasks, Steps, Attempts, events, results, scheduler recovery, background execution, and operator controls. |
 | CLI/UI | `src/cli/*`, `src/ui/*`, `src/theme/*` | Command dispatch, interactive session loop, setup commands, view models, renderers, Operator Console surfaces, bidi handling, and theme tokens. |
 | Setup | `src/setup/**` | Onboarding Wizard, Setup Editor, review/apply pipeline, optional capability setup, verification, and setup copy. |
 | Browser/Web | `src/browser/**`, `src/tools/web-*.ts` | URL safety, local CDP, Browserbase backend, web extraction/search providers, and debug redaction. |
@@ -36,7 +36,7 @@ graph TD
     CLI["CLI / setup / one-shot"] --> Runtime["Runtime"]
     Channels["ChannelGateway + adapters"] --> Runtime
     Cron["Cron runner"] --> Runtime
-    Workflow["Workflow adapter"] --> Runtime
+    Tasks["Durable Task host"] --> Runtime
 
     Runtime --> Config["Config + profile state"]
     Runtime --> Providers["Provider registry/executor"]
@@ -53,13 +53,13 @@ graph TD
     Skills --> Contracts
     Channels --> Contracts
     Session --> Contracts
-    Workflow --> Contracts
+    Tasks --> Contracts
 ```
 
 ## Important Boundaries
 
 - `src/contracts/` should stay mostly type-only. Runtime behavior belongs in subsystem modules.
-- `src/runtime/create-runtime.ts` is still the main composition root. Constructor changes in tools, providers, memory, skills, channels, browser, workflow, or security usually flow through it.
+- `src/runtime/create-runtime.ts` is still the main composition root. Constructor changes in tools, providers, memory, skills, channels, browser, durable Tasks, or security usually flow through it.
 - `AgentLoop` owns turn orchestration. Provider iteration is in `ProviderTurnLoop`; concrete tool execution is in `ToolPlanRunner` and `ToolExecutor`; deterministic native paths are in `NativeToolExecutor`.
 - Runtime config loads one selected profile. Workspace trust gates behavior for a directory; it does not merge project config into the active profile.
 - Channel adapters do not own approval resolution. `ChannelGateway` owns auth, session/surface routing, remote approvals, runtime cache invalidation, and delivery orchestration.

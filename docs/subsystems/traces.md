@@ -37,14 +37,13 @@ The event-kind source of truth is the `TrajectoryEventKind` union in `src/contra
 | Memory | `memory-write`, `memory-conclusion`, `memory-promotion`, `memory-promotion-failed`, `memory-file-compaction`, `session-recall-decision`, `external-memory-recall`, `external-memory-mirror-write` |
 | Security | `security-risk-escalated` |
 | Artifacts | `artifact-created` |
-| Delegation | `delegation-started`, `delegation-finished` |
 | Prompt and history | `prompt-assembled`, `session-history-packed`, `session-history-compressed`, `session-compression-state` |
 | Progress | `progress`, `fallback`, `assistant-output`, `user-correction` |
 | Cancel | `agent-cancelled` |
 
 ### User Corrections
 
-Delegation events are additive and bounded. `delegation-started` / `delegation-finished` are persisted session events for child lifecycle summaries. `delegation-heartbeat` keeps long-running child work visible to the parent without raw token streams. `delegation-diagnostic` points at bounded timeout/stale-heartbeat diagnostics. Runtime `delegation-progress` relays selected child activity such as tool start/result and provider attempt/result summaries with child metadata. After the manager resolves the structured child outcome, it emits a bounded `delegation-result` child event with only `completed`, `blocked`, `failed`, `timeout`, or `cancelled` status; prompt text, provider details, reasons, and tool arguments are excluded.
+Durable delegation lifecycle is recorded in the Task journal, fenced Attempt checkpoints, Task result metadata, and worker trajectories. `delegate_task` itself produces an ordinary bounded tool result containing the queued Task handle; it does not relay a synchronous child lifecycle into the creating turn. A leased worker may append a bounded `delegation-diagnostic` session event for a timeout or stale heartbeat; Task state and settlement remain authoritative in the Task journal.
 
 `user-correction` is a structured trajectory event kind. When the user provides corrective feedback (e.g., "no, do it this way"), the runtime records:
 

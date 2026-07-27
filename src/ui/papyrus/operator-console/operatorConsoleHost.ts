@@ -3,6 +3,7 @@ import type { FocusState } from "./focusModel.js";
 import {
   createInitialOperatorConsoleState,
   type AttachmentCardState,
+  type ApprovalCardState,
   type OperatorConsoleMode,
   type OperatorConsoleState,
   type PromptSurfaceState,
@@ -12,6 +13,7 @@ import {
   type SteerState,
   type StreamingState,
   type TerminalMetrics,
+  type TaskSurfaceState,
   type ToolActivityState,
   type TranscriptBlock,
   type TurnActivityState,
@@ -28,13 +30,17 @@ import type { OperatorConsoleStyle } from "./operatorConsoleStyle.js";
 
 export type OperatorConsoleRawPromptSnapshot = {
   readonly mode?: OperatorConsoleMode;
+  readonly locale?: import("./activeWorkCopy.js").OperatorConsoleLocale;
   readonly prompt: string;
   readonly state: LineEditorState;
   readonly status?: StatusRailState;
+  readonly motionElapsedMs?: number;
   readonly setupPanel?: SetupSurfaceState;
   readonly terminal?: Partial<TerminalMetrics>;
   readonly transcript?: readonly TranscriptBlock[];
   readonly attachments?: readonly AttachmentCardState[];
+  readonly approvals?: readonly ApprovalCardState[];
+  readonly tasks?: TaskSurfaceState;
   readonly turnActivity?: TurnActivityState;
   readonly slash?: SlashMenuState;
   readonly activeWork?: ToolActivityState;
@@ -66,6 +72,7 @@ export function buildOperatorConsoleStateFromRawPrompt(
   const terminal = normalizeTerminal(snapshot.terminal);
   return createInitialOperatorConsoleState({
     mode: snapshot.mode,
+    locale: snapshot.locale,
     terminal,
     setupPanel: snapshot.setupPanel,
     prompt: {
@@ -77,9 +84,12 @@ export function buildOperatorConsoleStateFromRawPrompt(
       ...(snapshot.placeholder === undefined ? {} : { placeholder: snapshot.placeholder }),
     },
     status: snapshot.status ?? createDefaultOperatorConsoleRawPromptStatus(),
+    motionElapsedMs: snapshot.motionElapsedMs,
     transcript: snapshot.transcript ?? [],
     turnActivity: snapshot.turnActivity,
     attachments: snapshot.attachments ?? [],
+    approvals: snapshot.approvals ?? [],
+    tasks: snapshot.tasks,
     activeWork: snapshot.activeWork,
     streaming: snapshot.streaming,
     steer: snapshot.steer,
@@ -116,12 +126,16 @@ export function buildOperatorConsoleRawPromptFrameWithRuntimeHost(
   const terminal = normalizeTerminal(snapshot.terminal);
   host.clear();
   host.setMode(snapshot.mode ?? "session");
+  host.setLocale(snapshot.locale ?? host.getState().locale);
   host.setTerminal(terminal);
   host.setStatus(snapshot.status ?? createDefaultOperatorConsoleRawPromptStatus());
+  host.setMotionElapsedMs(snapshot.motionElapsedMs ?? 0);
   host.setSetupPanel(snapshot.setupPanel);
   host.setTranscript(snapshot.transcript ?? []);
   host.setTurnActivity(snapshot.turnActivity);
   host.setAttachments(snapshot.attachments ?? []);
+  host.setApprovals(snapshot.approvals ?? []);
+  host.setTasks(snapshot.tasks ?? createInitialOperatorConsoleState().tasks);
   host.setSlash(snapshot.slash);
   host.setActiveWork(snapshot.activeWork ?? createInitialOperatorConsoleState().activeWork);
   host.setStreaming(snapshot.streaming);
@@ -175,8 +189,8 @@ function getPromptCursorPosition(
   promptRegionY: number,
   promptRegionHeight: number
 ): { readonly row: number; readonly column: number } {
-  if (promptRegionHeight < 3) return { row: promptRegionY, column: 0 };
   if (isSteerInputActive(state.steer) && state.steer !== undefined) {
+    if (promptRegionHeight < 3) return { row: promptRegionY, column: 0 };
     const metrics = getSteerInputSurfaceMetrics(state.steer, {
       width: state.terminal.width,
       height: promptRegionHeight,
@@ -193,7 +207,7 @@ function getPromptCursorPosition(
   });
   const visibleCursorRow = Math.max(0, metrics.cursorRow - metrics.scrollOffset);
   return {
-    row: promptRegionY + 1 + visibleCursorRow,
+    row: promptRegionY + metrics.contentStartRow + visibleCursorRow,
     column: metrics.cursorColumn,
   };
 }

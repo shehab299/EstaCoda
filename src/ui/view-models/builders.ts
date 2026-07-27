@@ -57,8 +57,6 @@ export interface BuildStatusInput {
   readonly toolCount: number;
   readonly mcpActive: number;
   readonly mcpTotal: number;
-  readonly workflowAvailable: boolean;
-  readonly workflowRunActive: boolean;
   readonly warnings?: readonly WarningErrorViewModel[];
   readonly sections?: readonly ViewModel[];
 }
@@ -74,8 +72,6 @@ export function buildStatusViewModel(input: BuildStatusInput): StatusViewModel {
     skillAutonomy: input.skillAutonomy,
     toolCount: input.toolCount,
     mcp: { active: input.mcpActive, total: input.mcpTotal },
-    workflowAvailable: input.workflowAvailable,
-    workflowRunActive: input.workflowRunActive,
     warnings: input.warnings ?? [],
     sections: input.sections,
   };
@@ -366,6 +362,7 @@ export function buildPlainFallbackViewModel(
 export interface BuildAssistantResponseInput {
   readonly label: string;
   readonly text: string;
+  readonly usageFooter?: string;
   readonly matchedSkills?: readonly string[];
   readonly progress?: readonly string[];
 }
@@ -377,6 +374,7 @@ export function buildAssistantResponseViewModel(
     kind: "assistantResponse",
     label: input.label,
     text: input.text,
+    usageFooter: input.usageFooter,
     matchedSkills: input.matchedSkills,
     progress: input.progress,
   };
@@ -558,6 +556,7 @@ export interface BuildSessionStatusRailInput {
   readonly sessionElapsedMs?: number;
   readonly currentTurnSeconds?: number;
   readonly contextUsage?: { readonly filled?: number; readonly total: number };
+  readonly sessionCost?: SessionStatusRailViewModel["sessionCost"];
 }
 
 export function buildSessionStatusRailViewModel(
@@ -574,6 +573,7 @@ export function buildSessionStatusRailViewModel(
     sessionElapsedMs: input.sessionElapsedMs,
     currentTurnSeconds: input.currentTurnSeconds,
     contextUsage: input.contextUsage,
+    sessionCost: input.sessionCost,
   };
 }
 

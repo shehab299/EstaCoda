@@ -9,13 +9,6 @@ export const kemetBlueSkin: ThemeAwareSkin = {
   shared: {
     glyph: {
       prompt: "›",
-      spinner: {
-        waiting: ["⌦", "◈", "✦", "◉", "☥"],
-        thinking: ["⣾⣷", "⣽⣯", "⣻⣟", "⢿⡿", "⡿⢿", "⣟⣻", "⣯⣽", "⣷⣾"],
-        tool: ["⣾⣷", "⣽⣯", "⣻⣟", "⢿⡿", "⡿⢿", "⣟⣻", "⣯⣽", "⣷⣾"],
-        worker: ["·", "∙", "•", "●", "•", "∙"],
-        background: ["⡀", "⠄", "⠂", "⠁", "⠈", "⠐", "⠠", "⢀"],
-      },
     },
     toolIcon: {
       terminal: "⌘",
@@ -54,8 +47,28 @@ export const kemetBlueSkin: ThemeAwareSkin = {
     severity: {
       info: "#5AACFF",
     },
+    trace: {
+      terminal: "#B0B0B0",
+      search: "#5AACFF",
+      plan: "#B899FF",
+      read: "#7BBFFF",
+      edit: "#40E0D0",
+      answer: "#7BD88F",
+      wait: "#FFB454",
+      finish: "#4CAF50",
+      failed: "#EF5350",
+    },
     text: {
       agentMessage: "#FFFFFF",
+    },
+    motion: {
+      waiting: { color: "#5AACFF" },
+      thinking: { color: "#B899FF" },
+      routing: { color: "#5ED0E6" },
+      tool: { color: "#40E0D0" },
+      worker: { color: "#4EA1FF" },
+      finalizing: { color: "#D7A7FF" },
+      background: { color: "#888888" },
     },
   },
   light: {
@@ -67,6 +80,26 @@ export const kemetBlueSkin: ThemeAwareSkin = {
     },
     severity: {
       info: "#0057D9",
+    },
+    trace: {
+      terminal: "#616161",
+      search: "#0057D9",
+      plan: "#6D28D9",
+      read: "#2563EB",
+      edit: "#008C95",
+      answer: "#2E7D32",
+      wait: "#B45309",
+      finish: "#2E7D32",
+      failed: "#C62828",
+    },
+    motion: {
+      waiting: { color: "#0057D9" },
+      thinking: { color: "#6D28D9" },
+      routing: { color: "#007C91" },
+      tool: { color: "#008C95" },
+      worker: { color: "#2563EB" },
+      finalizing: { color: "#7E22CE" },
+      background: { color: "#757575" },
     },
   },
 };

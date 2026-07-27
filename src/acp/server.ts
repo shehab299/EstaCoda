@@ -8,6 +8,8 @@ import { resolveStateHome } from "../config/state-home.js";
 import { defaultProfileId, readActiveProfile } from "../config/profile-home.js";
 import { assessSecurityPolicy, type SecurityApprovalMode, type SecurityDecision, type SecurityPolicy, type SecurityRequest } from "../contracts/security.js";
 import { ProviderExecutor } from "../providers/provider-executor.js";
+import { createProviderUsageRecorder } from "../providers/provider-usage-ledger.js";
+import { SQLiteProviderSpendController } from "../tasks/sqlite-provider-spend.js";
 import type { SessionDB } from "../contracts/session.js";
 import type { SessionMessage } from "../contracts/session.js";
 import type { Runtime, RuntimeOptions } from "../runtime/create-runtime.js";
@@ -772,6 +774,7 @@ export class AcpServer {
       providerConfigs: config.config.providers,
       auxiliaryModels: config.auxiliaryModels,
       compression: config.compression,
+      budgets: config.budgets,
       externalMemory: config.externalMemory,
       mcpServers: config.mcp.servers,
       browser: config.browser,
@@ -800,7 +803,18 @@ export class AcpServer {
           providerExecutor: new ProviderExecutor({
             registry: config.providerRegistry,
             homeDir: config.homeDir,
-            profileId: config.profileId
+            profileId: config.profileId,
+            ...(this.#sessionDb instanceof SQLiteSessionDB
+              ? { spendController: new SQLiteProviderSpendController({ db: this.#sessionDb.db, profileId: config.profileId }) }
+              : { allowUnenforcedAttributedSpend: true }),
+            usageRecorder: createProviderUsageRecorder({
+              profileId: config.profileId,
+              record: (entries) => this.#sessionDb.recordProviderUsageEntries(entries),
+              resolveSessionBudgetScopeId: async (sessionId) => {
+                const session = await this.#sessionDb.getSession(sessionId);
+                return session?.profileId === config.profileId ? session.spendingScopeSessionId : undefined;
+              }
+            })
           }),
           sessionId: options.sessionId
         }

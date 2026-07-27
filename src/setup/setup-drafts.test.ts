@@ -66,6 +66,7 @@ function state(kind: SetupEntryStateKind, overrides: Partial<SetupEntryState> = 
     stateDirectoryWritable: kind !== "state-not-writable",
     missingCredentials: kind === "missing-secret" ? { envVars: ["OPENAI_API_KEY"], providers: [] } : { envVars: [], providers: [] },
     setupVerification: report,
+    budgets: {},
     warnings: report.warnings,
     blockers: kind === "configured-ready" ? [] : [`${kind} blocker`],
     model: {
@@ -191,8 +192,20 @@ describe("setup draft bundles", () => {
 
     expect(bundle.sourceKind).toBe("setup-editor-plan-session");
     expect(bundle.drafts.length).toBeGreaterThan(0);
+    expect(bundle.drafts.some((draft) => draft.id.endsWith(".edit-budgets"))).toBe(false);
     expect(bundle.drafts.every((draft) => draft.applyIntent.dryRunOnly)).toBe(true);
     expect(bundle.drafts.every((draft) => draft.applyIntent.writesConfig === false)).toBe(true);
+  });
+
+  it("never converts the Budgets navigation action into an apply draft", () => {
+    const decision = routeSetupEntryState(state("configured-ready"));
+    const session = decision.setupEditorPlanSession;
+    if (session === undefined) throw new Error("Expected setup editor plan session");
+    const navigation = session.plan.actions.find((action) => action.id === "edit-budgets");
+    if (navigation === undefined) throw new Error("Expected Budgets navigation action");
+
+    expect(() => buildSetupEditorActionDraftBundle(session, [navigation]))
+      .toThrow(/navigation cannot be converted into an apply draft/i);
   });
 
   it("builds onboarding wizard draft bundles directly from wizard state", () => {

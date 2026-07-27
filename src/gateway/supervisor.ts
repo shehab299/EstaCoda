@@ -17,6 +17,8 @@ import { CronStore } from "../cron/cron-store.js";
 import { CronExecutionStore } from "../cron/cron-execution-store.js";
 import { createFileCronJobLock } from "../cron/cron-lock.js";
 import { ProviderExecutor } from "../providers/provider-executor.js";
+import { createProviderUsageRecorder } from "../providers/provider-usage-ledger.js";
+import { SQLiteProviderSpendController } from "../tasks/sqlite-provider-spend.js";
 import type { MemoryCurationCheckpointResult } from "../memory/memory-curation-service.js";
 import { curateSessionFinalizationJob } from "../memory/session-finalization-curator.js";
 import {
@@ -33,6 +35,7 @@ import { RuntimeCache } from "../runtime/runtime-cache.js";
 import { computeRuntimeFingerprint, stableJsonHash, type RuntimeFingerprint } from "../runtime/runtime-fingerprint.js";
 import { SQLiteSessionDB } from "../session/sqlite-session-db.js";
 import { createSQLiteSessionDB } from "../session/session-setup.js";
+import { createSessionId } from "../session/session-id.js";
 import {
   SessionFinalizationQueue,
   type SessionFinalizationJob,
@@ -98,8 +101,18 @@ import {
   clearGatewayRestartPlannedMarker,
   readGatewayRestartPlannedMarker,
 } from "../runtime/gateway-restart-marker.js";
+import { SQLiteTaskStore } from "../tasks/sqlite-task-store.js";
+import { TaskResultService } from "../tasks/task-result-service.js";
+import { SupervisorTaskBackgroundHost } from "../tasks/supervisor-task-background-host.js";
+import { TaskApprovalService } from "../tasks/task-approval-service.js";
+import { resolveTaskWorkspaceBinding } from "../tasks/task-workspace.js";
 
 export type { GatewayRunOptions, GatewayRunResult };
+
+export type SupervisorTaskHost = Pick<
+  SupervisorTaskBackgroundHost,
+  "runOnce" | "hasPendingWork" | "waitForIdle" | "status" | "dispose"
+>;
 
 export type SupervisorFactories = {
   createTelegramAdapter?(input: ConstructorParameters<typeof TelegramAdapter>[0]): ChannelAdapter;
@@ -108,6 +121,7 @@ export type SupervisorFactories = {
   createWhatsAppAdapter?(input: ConstructorParameters<typeof WhatsAppAdapter>[0]): ChannelAdapter;
   createChannelGateway?(input: ConstructorParameters<typeof ChannelGateway>[0]): ChannelGateway;
   createDeliveryRouter?(input: ConstructorParameters<typeof DeliveryRouter>[0]): DeliveryRouter;
+  createTaskBackgroundHost?(input: ConstructorParameters<typeof SupervisorTaskBackgroundHost>[0]): SupervisorTaskHost;
   tickCron?(input: Parameters<typeof tickCron>[0]): ReturnType<typeof tickCron>;
   finalizeSessionJob?(job: SessionFinalizationJob, signal: AbortSignal): Promise<MemoryCurationCheckpointResult>;
   sleep?(ms: number): Promise<void>;
@@ -157,20 +171,14 @@ export function buildGatewayCronRuntimeOptions(input: GatewayCronRuntimeBaseInpu
     providerConfigs: latestConfig.config.providers,
     auxiliaryModels: latestConfig.auxiliaryModels,
     compression: latestConfig.compression,
+    budgets: latestConfig.budgets,
     externalMemory: latestConfig.externalMemory,
     mcpServers: latestConfig.mcp.servers,
     imageGen: latestConfig.imageGen,
     tts: latestConfig.tts,
     stt: latestConfig.stt,
     securityMode: latestConfig.security.approvalMode,
-    securityAssessor: {
-      ...latestConfig.security.assessor,
-      providerExecutor: new ProviderExecutor({
-        registry: latestConfig.providerRegistry,
-        homeDir: input.homeDir,
-        profileId: input.profileId
-      }),
-    },
+    securityAssessor: latestConfig.security.assessor,
     browser: latestConfig.browser,
     telegramReady: latestConfig.channels.telegram.ready,
     enableWebNetwork: latestConfig.web.enableNetwork,
@@ -190,6 +198,7 @@ export function buildGatewayCronRuntimeOptions(input: GatewayCronRuntimeBaseInpu
     disabledToolsets: [...CRON_FORCED_DISABLED_TOOLSETS],
     enabledToolsets: input.job?.enabledToolsets,
     workspaceTrusted: input.workspaceTrusted ?? false,
+    taskBackgroundContinuation: "available",
   };
   };
   return input.job === undefined ? {
@@ -211,20 +220,14 @@ export function buildGatewayCronRuntimeOptions(input: GatewayCronRuntimeBaseInpu
     providerConfigs: latestConfig.config.providers,
     auxiliaryModels: latestConfig.auxiliaryModels,
     compression: latestConfig.compression,
+    budgets: latestConfig.budgets,
     externalMemory: latestConfig.externalMemory,
     mcpServers: latestConfig.mcp.servers,
     imageGen: latestConfig.imageGen,
     tts: latestConfig.tts,
     stt: latestConfig.stt,
     securityMode: latestConfig.security.approvalMode,
-    securityAssessor: {
-      ...latestConfig.security.assessor,
-      providerExecutor: new ProviderExecutor({
-        registry: latestConfig.providerRegistry,
-        homeDir: input.homeDir,
-        profileId: input.profileId
-      }),
-    },
+    securityAssessor: latestConfig.security.assessor,
     browser: latestConfig.browser,
     telegramReady: latestConfig.channels.telegram.ready,
     enableWebNetwork: latestConfig.web.enableNetwork,
@@ -243,11 +246,13 @@ export function buildGatewayCronRuntimeOptions(input: GatewayCronRuntimeBaseInpu
     disableCronTools: true,
     disabledToolsets: [...CRON_FORCED_DISABLED_TOOLSETS],
     workspaceTrusted: input.workspaceTrusted ?? true,
+    taskBackgroundContinuation: "available",
   } : build();
 }
 
 async function buildGatewaySecurityAssessorConfig(
-  config: LoadedRuntimeConfig
+  config: LoadedRuntimeConfig,
+  sessionDb: SQLiteSessionDB
 ): Promise<SecurityAssessorRuntimeConfig> {
   const mainRoute: ResolvedModelRoute = config.primaryModelRoute ?? {
     provider: config.model.provider,
@@ -261,7 +266,14 @@ async function buildGatewaySecurityAssessorConfig(
       providerExecutor: new ProviderExecutor({
         registry: config.providerRegistry,
         homeDir: config.homeDir,
-        profileId: config.profileId
+        profileId: config.profileId,
+        spendController: new SQLiteProviderSpendController({ db: sessionDb.db, profileId: config.profileId }),
+        usageRecorder: createProviderUsageRecorder({
+          profileId: config.profileId,
+          record: (entries) => sessionDb.recordProviderUsageEntries(entries),
+          resolveSessionBudgetScopeId: async (sessionId) =>
+            (await sessionDb.getSessionForProfile(sessionId, config.profileId))?.spendingScopeSessionId
+        })
       }),
     };
   }
@@ -284,7 +296,14 @@ async function buildGatewaySecurityAssessorConfig(
     providerExecutor: new ProviderExecutor({
       registry: config.providerRegistry,
       homeDir: config.homeDir,
-      profileId: config.profileId
+      profileId: config.profileId,
+      spendController: new SQLiteProviderSpendController({ db: sessionDb.db, profileId: config.profileId }),
+      usageRecorder: createProviderUsageRecorder({
+        profileId: config.profileId,
+        record: (entries) => sessionDb.recordProviderUsageEntries(entries),
+        resolveSessionBudgetScopeId: async (sessionId) =>
+          (await sessionDb.getSessionForProfile(sessionId, config.profileId))?.spendingScopeSessionId
+      })
     }),
   };
 }
@@ -333,6 +352,8 @@ export type SupervisorInternalState = {
   sessionFinalizationWorker?: Pick<SessionFinalizationWorker, "runOnce">;
   sessionFinalizationAbort?: AbortController;
   sessionFinalizationRun?: Promise<SessionFinalizationWorkerResult>;
+  taskBackgroundHost?: SupervisorTaskHost;
+  providerExecutors: Set<ProviderExecutor>;
 };
 
 function logInfo(message: string): void {
@@ -345,6 +366,24 @@ function logWarning(message: string): void {
 
 function logDebug(message: string): void {
   console.debug(message);
+}
+
+async function disposeTaskBackgroundHostWithRetry(taskBackgroundHost: SupervisorTaskHost): Promise<void> {
+  try {
+    await taskBackgroundHost.dispose();
+  } catch (error) {
+    logWarning(`Task background host disposal failed (${boundedErrorClass(error, "task-host-disposal-error")}); retrying once.`);
+    try {
+      await taskBackgroundHost.dispose();
+    } catch (retryError) {
+      logWarning(`Task background host disposal retry failed (${boundedErrorClass(retryError, "task-host-disposal-error")}).`);
+    }
+  }
+}
+
+function boundedErrorClass(error: unknown, fallback: string): string {
+  const name = error instanceof Error ? error.name.trim() : "";
+  return /^[A-Za-z][A-Za-z0-9._:-]{0,63}$/u.test(name) ? name : fallback;
 }
 
 function emitSupervisorHook<N extends GatewayHookEventName>(
@@ -459,6 +498,7 @@ function createInitialState(
     stuckAbortSent: new Set(),
     stuckEventRecorded: new Set(),
     stuckEventsBySession: new Map(),
+    providerExecutors: new Set(),
     cleanupDone: false,
     startupComplete: false,
     drainCancelled: false,
@@ -466,6 +506,7 @@ function createInitialState(
     sessionFinalizationWorker: undefined,
     sessionFinalizationAbort: undefined,
     sessionFinalizationRun: undefined,
+    taskBackgroundHost: undefined,
   };
 }
 
@@ -497,7 +538,21 @@ async function cleanupSupervisorStartupResources(state: SupervisorInternalState)
     try { await state.channelGateway.stop(); } catch { /* ignore */ }
   }
 
-  // 2a. Stop claiming finalization work and give the active provider call a short abort grace.
+  // 2a. Stop accepting Task ticks and preserve the shared DB until active work settles.
+  const taskBackgroundHost = state.taskBackgroundHost;
+  state.taskBackgroundHost = undefined;
+  let taskHostSettled = taskBackgroundHost === undefined || !taskBackgroundHost.hasPendingWork();
+  if (taskBackgroundHost !== undefined && !taskHostSettled) {
+    taskHostSettled = await Promise.race([
+      taskBackgroundHost.waitForIdle().then(() => true, () => true),
+      sleep(state.drainCancelled ? 250 : 5_000).then(() => false)
+    ]);
+  }
+  if (taskBackgroundHost !== undefined && taskHostSettled) {
+    await disposeTaskBackgroundHostWithRetry(taskBackgroundHost);
+  }
+
+  // 2b. Stop claiming finalization work and give the active provider call a short abort grace.
   state.sessionFinalizationAbort?.abort(new Error("gateway-shutdown"));
   const activeFinalization = state.sessionFinalizationRun;
   let finalizationSettled = activeFinalization === undefined;
@@ -524,7 +579,13 @@ async function cleanupSupervisorStartupResources(state: SupervisorInternalState)
     state.runtimeCache = undefined;
   }
 
-  // 4a. Dispose gateway-owned voice preprocessing worker
+  // 4a. Fence any gateway-owned provider dispatch that did not settle during drain.
+  await Promise.all([...state.providerExecutors].map(async (executor) => {
+    try { await executor.dispose(); } catch { /* expired ownership remains conservatively recoverable */ }
+  }));
+  state.providerExecutors.clear();
+
+  // 4b. Dispose gateway-owned voice preprocessing worker
   if (state.gatewayLocalWhisper !== undefined) {
     try { await state.gatewayLocalWhisper.dispose(); } catch { /* ignore */ }
     state.gatewayLocalWhisper = undefined;
@@ -535,8 +596,18 @@ async function cleanupSupervisorStartupResources(state: SupervisorInternalState)
   if (state.sessionDb !== undefined) {
     const sessionDb = state.sessionDb;
     state.sessionDb = undefined;
-    if (activeFinalization !== undefined && !finalizationSettled) {
-      void activeFinalization.finally(() => {
+    if ((activeFinalization !== undefined && !finalizationSettled) || !taskHostSettled) {
+      const pending = [
+        activeFinalization?.then(() => undefined, () => undefined),
+        taskBackgroundHost === undefined || taskHostSettled
+          ? undefined
+          : taskBackgroundHost.waitForIdle()
+              .then(
+                () => disposeTaskBackgroundHostWithRetry(taskBackgroundHost),
+                () => disposeTaskBackgroundHostWithRetry(taskBackgroundHost)
+              )
+      ].filter((value): value is Promise<void> => value !== undefined);
+      void Promise.all(pending).then(() => {
         try { sessionDb.close(); } catch { /* ignore */ }
       });
     } else {
@@ -650,7 +721,14 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
 
   // 3. PID / state write
   await writeGatewayPid(profilePaths, { pid: process.pid, startedAt, version, profileId });
-  await writeGatewayState(profilePaths, { lifecycle: "running", startedAt, pid: process.pid, version, profileId });
+  await writeGatewayState(profilePaths, {
+    lifecycle: "running",
+    startedAt,
+    pid: process.pid,
+    version,
+    profileId,
+    backgroundServices: { tasks: "starting", cron: "starting" }
+  });
 
   // 4. Signal handlers (installed EARLY)
   const shutdown = (signalName?: string) => {
@@ -674,7 +752,14 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
     logInfo(`Shutting down${signalName ? ` (${signalName})` : ""}...`);
 
     state.signalExit = (async () => {
-      await writeGatewayState(profilePaths, { lifecycle: "draining", startedAt, pid: process.pid, version, profileId });
+      await writeGatewayState(profilePaths, {
+        lifecycle: "draining",
+        startedAt,
+        pid: process.pid,
+        version,
+        profileId,
+        backgroundServices: { tasks: "running", cron: "running" }
+      });
       logInfo("Draining, waiting for active turns...");
 
       emitSupervisorHook(state.hookRegistry, "supervisor:drain:start", {
@@ -693,7 +778,8 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
       let drained = false;
 
       while (Date.now() < deadline) {
-        const hasPending = state.channelGateway?.hasPendingWork() ?? false;
+        const hasPending = (state.channelGateway?.hasPendingWork() ?? false) ||
+          (state.taskBackgroundHost?.hasPendingWork() ?? false);
         if (!hasPending) {
           drained = true;
           break;
@@ -793,6 +879,7 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
       providerConfigs: latestConfig.config.providers,
       auxiliaryModels: latestConfig.auxiliaryModels,
       compression: latestConfig.compression,
+      budgets: latestConfig.budgets,
       externalMemory: latestConfig.externalMemory,
       mcpServers: latestConfig.mcp.servers,
       securityPolicy: input.securityPolicy,
@@ -815,6 +902,7 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
         websiteBlocklist: latestConfig.security.websiteBlocklist
       },
       trustStorePath: tsp,
+      taskBackgroundContinuation: "available",
     });
   };
 
@@ -825,7 +913,7 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
 
     if (configured.length === 0) {
       logInfo("Adapters: none");
-      logInfo("Mode: cron-only");
+      logInfo("Mode: background (tasks+cron)");
     }
 
     // 6. Identity derivation + lock acquisition per adapter
@@ -943,6 +1031,19 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
         providerModels
       });
     const hygieneContextWindowTokens = config.compression.summaryModelContextLength ?? config.model.contextWindowTokens ?? 128_000;
+    const sessionHygieneProviderExecutor = new ProviderExecutor({
+      registry: config.providerRegistry,
+      homeDir: config.homeDir,
+      profileId: config.profileId,
+      spendController: new SQLiteProviderSpendController({ db: sessionDb.db, profileId }),
+      usageRecorder: createProviderUsageRecorder({
+        profileId,
+        record: (entries) => sessionDb.recordProviderUsageEntries(entries),
+        resolveSessionBudgetScopeId: async (sessionId) =>
+          (await sessionDb.getSessionForProfile(sessionId, profileId))?.spendingScopeSessionId
+      })
+    });
+    state.providerExecutors.add(sessionHygieneProviderExecutor);
     const sessionHygieneService = new SessionHygieneService({
       sessionDb,
       profileId,
@@ -957,11 +1058,7 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
         },
         route: compressionRoute,
         mainRoute,
-        providerExecutor: new ProviderExecutor({
-          registry: config.providerRegistry,
-          homeDir: config.homeDir,
-          profileId: config.profileId
-        })
+        providerExecutor: sessionHygieneProviderExecutor
       }),
       logWarning
     });
@@ -1217,6 +1314,47 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
 
     const trustStore = new WorkspaceTrustStore({ path: trustStorePath });
     const workspaceTrusted = await trustStore.isTrusted(options.workspaceRoot);
+    const taskStore = new SQLiteTaskStore({ db: sessionDb.db, profileId });
+    const taskResultService = new TaskResultService({
+      store: taskStore,
+      profileId,
+      contentRoot: profilePaths.taskResultsPath,
+      sessionDb
+    });
+    const taskApprovalService = new TaskApprovalService({
+      store: taskStore,
+      queue: gatewayApprovalQueue
+    });
+    const taskBackgroundHostOptions: ConstructorParameters<typeof SupervisorTaskBackgroundHost>[0] = {
+      store: taskStore,
+      resultService: taskResultService,
+      router,
+      ownerId: `gateway-task-host-${process.pid}-${startedAt}`,
+      resolveWorkspace: resolveTaskWorkspaceBinding,
+      isWorkspaceTrusted: (canonicalPath) => trustStore.isTrusted(canonicalPath),
+      approvalService: taskApprovalService,
+      locale: config.ui?.language === "ar" ? "ar" : "en",
+      logWarning,
+      createExecutorRuntime: async (workspace) => {
+        const workspaceTrusted = await trustStore.isTrusted(workspace.canonicalPath);
+        if (!workspaceTrusted) throw new Error("Task workspace trust was revoked before runtime creation.");
+        const latestConfig = await loadConfig();
+        return await createRuntime({
+          ...buildGatewayCronRuntimeOptions({
+            latestConfig,
+            workspaceRoot: workspace.canonicalPath,
+            homeDir,
+            profileId,
+            sessionDb,
+            sessionId: createSessionId(),
+            workspaceTrusted
+          }),
+          closeSessionDbOnDispose: false
+        });
+      }
+    };
+    state.taskBackgroundHost = options.factories?.createTaskBackgroundHost?.(taskBackgroundHostOptions) ??
+      new SupervisorTaskBackgroundHost(taskBackgroundHostOptions);
 
     const authPolicies: ChannelAuthPolicies = {};
     if (telegram.enabled === true) {
@@ -1267,7 +1405,10 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
       idleResetMinutes: telegram.sessionIdleResetMinutes,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     };
-    const gatewaySecurityAssessor = await buildGatewaySecurityAssessorConfig(config);
+    const gatewaySecurityAssessor = await buildGatewaySecurityAssessorConfig(config, sessionDb);
+    if (gatewaySecurityAssessor.providerExecutor instanceof ProviderExecutor) {
+      state.providerExecutors.add(gatewaySecurityAssessor.providerExecutor);
+    }
     const voiceAudit = createVoiceTranscriptionAudit({ profilePaths, hookRegistry, logWarning });
     const gatewayLocalWhisperFor = async (stt: LoadedRuntimeConfig["stt"]) => {
       if (!isFasterWhisperConfig(stt)) {
@@ -1487,6 +1628,14 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
     // 12. Start adapters through ChannelGateway (wrappers swallow errors)
     await gateway.start();
     state.startupComplete = true;
+    await writeGatewayState(profilePaths, {
+      lifecycle: "running",
+      startedAt,
+      pid: process.pid,
+      version,
+      profileId,
+      backgroundServices: { tasks: "running", cron: "running" }
+    });
     await maybeSendGatewayOnlineNotification({
       profilePaths,
       router,
@@ -1503,7 +1652,7 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
       startedAt,
       version,
       adapterKinds: configured.map((c) => c.kind),
-      mode: configured.length === 0 ? "cron-only" : "adapters",
+      mode: configured.length === 0 ? "background" : "adapters+background",
     });
 
     // 12a. Start background timers
@@ -1586,6 +1735,19 @@ export async function runGatewaySupervisor(options: GatewaySupervisorOptions): P
           },
         }),
       });
+      }
+
+      const taskTick = state.draining
+        ? undefined
+        : state.taskBackgroundHost?.runOnce();
+      if (taskTick !== undefined) {
+        if (options.once === true) {
+          await taskTick;
+        } else {
+          void taskTick.catch((error) => {
+            logWarning(`Task background tick failed (${error instanceof Error ? error.name : "task-host-error"}).`);
+          });
+        }
       }
 
       const finalizationTick = runSessionFinalizationTick(state, sessionFinalizationGuard);

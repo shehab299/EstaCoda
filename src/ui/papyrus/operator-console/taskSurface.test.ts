@@ -1,0 +1,1697 @@
+import { describe, expect, it } from "vitest";
+import { resolveTokens } from "../../../theme/token-resolver.js";
+import {
+  createOperatorConsoleStyle,
+  createInitialOperatorConsoleState,
+  createOperatorConsoleLayout,
+  createOperatorConsoleHitRegions,
+  findOperatorConsoleHitRegion,
+  getTaskCardHitTargets,
+  getTaskCardSurfaceDesiredHeight,
+  hasVisibleTaskMotion,
+  reconcileTaskSurfaceState,
+  renderOperatorConsoleTextLines,
+  renderTaskCardSurface,
+  renderTaskInspectionSurface,
+  subagentInspectionContentLines,
+  taskInspectionContentLines,
+  resolveOperatorConsoleInputSurface,
+  routeOperatorConsoleInput,
+  routeTaskSurfaceKey,
+  type TaskCardState,
+  type TaskCardSubagentState,
+} from "./index.js";
+
+describe("durable Task surfaces", () => {
+  it("renders one Subagent as exactly seven borderless grey rows with semantic title and truthful footer", () => {
+    const tokens = resolveTokens("standard", "dark", "kemetBlue");
+    const style = createOperatorConsoleStyle({
+      tokens,
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const card = makeCard({
+      subagents: [makeSubagent(1, {
+        title: "Research how modern AI agents improve themselves autonomously. Cover academic techniques",
+        objective: "Full research objective retained for detailed inspection",
+        assistantPreview: "I found the relevant comparison data.",
+        trace: Array.from({ length: 5 }, (_, index) => ({
+          eventId: `event-${index}`,
+          kind: "tool-result",
+          label: `Safe activity ${index + 1}`,
+          category: index % 2 === 0 ? "read" : "search",
+          timestamp: `2026-07-20T10:00:0${index}.000Z`,
+          subagentIndex: 1,
+        })),
+      })],
+    });
+    const lines = renderTaskCardSurface({ cards: [card], selectedTaskId: card.taskId, scrollOffset: 0 }, {
+      width: 72,
+      isTty: true,
+      focusedTaskId: card.taskId,
+      style,
+      motionElapsedMs: 105,
+    });
+    const text = stripAnsi(lines.join("\n"));
+
+    expect(lines).toHaveLength(8);
+    expect(lines.slice(1)).toHaveLength(7);
+    expect(text).toContain("Task 1/1");
+    expect(text).toContain("Subagent 1 · Research how modern AI agents improve themselves auto…");
+    expect(text).not.toContain("Full research objective retained for detailed inspection");
+    expect(subagentInspectionContentLines(card, card.subagents[0]!, 72).join("\n"))
+      .toContain("Full research objective retained for detailed inspection");
+    expect(text).toContain("+3 earlier activities");
+    expect(text).toContain("I found the relevant comparison data.");
+    expect(text).toContain("running · 03:18 · 100 tokens · $0.0060");
+    expect(text).not.toMatch(/[╭╮╰╯│]/u);
+    expect(lines.slice(1).every((line) => line.includes("\x1b[48;2;37;37;37m"))).toBe(true);
+    expect(lines[0]).toContain("\x1b[38;2;64;224;208m");
+    expect(lines[1]).toContain(ansiFg(tokens.contract.palette.accent));
+    expect(lines[1]).toContain(ansiFg(tokens.contract.text.secondary));
+    expect(lines.at(-1)).toContain(ansiFg(tokens.contract.palette.action));
+    expect(lines.at(-1)).toContain(ansiFg(tokens.contract.text.muted));
+    expect(lines.every((line) => visibleWidth(line) <= 72)).toBe(true);
+  });
+
+  it("replaces generic delegated titles with a concise summary of the real objective", () => {
+    const subagent = makeSubagent(1, {
+      title: "Delegated work 1",
+      objective: "Research how modern AI agents improve themselves autonomously using measurable evaluation loops",
+    });
+    const card = makeCard({ subagents: [subagent] });
+    const text = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 72 }).join("\n");
+
+    expect(text).toContain("Subagent 1 · Research how modern AI agents improve themselves auto…");
+    expect(text).not.toContain("Delegated work 1");
+    expect(subagentInspectionContentLines(card, subagent, 72).join("\n"))
+      .toContain("Research how modern AI agents improve themselves autonomously using measurable evaluation loops");
+
+    const arabic = makeSubagent(2, {
+      title: "Delegated work 2",
+      objective: "مراجعة النتائج ومقارنة الأدلة وإعداد ملخص واضح",
+    });
+    const arabicCard = makeCard({ subagents: [arabic] });
+    const arabicText = renderTaskCardSurface(
+      { cards: [arabicCard], scrollOffset: 0 },
+      { width: 72, locale: "ar" }
+    ).join("\n");
+    expect(arabicText).toContain("Subagent 2 · مراجعة النتائج ومقارنة الأدلة وإعداد ملخص واضح");
+    expect(arabicText).not.toContain("Delegated work 2");
+  });
+
+  it("uses a compact Task ID in the main header while retaining the full ID in inspection", () => {
+    const taskId = "task_37c8496f-f9b2-4568-8552-73c95e35c81f";
+    const card = makeCard({ taskId });
+    const main = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 100 });
+    const inspection = renderTaskInspectionSurface({
+      cards: [card],
+      inspectedTaskId: taskId,
+      inspection: { followLive: true },
+      scrollOffset: 0,
+    }, { width: 100, height: 8 });
+
+    expect(main[0]).toContain("\u2068task_37c8496f\u2069");
+    expect(main[0]).not.toContain(taskId);
+    expect(inspection[0]).toContain(`\u2068${taskId}\u2069`);
+    expect(main[0]).toContain("Ctrl+G");
+    expect(main[0]).toContain("Competitor comparison");
+    expect(main.every((line) => visibleWidth(line) <= 100)).toBe(true);
+
+    const customTaskId = "customer-import-batch";
+    const custom = renderTaskCardSurface(
+      { cards: [makeCard({ taskId: customTaskId })], scrollOffset: 0 },
+      { width: 100 },
+    );
+    expect(custom[0]).toContain(`\u2068${customTaskId}\u2069`);
+  });
+
+  it("uses column-major 1-3 | 4-6 placement, equal widths, and +N more instead of squeezing", () => {
+    const four = makeCard({ subagents: Array.from({ length: 4 }, (_, index) => makeSubagent(index + 1)) });
+    const wide = renderTaskCardSurface({ cards: [four], scrollOffset: 0 }, { width: 100, isTty: true });
+
+    expect(getTaskCardSurfaceDesiredHeight({ cards: [four], scrollOffset: 0 }, 100)).toBe(24);
+    expect(wide).toHaveLength(24);
+    expect(wide[1]).toContain("Subagent 1");
+    expect(wide[1]).toContain("Subagent 4");
+    expect(wide[9]).toContain("Subagent 2");
+    expect(wide[17]).toContain("Subagent 3");
+    expect(wide.every((line) => visibleWidth(line) === 100)).toBe(true);
+
+    const narrow = renderTaskCardSurface({ cards: [four], scrollOffset: 0 }, { width: 72, isTty: true });
+    const narrowText = narrow.join("\n");
+    expect(getTaskCardSurfaceDesiredHeight({ cards: [four], scrollOffset: 0 }, 72)).toBe(25);
+    expect(narrowText).toContain("Subagent 1");
+    expect(narrowText).toContain("Subagent 2");
+    expect(narrowText).toContain("Subagent 3");
+    expect(narrowText).not.toContain("Subagent 4 ·");
+    expect(narrowText).toContain("+1 more Subagents");
+  });
+
+  it("focuses and opens main-session Subagents directly with the keyboard", () => {
+    const style = createOperatorConsoleStyle({
+      tokens: resolveTokens("standard", "dark", "kemetBlue"),
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const card = makeCard({ subagents: Array.from({ length: 4 }, (_, index) => makeSubagent(index + 1)) });
+    let state = createInitialOperatorConsoleState({
+      terminal: { width: 100, height: 30, isTty: true },
+      tasks: { cards: [card], selectedTaskId: card.taskId, scrollOffset: 0 },
+    });
+
+    state = routeTaskSurfaceKey(state, { type: "key", key: "tab" }, 24).state;
+    state = routeTaskSurfaceKey(state, { type: "key", key: "right" }, 24).state;
+    expect(state.focus.target).toEqual({ kind: "taskSubagent", taskId: card.taskId, stepId: "step-1" });
+    const focused = renderTaskCardSurface(state.tasks, {
+      width: 100,
+      height: 24,
+      style,
+      focusedSubagentStepId: "step-1",
+    });
+    expect(stripAnsi(focused[1] ?? "")).toContain("▌");
+    expect(focused[1]).toContain("\x1b[38;2;64;224;208m");
+
+    state = routeTaskSurfaceKey(state, { type: "key", key: "down" }, 24).state;
+    expect(state.focus.target).toEqual({ kind: "taskSubagent", taskId: card.taskId, stepId: "step-2" });
+    state = routeTaskSurfaceKey(state, { type: "key", key: "enter" }, 24).state;
+    expect(state.tasks.inspectedTaskId).toBe(card.taskId);
+    expect(state.tasks.inspection).toMatchObject({
+      selectedSubagentStepId: "step-2",
+      inspectedSubagentStepId: "step-2",
+    });
+  });
+
+  it("scrolls the whole-Task overview to keep keyboard-selected Subagents visible", () => {
+    const card = makeCard({ subagents: Array.from({ length: 8 }, (_, index) => makeSubagent(index + 1)) });
+    let state = createInitialOperatorConsoleState({
+      terminal: { width: 72, height: 10, isTty: true },
+      tasks: { cards: [card], selectedTaskId: card.taskId, scrollOffset: 0 },
+    });
+    state = routeTaskSurfaceKey(state, { type: "key", key: "tab" }, 10).state;
+    state = routeTaskSurfaceKey(state, { type: "key", key: "enter" }, 10).state;
+    for (let index = 1; index < 8; index += 1) {
+      state = routeTaskSurfaceKey(state, { type: "key", key: "down" }, 10).state;
+    }
+
+    expect(state.tasks.inspection?.selectedSubagentStepId).toBe("step-8");
+    expect(state.tasks.scrollOffset).toBeGreaterThan(0);
+    expect(renderTaskInspectionSurface(state.tasks, { width: 72, height: 10 }).join("\n"))
+      .toContain("Subagent 8");
+  });
+
+  it("adds a third column only when seven Subagents remain readable", () => {
+    const card = makeCard({ subagents: Array.from({ length: 7 }, (_, index) => makeSubagent(index + 1)) });
+    const threeColumns = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 140, isTty: true });
+    const twoColumns = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 100, isTty: true });
+
+    expect(threeColumns[1]).toContain("Subagent 1");
+    expect(threeColumns[1]).toContain("Subagent 4");
+    expect(threeColumns[1]).toContain("Subagent 7");
+    expect(threeColumns.join("\n")).not.toContain("more Subagents");
+    expect(twoColumns.join("\n")).toContain("+1 more Subagents");
+  });
+
+  it("never clips a visible card below seven rows and uses a compact tiny-terminal fallback", () => {
+    const card = makeCard({ subagents: Array.from({ length: 4 }, (_, index) => makeSubagent(index + 1)) });
+    const constrained = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 100, height: 9 });
+    const tiny = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 36, height: 5 });
+
+    expect(constrained).toHaveLength(9);
+    expect(constrained.join("\n")).toContain("Subagent 1");
+    expect(constrained.join("\n")).toContain("Subagent 2");
+    expect(constrained.join("\n")).toContain("+2 more Subagents");
+    expect(tiny).toHaveLength(5);
+    expect(tiny.join("\n")).toContain("Subagent 1 · running");
+    expect(tiny.join("\n")).toContain("Subagent 4 · running");
+    expect(tiny.join("\n")).not.toMatch(/[╭╮╰╯│]/u);
+  });
+
+  it("updates the latest safe activity without changing stable Subagent identity", () => {
+    const first = makeCard({ subagents: [makeSubagent(1, { currentActivity: "Reading package.json" })] });
+    const next = makeCard({ subagents: [makeSubagent(1, { currentActivity: "Editing dashboard route" })] });
+    const before = renderTaskCardSurface({ cards: [first], scrollOffset: 0 }, { width: 72 }).join("\n");
+    const after = renderTaskCardSurface({ cards: [next], scrollOffset: 0 }, { width: 72 }).join("\n");
+
+    expect(before).toContain("Subagent 1");
+    expect(after).toContain("Subagent 1");
+    expect(before).not.toContain("no earlier activity");
+    expect(after).not.toContain("no earlier activity");
+    expect(before).toContain("Reading package.json");
+    expect(after).toContain("Editing dashboard route");
+    expect(after).not.toContain("Reading package.json");
+  });
+
+  it("keeps audit events out of running cards and shows semantic work instead", () => {
+    const subagent = makeSubagent(1, {
+      currentActivity: "Comparing trust-boundary mechanisms",
+      assistantPreview: "Writing recommendations",
+      trace: [
+        { eventId: "semantic", kind: "attempt-progressed", label: "Inspecting memory architecture · Research Company 1", category: "read", timestamp: "2026-07-20T10:00:00.000Z" },
+        { eventId: "finished", kind: "attempt-progressed", label: "Worker finished · Research Company 1", category: "finish", timestamp: "2026-07-20T10:00:01.000Z" },
+        { eventId: "step", kind: "step-state-changed", label: "Step status changed · Research Company 1", category: "finish", timestamp: "2026-07-20T10:00:02.000Z" },
+        { eventId: "usage", kind: "usage-recorded", label: "Usage recorded · Research Company 1", category: "plan", timestamp: "2026-07-20T10:00:03.000Z" },
+      ],
+    });
+    const card = makeCard({ subagents: [subagent] });
+    const text = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 72 }).join("\n");
+    const inspection = subagentInspectionContentLines(card, subagent, 72).join("\n");
+
+    expect(text).toContain("Comparing trust-boundary mechanisms");
+    expect(text).toContain("Inspecting memory architecture");
+    expect(text).toContain("Writing recommendations");
+    expect(text).not.toContain("Worker finished");
+    expect(text).not.toContain("Step status changed");
+    expect(text).not.toContain("Usage recorded");
+    expect(inspection).toContain("Worker finished");
+    expect(inspection).toContain("Step status changed");
+    expect(inspection).toContain("Usage recorded");
+  });
+
+  it("uses the recovered fourth completed-card row for a clean wrapped result summary", () => {
+    const subagent = makeSubagent(1, {
+      status: "completed",
+      currentActivity: "Worker finished",
+      assistantPreview: "A shorter provider preview.",
+      trace: [
+        { eventId: "finished", kind: "attempt-progressed", label: "Worker finished · Research Company 1", category: "finish", timestamp: "2026-07-20T10:00:01.000Z" },
+        { eventId: "usage", kind: "usage-recorded", label: "Usage recorded · Research Company 1", category: "plan", timestamp: "2026-07-20T10:00:02.000Z" },
+      ],
+      results: [{
+        id: "result-1",
+        handle: "result://one",
+        kind: "summary",
+        disposition: "accepted",
+        status: "available",
+        byteLength: 240,
+        primary: true,
+        displaySummary: "Summary: Found that EstaCoda already has strong file and profile boundaries, but memory writes need explicit provenance and review semantics. Produced 7 recommendations. Recommended explicit review gates for every durable memory write before broad rollout.",
+        summary: "…bitrary legacy slice with **Markdown** that must not win.",
+      }],
+    });
+    const card = makeCard({ subagents: [subagent] });
+    const lines = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 72 });
+    const text = stripAnsi(lines.join("\n"));
+    const inspection = stripAnsi(subagentInspectionContentLines(card, subagent, 72).join("\n"));
+    const overview = stripAnsi(taskInspectionContentLines({ ...card, results: subagent.results }, 100).join("\n"));
+    const compactText = text.replace(/\s+/gu, " ");
+    const tokens = resolveTokens("standard", "dark", "kemetBlue");
+    const style = createOperatorConsoleStyle({
+      tokens,
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const styled = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 72, style });
+
+    expect(lines).toHaveLength(8);
+    expect(lines.slice(1)).toHaveLength(7);
+    expect(text).toContain("Summary");
+    expect(stripAnsi(lines[2]!)).toContain("> Summary");
+    expect(lines.slice(3, 7).every((line) => stripAnsi(line).trim().length > 0)).toBe(true);
+    expect(styled[2]).toContain("◆");
+    expect(styled[2]).toContain(ansiFg(tokens.contract.palette.action));
+    expect(compactText).toContain("Found that EstaCoda already has strong file and profile boundaries");
+    expect(compactText).toContain("memory writes need explicit provenance and review semantics");
+    expect(compactText).toContain("Produced 7 recommendations.");
+    expect(compactText).toContain("every durable memory write before broad rollout.");
+    expect(compactText).not.toContain("Summary: Found");
+    expect(text).not.toContain("A shorter provider preview.");
+    expect(text).not.toContain("arbitrary legacy slice");
+    expect(inspection).toContain("Found that EstaCoda already has strong file and profile boundaries");
+    expect(inspection).not.toContain("arbitrary legacy slice");
+    expect(overview).toContain("Found that EstaCoda already has strong file and profile boundaries");
+    expect(overview).not.toContain("arbitrary legacy slice");
+    expect(text).not.toContain("Worker finished");
+    expect(text).not.toContain("Usage recorded");
+    expect(text).toContain("completed · 03:18");
+  });
+
+  it("retains a real history row and uses three summary rows when completed activity was truncated", () => {
+    const subagent = makeSubagent(1, {
+      status: "completed",
+      currentActivity: undefined,
+      trace: Array.from({ length: 5 }, (_, index) => ({
+        eventId: `completed-history-${index}`,
+        kind: "attempt-progressed",
+        label: `Reviewed evidence source ${index + 1}`,
+        category: "read",
+        timestamp: `2026-07-20T10:00:0${index}.000Z`,
+      })),
+      results: [{
+        id: "result-history",
+        handle: "result://history",
+        kind: "summary",
+        disposition: "accepted",
+        status: "available",
+        byteLength: 240,
+        primary: true,
+        displaySummary: "Compared the retained evidence and produced a bounded recommendation for the parent Task.",
+      }],
+    });
+    const lines = renderTaskCardSurface(
+      { cards: [makeCard({ subagents: [subagent] })], scrollOffset: 0 },
+      { width: 72 }
+    );
+
+    expect(lines).toHaveLength(8);
+    expect(stripAnsi(lines[2]!)).toContain("+2 earlier activities");
+    expect(stripAnsi(lines[3]!)).toContain("> Summary");
+    expect(stripAnsi(lines[7]!)).toContain("completed");
+  });
+
+  it("keeps the completed summary marker and compact spacing deterministic in plain narrow Arabic", () => {
+    const style = createOperatorConsoleStyle({
+      tokens: resolveTokens("plain", "dark", "kemetBlue"),
+      capabilities: { supportsColor: false, supportsTrueColor: false },
+    });
+    const subagent = makeSubagent(1, {
+      status: "completed",
+      currentActivity: undefined,
+      trace: [],
+      results: [{
+        id: "result-arabic",
+        handle: "result://arabic",
+        kind: "summary",
+        disposition: "accepted",
+        status: "available",
+        byteLength: 160,
+        primary: true,
+        displaySummary: "الملخص: قارنت الأدلة وحددت حدود الثقة وقدمت توصيات قابلة للمراجعة.",
+      }],
+    });
+    const lines = renderTaskCardSurface(
+      { cards: [makeCard({ subagents: [subagent] })], scrollOffset: 0 },
+      { width: 38, locale: "ar", style }
+    );
+    const text = lines.join("\n");
+
+    expect(lines).toHaveLength(8);
+    expect(lines[2]).toContain("> الملخص");
+    expect(text.match(/الملخص/gu)).toHaveLength(1);
+    expect(text).toContain("قارنت الأدلة");
+    expect(text).not.toMatch(/\u001B\[/u);
+    expect(lines.every((line) => visibleWidth(line) === 38)).toBe(true);
+  });
+
+  it("cleans legacy result summaries instead of exposing raw Markdown fragments", () => {
+    const subagent = makeSubagent(1, {
+      status: "completed",
+      assistantPreview: "…verything) | Progressive-disclosure skills...",
+      results: [{
+        id: "result-legacy",
+        handle: "result://legacy",
+        kind: "summary",
+        disposition: "accepted",
+        status: "available",
+        byteLength: 240,
+        primary: true,
+        summary: "## Summary\n\n**Compared [leading agent harnesses](https://example.com) across extension systems, persistent memory, lifecycle hooks, and trust boundaries.**",
+      }],
+    });
+    const text = stripAnsi(renderTaskCardSurface(
+      { cards: [makeCard({ subagents: [subagent] })], scrollOffset: 0 },
+      { width: 72 }
+    ).join("\n"));
+    const compactText = text.replace(/\s+/gu, " ");
+
+    expect(compactText).toContain("Compared leading agent harnesses across extension systems");
+    expect(compactText).toContain("lifecycle hooks, and trust boundaries.");
+    expect(text).not.toContain("##");
+    expect(text).not.toContain("**");
+    expect(text).not.toContain("https://");
+    expect(text).not.toContain("…verything");
+  });
+
+  it("does not reuse an arbitrary streaming tail when a legacy result lacks a summary", () => {
+    const subagent = makeSubagent(1, {
+      status: "completed",
+      assistantPreview: "…firmation gates are not optional.**",
+      results: [{
+        id: "result-without-summary",
+        handle: "result://without-summary",
+        kind: "summary",
+        disposition: "accepted",
+        status: "available",
+        byteLength: 240,
+        primary: true,
+      }],
+    });
+    const text = stripAnsi(renderTaskCardSurface(
+      { cards: [makeCard({ subagents: [subagent] })], scrollOffset: 0 },
+      { width: 72 }
+    ).join("\n"));
+
+    expect(text).toContain("Open to inspect the full result");
+    expect(text).not.toContain("…firmation gates");
+  });
+
+  it("surfaces active parent synthesis and collapses settled Subagent cards", () => {
+    const tokens = resolveTokens("standard", "dark", "kemetBlue");
+    const style = createOperatorConsoleStyle({
+      tokens,
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const card = makeSynthesisCard("running");
+    const state = { cards: [card], selectedTaskId: card.taskId, scrollOffset: 0 };
+    const lines = renderTaskCardSurface(state, { width: 100, isTty: true });
+    const text = lines.join("\n");
+    const inspection = taskInspectionContentLines(card, 100).join("\n");
+
+    expect(getTaskCardSurfaceDesiredHeight(state, 100)).toBe(14);
+    expect(lines).toHaveLength(14);
+    expect(text).toContain("Delegated Task 1/1 · ⁨T-104⁩ · synthesizing");
+    expect(text).toContain("3 of 3 delegated Steps completed");
+    expect(text).toContain("Parent synthesis · Synthesize delegated results");
+    expect(text).toContain("Synthesizing 3 Subagent results");
+    expect(text).toContain("Comparing overlapping recommendations");
+    expect(text).toContain("Activity trace · 2 events");
+    expect(text).toContain("Preparing final response");
+    expect(text).not.toContain("Usage recorded");
+    expect(text.match(/Subagent [123]/gu)).toHaveLength(3);
+    expect(text).not.toContain("Summary");
+    expect(text).not.toContain("Accepted worker summary");
+    expect(inspection).toContain("synthesizing");
+    expect(inspection).toContain("3 of 3 delegated Steps completed");
+    expect(inspection).toContain("Accepted worker summary 1");
+    expect(lines.every((line) => visibleWidth(line) === 100)).toBe(true);
+
+    const targets = getTaskCardHitTargets(state, 100, 14);
+    expect(targets[0]).toMatchObject({ kind: "taskHeader", y: 0, height: 8 });
+    expect(targets.filter((target) => target.kind === "subagentCard")).toEqual([
+      expect.objectContaining({ stepId: "step-1", y: 9, height: 1 }),
+      expect.objectContaining({ stepId: "step-2", y: 11, height: 1 }),
+      expect.objectContaining({ stepId: "step-3", y: 13, height: 1 }),
+    ]);
+
+    const styled = renderTaskCardSurface(state, { width: 100, isTty: true, style, motionElapsedMs: 105 });
+    expect(styled[1]).toContain(ansiFg(tokens.contract.palette.brand));
+    expect(styled[2]).toContain(ansiFg(tokens.contract.palette.action));
+    expect(styled[4]).toContain(ansiFg(tokens.contract.trace.read));
+    expect(styled[4]).toContain(ansiFg(tokens.contract.trace.answer));
+    expect(styled[9]).toContain("\x1b[48;2;37;37;37m");
+
+    const six = makeSynthesisCard("running", 6);
+    const sixLines = renderTaskCardSurface({ cards: [six], scrollOffset: 0 }, { width: 100 });
+    expect(getTaskCardSurfaceDesiredHeight({ cards: [six], scrollOffset: 0 }, 100)).toBe(14);
+    expect(sixLines[9]).toContain("Subagent 1");
+    expect(sixLines[9]).toContain("Subagent 4");
+    expect(sixLines.join("\n")).toContain("Synthesizing 6 Subagent results");
+  });
+
+  it("keeps semantic motion scoped to the visible running worker or synthesis card", () => {
+    const worker = makeCard();
+    const synthesis = makeSynthesisCard("ready");
+    const settled = makeSynthesisCard("completed");
+
+    expect(hasVisibleTaskMotion({ cards: [worker], selectedTaskId: worker.taskId, scrollOffset: 0 })).toBe(true);
+    expect(hasVisibleTaskMotion({ cards: [synthesis], selectedTaskId: synthesis.taskId, scrollOffset: 0 })).toBe(true);
+    expect(hasVisibleTaskMotion({ cards: [settled], selectedTaskId: settled.taskId, scrollOffset: 0 })).toBe(false);
+    expect(hasVisibleTaskMotion({
+      cards: [worker],
+      selectedTaskId: worker.taskId,
+      inspectedTaskId: worker.taskId,
+      scrollOffset: 0,
+    })).toBe(false);
+  });
+
+  it("collapses workers only while synthesis is active and keeps constrained output truthful", () => {
+    const pending = makeSynthesisCard("pending");
+    const running = makeSynthesisCard("running");
+    const completed = makeSynthesisCard("completed");
+
+    expect(getTaskCardSurfaceDesiredHeight({ cards: [pending], scrollOffset: 0 }, 100)).toBe(24);
+    expect(getTaskCardSurfaceDesiredHeight({ cards: [running], scrollOffset: 0 }, 100)).toBe(14);
+    expect(getTaskCardSurfaceDesiredHeight({ cards: [completed], scrollOffset: 0 }, 100)).toBe(24);
+    expect(renderTaskCardSurface({ cards: [pending], scrollOffset: 0 }, { width: 100 }).join("\n"))
+      .not.toContain("Parent synthesis");
+    expect(renderTaskCardSurface({ cards: [completed], scrollOffset: 0 }, { width: 100 }).join("\n"))
+      .not.toContain("Parent synthesis");
+    expect(renderTaskCardSurface({ cards: [makeSynthesisCard("ready")], scrollOffset: 0 }, { width: 100 }).join("\n"))
+      .toContain("Preparing to synthesize 3 Subagent results");
+    expect(renderTaskCardSurface({ cards: [makeSynthesisCard("waiting_for_approval")], scrollOffset: 0 }, { width: 100 }).join("\n"))
+      .toContain("Synthesis waiting for approval");
+
+    const constrained = renderTaskCardSurface(
+      { cards: [running], scrollOffset: 0 },
+      { width: 72, height: 10, locale: "ar" },
+    );
+    const constrainedText = constrained.join("\n");
+    expect(constrained).toHaveLength(10);
+    expect(constrainedText).toContain("تجميع الوكيل الرئيسي");
+    expect(constrainedText).toContain("يتم تجميع 3 من نتائج الوكلاء الفرعيين");
+    expect(constrainedText).toContain("+3 وكلاء فرعيون إضافيون");
+    expect(constrainedText).not.toMatch(/\u001B\[/u);
+    expect(constrained.map(visibleWidth)).toEqual(Array.from({ length: 10 }, () => 72));
+  });
+
+  it("refreshes projections by stable ID without reordering cards or resetting inspection", () => {
+    const first = makeCard({ taskId: "T-first", objective: "First Task" });
+    const second = makeCard({
+      taskId: "T-second",
+      objective: "Second Task",
+      trace: {
+        events: [
+          { eventId: "second-1", kind: "read", label: "Read first file", category: "read", timestamp: "2026-07-20T10:00:00.000Z" },
+          { eventId: "second-2", kind: "answer", label: "Summarized file", category: "answer", timestamp: "2026-07-20T10:01:00.000Z" },
+        ],
+        hasEarlierEvents: false,
+      },
+    });
+    const current = {
+      cards: [first, second],
+      selectedTaskId: second.taskId,
+      inspectedTaskId: second.taskId,
+      inspection: {
+        followLive: false,
+        selectedTraceEventId: "second-1",
+        selectedSubagentStepId: "step-a",
+        inspectedSubagentStepId: "step-a",
+        subagentTrace: { followLive: false, selectedTraceEventId: "subagent-old" },
+      },
+      scrollOffset: 7,
+    } as const;
+    const refreshedSecond = {
+      ...second,
+      status: "completed" as const,
+      usage: cardUsage(0.42),
+      trace: {
+        events: [
+          ...second.trace.events,
+          { eventId: "second-3", kind: "finish" as const, label: "Finished Task", category: "finish" as const, timestamp: "2026-07-20T10:02:00.000Z" },
+        ],
+        hasEarlierEvents: false,
+      },
+    };
+    const third = makeCard({ taskId: "T-third", objective: "New Task" });
+
+    const refreshed = reconcileTaskSurfaceState(current, [refreshedSecond, first, third]);
+
+    expect(refreshed.cards.map((card) => card.taskId)).toEqual(["T-first", "T-second", "T-third"]);
+    expect(refreshed.cards[1]).toMatchObject({ status: "completed", usage: { estimatedCostUsd: 0.42 } });
+    expect(refreshed.selectedTaskId).toBe("T-second");
+    expect(refreshed.inspectedTaskId).toBe("T-second");
+    expect(refreshed.inspection).toMatchObject({
+      followLive: false,
+      selectedTraceEventId: "second-1",
+      selectedSubagentStepId: "step-a",
+      inspectedSubagentStepId: "step-a",
+      subagentTrace: { followLive: false, selectedTraceEventId: "subagent-old" },
+    });
+    expect(refreshed.scrollOffset).toBe(7);
+
+    const removed = reconcileTaskSurfaceState(refreshed, [first, third]);
+    expect(removed.cards.map((card) => card.taskId)).toEqual(["T-first", "T-third"]);
+    expect(removed.inspectedTaskId).toBeUndefined();
+    expect(removed.selectedTaskId).toBe("T-first");
+    expect(removed.inspection).toEqual({ followLive: true });
+    expect(removed.scrollOffset).toBe(0);
+  });
+
+  it("rolls settled and superseded Tasks into one-row receipts that remain inspectable", () => {
+    const tokens = resolveTokens("standard", "dark", "kemetBlue");
+    const style = createOperatorConsoleStyle({
+      tokens,
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const receipt = makeCard({
+      presentation: "receipt",
+      status: "completed",
+      phase: { name: "completed", workerProgress: { completed: 3, settled: 3, total: 3 } },
+      progress: { completed: 3, skipped: 0, total: 3 },
+    });
+    const taskState = { cards: [receipt], selectedTaskId: receipt.taskId, scrollOffset: 0 };
+    const lines = renderTaskCardSurface(taskState, {
+      width: 100,
+      focusedTaskId: receipt.taskId,
+      style,
+    });
+    const text = stripAnsi(lines.join("\n"));
+
+    expect(getTaskCardSurfaceDesiredHeight(taskState, 100)).toBe(1);
+    expect(lines).toHaveLength(1);
+    expect(text).toContain("Delegated Task 1/1");
+    expect(text).toContain("completed");
+    expect(text).toContain("3/3 completed");
+    expect(text).toContain("2.4k tokens");
+    expect(text).toContain("Competit");
+    expect(text).not.toContain("Subagent 1");
+    expect(lines[0]).toContain("\x1b[48;2;37;37;37m");
+    expect(getTaskCardHitTargets(taskState, 100)).toEqual([
+      expect.objectContaining({ kind: "taskHeader", taskId: receipt.taskId, height: 1 }),
+    ]);
+
+    let consoleState = createInitialOperatorConsoleState({
+      terminal: { width: 100, height: 20, isTty: true },
+      tasks: taskState,
+    });
+    consoleState = routeTaskSurfaceKey(consoleState, { type: "key", key: "tab" }).state;
+    consoleState = routeTaskSurfaceKey(consoleState, { type: "key", key: "enter" }).state;
+    expect(consoleState.tasks.inspectedTaskId).toBe(receipt.taskId);
+    const receiptLayout = createOperatorConsoleLayout(createInitialOperatorConsoleState({
+      terminal: { width: 100, height: 20, isTty: true },
+      tasks: taskState,
+    }));
+    expect(receiptLayout.regions.find((region) => region.kind === "promptGap")?.height).toBe(1);
+
+    let settlingState = createInitialOperatorConsoleState({
+      terminal: { width: 100, height: 20, isTty: true },
+      tasks: { cards: [makeCard()], selectedTaskId: receipt.taskId, scrollOffset: 0 },
+    });
+    settlingState = routeTaskSurfaceKey(settlingState, { type: "key", key: "tab" }).state;
+    settlingState = routeTaskSurfaceKey(settlingState, { type: "key", key: "right" }).state;
+    expect(settlingState.focus.target.kind).toBe("taskSubagent");
+    settlingState = {
+      ...settlingState,
+      tasks: reconcileTaskSurfaceState(settlingState.tasks, [receipt]),
+    };
+    settlingState = routeTaskSurfaceKey(settlingState, { type: "key", key: "enter" }).state;
+    expect(settlingState.tasks.inspectedTaskId).toBe(receipt.taskId);
+
+    const plainStyle = createOperatorConsoleStyle({
+      tokens: resolveTokens("plain", "dark", "kemetBlue"),
+      capabilities: { supportsColor: false, supportsTrueColor: false },
+    });
+    const arabicReceipt = { ...receipt, objective: "قارن النتائج واكتب الملخص" };
+    const arabic = renderTaskCardSurface({
+      cards: [arabicReceipt],
+      selectedTaskId: arabicReceipt.taskId,
+      scrollOffset: 0,
+    }, { width: 48, locale: "ar", style: plainStyle });
+    expect(arabic).toHaveLength(1);
+    expect(arabic[0]).toContain("مكتملة");
+    expect(arabic[0]).not.toMatch(/\u001B\[/u);
+    expect(visibleWidth(arabic[0]!)).toBe(48);
+  });
+
+  it("selects a newly arriving expanded Task instead of leaving an older receipt active", () => {
+    const prior = makeCard({ taskId: "T-prior", presentation: "receipt", status: "completed" });
+    const current = makeCard({ taskId: "T-current", objective: "Current turn Task" });
+    const refreshed = reconcileTaskSurfaceState({
+      cards: [prior],
+      selectedTaskId: prior.taskId,
+      scrollOffset: 0,
+    }, [prior, current]);
+
+    expect(refreshed.selectedTaskId).toBe(current.taskId);
+  });
+
+  it("uses light surface tokens and degrades to deterministic ASCII in plain mode", () => {
+    const lightStyle = createOperatorConsoleStyle({
+      tokens: resolveTokens("standard", "light", "kemetBlue"),
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const plainStyle = createOperatorConsoleStyle({
+      tokens: resolveTokens("plain", "dark", "kemetBlue"),
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const card = makeCard({ subagents: [makeSubagent(1)] });
+    const light = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 72, style: lightStyle });
+    const plain = renderTaskCardSurface({ cards: [card], scrollOffset: 0 }, { width: 72, style: plainStyle });
+
+    expect(light.slice(1).every((line) => line.includes("\x1b[48;2;245;245;245m"))).toBe(true);
+    expect(plain.join("\n")).not.toMatch(/\u001B\[/u);
+    expect(plain.join("\n")).toContain(". Subagent 1");
+    expect(plain.join("\n")).toContain("> Reading company 1");
+    expect(plain.every((line) => visibleWidth(line) === 72)).toBe(true);
+  });
+
+  it("renders the full safe inspection projection without raw bodies or internal worker handles", () => {
+    const card = makeCard({
+      childTasks: [{ taskId: "T-child-1", status: "running", parentAttemptId: "attempt-parent-1" }]
+    });
+    const lines = renderTaskInspectionSurface({
+      cards: [card],
+      selectedTaskId: card.taskId,
+      inspectedTaskId: card.taskId,
+      scrollOffset: 0,
+    }, { width: 80, height: 52, isTty: true });
+    const text = lines.join("\n");
+
+    expect(text).toContain("Competitor comparison");
+    expect(text).toContain("Activity trace");
+    expect(text).toContain("Subagent 1");
+    expect(text).toContain("Plan Steps");
+    expect(text).toContain("after Research Company A");
+    expect(text).toContain("Approvals");
+    expect(text).toContain("Blockers");
+    expect(text).toContain("Child Tasks");
+    expect(text).toContain("T-child-1");
+    expect(text).toContain("running");
+    expect(text).toContain("Task spending");
+    expect(text).toContain("Reserved: $0.18");
+    expect(text).toContain("result://safe-1");
+    expect(text).toContain("1 of 2 delegated Steps settled");
+    expect(text).not.toMatch(/\d+%/u);
+    expect(text).not.toContain("raw tool input");
+    expect(text).not.toContain("worker-session-secret");
+  });
+
+  it("renders one Subagent's filtered safe trace, results, dependencies, and retry Attempts", () => {
+    const firstAttempt = {
+      attemptId: "attempt-b-1",
+      taskId: "T-104",
+      stepId: "step-b",
+      attemptNumber: 1,
+      status: "failed" as const,
+      createdAt: "2026-07-20T09:58:00.000Z",
+      updatedAt: "2026-07-20T09:59:00.000Z",
+      startedAt: "2026-07-20T09:58:00.000Z",
+      completedAt: "2026-07-20T09:59:00.000Z",
+      elapsedMs: 60_000,
+      assistantPreview: "Recovered a partial comparison.",
+      usage: cardUsage(0.004),
+    };
+    const secondAttempt = {
+      ...firstAttempt,
+      attemptId: "attempt-b-2",
+      attemptNumber: 2,
+      status: "running" as const,
+      completedAt: undefined,
+      elapsedMs: 90_000,
+      currentActivity: "Reading the comparison table",
+      assistantPreview: "The retry has validated both sources.",
+      usage: cardUsage(0.008),
+    };
+    const inspected = makeSubagent(2, {
+      stepId: "step-b",
+      displayLabel: "Subagent 2",
+      objective: "Validate comparison criteria",
+      dependsOn: ["step-a"],
+      currentActivity: "Reading the comparison table",
+      assistantPreview: "The retry has validated both sources.",
+      attempts: [firstAttempt, secondAttempt],
+      activeAttempt: secondAttempt,
+      latestAttempt: secondAttempt,
+      trace: [
+        { eventId: "b-read", kind: "tool", label: "Read comparison.md", category: "read", timestamp: "2026-07-20T10:01:00.000Z", stepId: "step-b", attemptId: "attempt-b-2", subagentIndex: 2 },
+        { eventId: "b-answer", kind: "assistant", label: "Summarized validated criteria", category: "answer", timestamp: "2026-07-20T10:02:00.000Z", stepId: "step-b", attemptId: "attempt-b-2", subagentIndex: 2 },
+      ],
+      results: [{
+        id: "result-b",
+        handle: "result://comparison-b",
+        kind: "file",
+        disposition: "accepted",
+        status: "available",
+        byteLength: 512,
+        primary: true,
+        stepId: "step-b",
+        attemptId: "attempt-b-2",
+        summary: "Validated comparison table",
+      }],
+    });
+    const card = makeCard({
+      subagents: [makeSubagent(1, {
+        trace: [{ eventId: "a-secret", kind: "tool", label: "Other Subagent activity", category: "search", timestamp: "2026-07-20T10:00:00.000Z", stepId: "step-a", subagentIndex: 1 }],
+      }), inspected],
+    });
+    const state = {
+      cards: [card],
+      inspectedTaskId: card.taskId,
+      inspection: {
+        followLive: false,
+        selectedTraceEventId: "event-attempt-started",
+        selectedSubagentStepId: "step-b",
+        inspectedSubagentStepId: "step-b",
+        subagentTrace: { followLive: false, selectedTraceEventId: "b-read" },
+      },
+      scrollOffset: 0,
+    } as const;
+    const text = renderTaskInspectionSurface(state, { width: 100, height: 44 }).join("\n");
+
+    expect(text).toContain("Main session / Task ⁨T-104⁩ / Subagent 2");
+    expect(text).toContain("Validate comparison criteria");
+    expect(text).toContain("Subagent total · running · 03:18 · 100 tokens · $0.01");
+    expect(text).toContain("Results and artifacts");
+    expect(text).not.toContain("Relevant files");
+    expect(text).toContain("Attempt 2 · running · 01:30 · 100 tokens · $0.0080");
+    expect(text).toContain("Current activity");
+    expect(text).toContain("Reading the comparison table");
+    expect(text).toContain("Read comparison.md");
+    expect(text).toContain("Summarized validated criteria");
+    expect(text).not.toContain("Other Subagent activity");
+    expect(text).toContain("The retry has validated both sources.");
+    expect(text).toContain("result://comparison-b");
+    expect(text).toContain("Attempt 1 · failed");
+    expect(text).toContain("Attempt 2 · running · current");
+    expect(text).toContain("Research Company A");
+    expect(text).not.toContain("worker-session-secret");
+
+    expect(subagentInspectionContentLines(card, inspected, 48, { locale: "en" })).toContain("Retained safe activity");
+    const narrow = renderTaskInspectionSurface(state, { width: 48, height: 44 });
+    expect(narrow.every((line) => visibleWidth(line) <= 48)).toBe(true);
+  });
+
+  it("places Subagents and Plan side by side when wide and stacks them when narrow", () => {
+    const card = makeCard();
+    const wide = taskInspectionContentLines(card, 120, "en");
+    const narrow = taskInspectionContentLines(card, 72, "en");
+    const wideSection = wide.find((line) => line.includes("Subagents"));
+
+    expect(wideSection).toContain("Plan Steps");
+    expect(narrow.indexOf("Subagents")).toBeLessThan(narrow.indexOf("Plan Steps"));
+    expect(narrow.slice(narrow.indexOf("Subagents"), narrow.indexOf("Plan Steps"))).toContain("");
+  });
+
+  it("surfaces factual approvals and blockers without inventing progress", () => {
+    const base = makeCard();
+    const card = makeCard({
+      status: "waiting_for_approval",
+      waitReason: "Approval required before publishing",
+      steps: base.steps.map((step) => step.stepId === "step-a"
+        ? { ...step, status: "waiting_for_approval" as const }
+        : step.stepId === "step-c"
+          ? { ...step, status: "waiting_for_input" as const }
+          : step),
+    });
+    const text = taskInspectionContentLines(card, 100, "en").join("\n");
+
+    expect(text).toContain("Approvals");
+    expect(text).toContain("Research Company A");
+    expect(text).toContain("Blockers");
+    expect(text).toContain("Approval required before publishing");
+    expect(text).toContain("Compare findings · waiting for input");
+    expect(text).not.toMatch(/\d+%/u);
+  });
+
+  it("uses brand, accent, trace, and severity tokens throughout the Task workspace", () => {
+    const style = createOperatorConsoleStyle({
+      tokens: resolveTokens("standard", "dark", "kemetBlue"),
+      capabilities: { supportsColor: true, supportsTrueColor: true },
+    });
+    const card = makeCard();
+    const lines = renderTaskInspectionSurface({
+      cards: [card],
+      inspectedTaskId: card.taskId,
+      inspection: { followLive: true },
+      scrollOffset: 0,
+    }, { width: 100, height: 30, style });
+    const output = lines.join("\n");
+
+    expect(output).toContain("\x1b[38;2;67;137;215m");
+    expect(output).toContain("\x1b[38;2;78;161;255m");
+    expect(output).toContain("\x1b[38;2;184;153;255m");
+    expect(output).toContain("\x1b[38;2;90;172;255m");
+  });
+
+  it("separates recovered output from accepted Results and explains its failed status", () => {
+    const lines = taskInspectionContentLines(makeCard({
+      results: [
+        {
+          id: "result-accepted",
+          handle: "task-result:accepted",
+          kind: "text",
+          disposition: "accepted",
+          status: "available",
+          byteLength: 12,
+          primary: true
+        },
+        {
+          id: "result-diagnostic",
+          handle: "task-result:diagnostic",
+          kind: "text",
+          disposition: "diagnostic",
+          status: "available",
+          byteLength: 18,
+          primary: false
+        }
+      ]
+    }), 100, "en").join("\n");
+
+    expect(lines).toContain("Recovered output");
+    expect(lines).toContain("task-result:diagnostic");
+    expect(lines).toContain("May be incomplete; it was not accepted as a successful result");
+    expect(lines.indexOf("task-result:accepted")).toBeLessThan(lines.indexOf("Recovered output"));
+  });
+
+  it("keeps retained Task card cost honest for partial and unavailable accounting", () => {
+    const partial = makeCard({
+      subagents: [makeSubagent(1, { usage: { total: partialCardUsage(0.84, 2_400) } })],
+      usage: partialCardUsage(0.84, 2_400),
+    });
+    const unavailable = makeCard({
+      taskId: "T-105",
+      subagents: [makeSubagent(1, { usage: { total: unavailableCardUsage() } })],
+      usage: {
+        providerCalls: 1,
+        totalTokens: 0,
+        usageComplete: false,
+        pricingComplete: false,
+      },
+    });
+
+    expect(renderTaskCardSurface({ cards: [partial], scrollOffset: 0 }, { width: 72, isTty: true }).join("\n"))
+      .toContain("≥ $0.84");
+    expect(renderTaskCardSurface({ cards: [unavailable], scrollOffset: 0 }, { width: 72, isTty: true }).join("\n"))
+      .toContain("unavailable");
+    const partialInspection = renderTaskInspectionSurface({
+      cards: [partial],
+      selectedTaskId: partial.taskId,
+      inspectedTaskId: partial.taskId,
+      scrollOffset: 0,
+    }, { width: 72, height: 52, isTty: true }).join("\n");
+    expect(partialInspection).toContain("≥ $0.84");
+    expect(partialInspection).toContain("Some provider pricing was unavailable");
+    const inspection = renderTaskInspectionSurface({
+      cards: [unavailable],
+      selectedTaskId: unavailable.taskId,
+      inspectedTaskId: unavailable.taskId,
+      scrollOffset: 0,
+    }, { width: 72, height: 40, isTty: true }).join("\n");
+    expect(inspection).toContain("unavailable");
+    expect(inspection).not.toContain("$0.0000 · incomplete");
+  });
+
+  it("uses the Task inspection as a modal region and supports complete keyboard navigation", () => {
+    let state = createInitialOperatorConsoleState({
+      terminal: { width: 48, height: 10, isTty: true },
+      tasks: { cards: [makeCard(), makeCard({ taskId: "T-105", objective: "Second Task" })], scrollOffset: 0 },
+    });
+    state = routeTaskSurfaceKey(state, { type: "key", key: "tab" }).state;
+    expect(state.focus.target).toEqual({ kind: "taskCard", taskId: "T-104" });
+    state = routeTaskSurfaceKey(state, { type: "key", key: "down" }).state;
+    expect(state.tasks.selectedTaskId).toBe("T-105");
+    state = routeTaskSurfaceKey(state, { type: "key", key: "home" }).state;
+    state = routeTaskSurfaceKey(state, { type: "key", key: "enter" }).state;
+    expect(state.tasks.inspectedTaskId).toBe("T-104");
+    expect(createOperatorConsoleLayout(state).regions.map((region) => region.kind)).toEqual(["taskInspection"]);
+
+    state = routeTaskSurfaceKey(state, { type: "key", key: "left" }).state;
+    expect(state.tasks.inspection).toMatchObject({ followLive: false, selectedTraceEventId: "event-attempt-started" });
+    state = routeTaskSurfaceKey(state, { type: "key", key: "end" }).state;
+    expect(state.tasks.inspection).toMatchObject({ followLive: true });
+    state = routeTaskSurfaceKey(state, { type: "key", key: "pagedown" }).state;
+    expect(state.tasks.scrollOffset).toBeGreaterThan(0);
+    state = routeTaskSurfaceKey(state, { type: "key", key: "pageup" }).state;
+    state = routeTaskSurfaceKey(state, { type: "key", key: "escape" }).state;
+    expect(state.tasks.inspectedTaskId).toBeUndefined();
+    expect(state.focus.target).toEqual({ kind: "taskCard", taskId: "T-104" });
+  });
+
+  it("opens the selected Subagent by stable Step ID and unwinds Subagent to Task to main session", () => {
+    const first = makeSubagent(1, {
+      trace: [
+        { eventId: "first-1", kind: "read", label: "Read one", category: "read", timestamp: "2026-07-20T10:00:00.000Z", stepId: "step-1", subagentIndex: 1 },
+        { eventId: "first-2", kind: "answer", label: "Answered one", category: "answer", timestamp: "2026-07-20T10:01:00.000Z", stepId: "step-1", subagentIndex: 1 },
+      ],
+    });
+    const second = makeSubagent(2, {
+      trace: [
+        { eventId: "second-1", kind: "read", label: "Read two", category: "read", timestamp: "2026-07-20T10:00:00.000Z", stepId: "step-2", subagentIndex: 2 },
+        { eventId: "second-2", kind: "answer", label: "Answered two", category: "answer", timestamp: "2026-07-20T10:01:00.000Z", stepId: "step-2", subagentIndex: 2 },
+      ],
+    });
+    const card = makeCard({ subagents: [first, second] });
+    let state = createInitialOperatorConsoleState({
+      terminal: { width: 80, height: 20, isTty: true },
+      tasks: { cards: [card], selectedTaskId: card.taskId, scrollOffset: 0 },
+    });
+
+    state = routeTaskSurfaceKey(state, { type: "key", key: "tab" }).state;
+    state = routeTaskSurfaceKey(state, { type: "key", key: "enter" }).state;
+    state = routeTaskSurfaceKey(state, { type: "key", key: "left" }).state;
+    const taskTraceSelection = state.tasks.inspection?.selectedTraceEventId;
+    state = routeTaskSurfaceKey(state, { type: "key", key: "down" }).state;
+    expect(state.tasks.inspection?.selectedSubagentStepId).toBe("step-2");
+    expect(state.focus.target).toEqual({ kind: "taskSubagent", taskId: "T-104", stepId: "step-2" });
+
+    state = routeTaskSurfaceKey(state, { type: "key", key: "enter" }).state;
+    expect(state.tasks.inspection?.inspectedSubagentStepId).toBe("step-2");
+    expect(renderTaskInspectionSurface(state.tasks, { width: 80, height: 20 }).join("\n"))
+      .toContain("Main session / Task ⁨T-104⁩ / Subagent 2");
+    state = routeTaskSurfaceKey(state, { type: "key", key: "left" }).state;
+    expect(state.tasks.inspection?.subagentTrace).toEqual({ followLive: false, selectedTraceEventId: "second-1" });
+
+    const refreshedCard = { ...card, subagents: [second, first] };
+    state = { ...state, tasks: { ...state.tasks, cards: [refreshedCard] } };
+    expect(renderTaskInspectionSurface(state.tasks, { width: 80, height: 20 }).join("\n"))
+      .toContain("Subagent 2");
+
+    state = routeTaskSurfaceKey(state, { type: "key", key: "escape" }).state;
+    expect(state.tasks.inspection?.inspectedSubagentStepId).toBeUndefined();
+    expect(state.tasks.inspection?.selectedTraceEventId).toBe(taskTraceSelection);
+    expect(state.tasks.inspectedTaskId).toBe("T-104");
+    state = routeTaskSurfaceKey(state, { type: "key", key: "escape" }).state;
+    expect(state.tasks.inspectedTaskId).toBeUndefined();
+    expect(state.focus.target).toEqual({ kind: "taskCard", taskId: "T-104" });
+  });
+
+  it("keeps Subagent accounting truthful and its Arabic plain view width-bounded", () => {
+    const partial = makeSubagent(1, {
+      objective: "مراجعة النتائج",
+      usage: { total: partialCardUsage(0.84, 2_400) },
+      currentActivity: "قراءة التقرير",
+    });
+    const unavailable = makeSubagent(2, {
+      usage: { total: unavailableCardUsage() },
+    });
+    const partialCard = makeCard({ subagents: [partial] });
+    const unavailableCard = makeCard({ subagents: [unavailable] });
+    const detailState = (card: TaskCardState) => ({
+      cards: [card],
+      inspectedTaskId: card.taskId,
+      inspection: {
+        followLive: true,
+        selectedSubagentStepId: card.subagents[0]!.stepId,
+        inspectedSubagentStepId: card.subagents[0]!.stepId,
+        subagentTrace: { followLive: true },
+      },
+      scrollOffset: 0,
+    });
+
+    const partialText = renderTaskInspectionSurface(detailState(partialCard), {
+      width: 52,
+      height: 28,
+      locale: "ar",
+    });
+    const unavailableText = renderTaskInspectionSurface(detailState(unavailableCard), {
+      width: 72,
+      height: 20,
+    }).join("\n");
+
+    expect(partialText.join("\n")).toContain("إجمالي الوكيل الفرعي");
+    expect(subagentInspectionContentLines(partialCard, partial, 80, { locale: "ar" }).join("\n"))
+      .toContain("≥ $0.84");
+    expect(partialText.join("\n")).toContain("قراءة التقرير");
+    expect(partialText.join("\n")).toContain("\u2068Subagent 1\u2069");
+    expect(partialText.every((line) => visibleWidth(line) <= 52)).toBe(true);
+    expect(partialText.join("\n")).not.toMatch(/\u001B\[/u);
+    expect(unavailableText).toContain("unavailable");
+    expect(unavailableText).not.toContain("$0.0000");
+  });
+
+  it("keeps Arabic, bidi identifiers, narrow terminals, and plain output deterministic", () => {
+    const card = makeCard({ objective: "مقارنة الشركات وإعداد التقرير" });
+    const state = createInitialOperatorConsoleState({
+      locale: "ar",
+      terminal: { width: 28, height: 12, isTty: false },
+      tasks: { cards: [card], selectedTaskId: card.taskId, scrollOffset: 0 },
+    });
+    const lines = renderOperatorConsoleTextLines(state, createOperatorConsoleLayout(state));
+    const text = lines.join("\n");
+
+    expect(text).toContain("المهمة");
+    expect(text).toContain("\u2068T-104\u2069");
+    expect(text).not.toMatch(/\u001B\[/u);
+    expect(lines.every((line) => visibleWidth(line) <= 28)).toBe(true);
+  });
+
+  it("codifies modal, approval, typeahead, attachment, and prompt precedence", () => {
+    const resolve = (overrides: Partial<Parameters<typeof resolveOperatorConsoleInputSurface>[0]> = {}) =>
+      resolveOperatorConsoleInputSurface({
+        taskInspection: false,
+        approval: false,
+        typeahead: false,
+        attachment: false,
+        ...overrides,
+      });
+    expect(resolve({ taskInspection: true, approval: true, typeahead: true, attachment: true })).toBe("taskInspection");
+    expect(resolve({ approval: true, typeahead: true, attachment: true })).toBe("approval");
+    expect(resolve({ typeahead: true, attachment: true })).toBe("typeahead");
+    expect(resolve({ attachment: true })).toBe("attachment");
+    expect(resolve({ liveFocus: true, steer: true })).toBe("liveFocus");
+    expect(resolve({ steer: true })).toBe("steer");
+    expect(resolve()).toBe("prompt");
+  });
+
+  it("returns editing and hard-interrupt input from main-session Task focus to the prompt", () => {
+    const card = makeCard({ subagents: [makeSubagent(1)] });
+    const initial = createInitialOperatorConsoleState({
+      terminal: { width: 90, height: 30, isTty: true },
+      tasks: { cards: [card], selectedTaskId: card.taskId, scrollOffset: 0 },
+    });
+    const focused = routeTaskSurfaceKey(initial, { type: "key", key: "tab" }).state;
+    expect(routeTaskSurfaceKey(focused, { type: "key", key: "down" }).state).toBe(focused);
+
+    for (const event of [
+      { type: "text", text: "x" } as const,
+      { type: "paste", text: "pasted" } as const,
+      { type: "key", key: "backspace" } as const,
+      { type: "key", key: "delete" } as const,
+      { type: "key", key: "u", ctrl: true } as const,
+      { type: "key", key: "enter", alt: true } as const,
+    ]) {
+      const routed = routeOperatorConsoleInput({
+        state: focused,
+        event,
+        approval: false,
+        typeahead: false,
+        attachment: false,
+        steer: true,
+      });
+      expect(routed.handled).toBe(false);
+      expect(routed.surface).toBe("steer");
+      expect(routed.state.focus.target).toEqual({ kind: "prompt" });
+    }
+
+    const interrupt = routeOperatorConsoleInput({
+      state: focused,
+      event: { type: "key", key: "c", ctrl: true },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: true,
+    });
+    expect(interrupt.handled).toBe(false);
+    expect(interrupt.state.focus.target).toEqual({ kind: "taskCard", taskId: card.taskId });
+
+    const inspected = routeTaskSurfaceKey(focused, { type: "key", key: "enter" }).state;
+    expect(routeOperatorConsoleInput({
+      state: inspected,
+      event: { type: "key", key: "backspace" },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: true,
+    }).handled).toBe(true);
+    expect(routeOperatorConsoleInput({
+      state: inspected,
+      event: { type: "key", key: "c", ctrl: true },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: true,
+    }).handled).toBe(false);
+  });
+
+  it("routes Task and Subagent hit regions with equivalent keyboard paths", () => {
+    const card = makeCard({ subagents: [makeSubagent(1), makeSubagent(2)] });
+    const initial = createInitialOperatorConsoleState({
+      terminal: { width: 90, height: 30, isTty: true },
+      tasks: { cards: [card], selectedTaskId: card.taskId, mouseModeActive: true, scrollOffset: 0 },
+    });
+    const layout = createOperatorConsoleLayout(initial);
+    const regions = createOperatorConsoleHitRegions(initial, layout);
+    const taskHit = regions.find((region) => region.id === `task:${card.taskId}`)!;
+    const subagentHit = regions.find((region) => region.id === `task:${card.taskId}:subagent:step-2`)!;
+
+    expect(findOperatorConsoleHitRegion(regions, taskHit.x, taskHit.y)?.id).toBe(taskHit.id);
+    const clickedTask = routeOperatorConsoleInput({
+      state: initial,
+      event: { type: "mouse", action: "press", button: "primary", x: taskHit.x, y: taskHit.y },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+      layout,
+    });
+    const keyboardFocused = routeOperatorConsoleInput({
+      state: initial,
+      event: { type: "key", key: "tab" },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+    });
+    const keyboardTask = routeOperatorConsoleInput({
+      state: keyboardFocused.state,
+      event: { type: "key", key: "enter" },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+    });
+    expect(clickedTask.state.tasks.inspectedTaskId).toBe(keyboardTask.state.tasks.inspectedTaskId);
+
+    const clickedSubagent = routeOperatorConsoleInput({
+      state: initial,
+      event: { type: "mouse", action: "press", button: "primary", x: subagentHit.x, y: subagentHit.y },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+      layout,
+    });
+    const keyboardSelected = routeOperatorConsoleInput({
+      state: clickedTask.state,
+      event: { type: "key", key: "down" },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+    });
+    const keyboardSubagent = routeOperatorConsoleInput({
+      state: keyboardSelected.state,
+      event: { type: "key", key: "enter" },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+    });
+    expect(clickedSubagent.state.tasks.inspection?.inspectedSubagentStepId).toBe("step-2");
+    expect(clickedSubagent.state.tasks.inspection?.inspectedSubagentStepId)
+      .toBe(keyboardSubagent.state.tasks.inspection?.inspectedSubagentStepId);
+
+    const release = routeOperatorConsoleInput({
+      state: initial,
+      event: { type: "mouse", action: "release", button: "primary", x: subagentHit.x, y: subagentHit.y },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+      layout,
+    });
+    expect(release.handled).toBe(true);
+    expect(release.releaseMouseMode).toBeUndefined();
+    expect(release.state.tasks.mouseModeActive).toBe(true);
+    expect(release.state.tasks.inspectedTaskId).toBeUndefined();
+
+    const outside = routeOperatorConsoleInput({
+      state: initial,
+      event: { type: "mouse", action: "press", button: "primary", x: 89, y: 29 },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+      layout,
+    });
+    expect(outside.handled).toBe(true);
+    expect(outside.releaseMouseMode).toBe(true);
+    expect(outside.state.tasks.mouseModeActive).toBeUndefined();
+  });
+
+  it("routes trace squares, live-tail controls, breadcrumbs, and wheel scrolling", () => {
+    const trace = Array.from({ length: 8 }, (_, index) => ({
+      eventId: `trace-${index + 1}`,
+      kind: "tool-result",
+      label: `Safe event ${index + 1}`,
+      category: index % 2 === 0 ? "read" as const : "search" as const,
+      timestamp: `2026-07-20T10:00:0${index}.000Z`,
+      stepId: "step-1",
+      subagentIndex: 1,
+    }));
+    const card = makeCard({
+      subagents: [makeSubagent(1, { trace })],
+      trace: { events: trace, hasEarlierEvents: false },
+    });
+    const initial = createInitialOperatorConsoleState({
+      terminal: { width: 60, height: 10, isTty: true },
+      tasks: {
+        cards: [card],
+        selectedTaskId: card.taskId,
+        inspectedTaskId: card.taskId,
+        inspection: { followLive: true, selectedSubagentStepId: "step-1" },
+        mouseModeActive: true,
+        scrollOffset: 0,
+      },
+    });
+    const layout = createOperatorConsoleLayout(initial);
+    const eventHit = createOperatorConsoleHitRegions(initial, layout)
+      .find((region) => region.id === `task:${card.taskId}:task:event:trace-1`)!;
+    expect(eventHit).toBeDefined();
+    const selected = routeOperatorConsoleInput({
+      state: initial,
+      event: { type: "mouse", action: "press", button: "primary", x: eventHit.x, y: eventHit.y },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+      layout,
+    });
+    expect(selected.state.tasks.inspection).toMatchObject({
+      followLive: false,
+      selectedTraceEventId: "trace-1",
+    });
+
+    const selectedState = {
+      ...selected.state,
+      terminal: { ...selected.state.terminal, height: 30 },
+    };
+    const selectedLayout = createOperatorConsoleLayout(selectedState);
+    const selectedRegions = createOperatorConsoleHitRegions(selectedState, selectedLayout);
+    expect(selectedRegions.some((region) => region.id === `task:${card.taskId}:task:live`)).toBe(true);
+    const liveHit = selectedRegions
+      .find((region) => region.id === `task:${card.taskId}:task:return-live`)!;
+    expect(liveHit).toBeDefined();
+    const live = routeOperatorConsoleInput({
+      state: selectedState,
+      event: { type: "mouse", action: "press", button: "primary", x: liveHit.x, y: liveHit.y },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+      layout: selectedLayout,
+    });
+    expect(live.state.tasks.inspection?.followLive).toBe(true);
+
+    const smallLiveState = {
+      ...live.state,
+      terminal: { ...live.state.terminal, height: 10 },
+    };
+    const scrolled = routeOperatorConsoleInput({
+      state: smallLiveState,
+      event: { type: "mouse", action: "scroll", button: "wheelDown", x: 1, y: 2 },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+      layout: createOperatorConsoleLayout(smallLiveState),
+    });
+    expect(scrolled.state.tasks.scrollOffset).toBeGreaterThan(0);
+
+    const backHit = createOperatorConsoleHitRegions(scrolled.state, createOperatorConsoleLayout(scrolled.state))
+      .find((region) => region.id === `task:${card.taskId}:back`)!;
+    const closed = routeOperatorConsoleInput({
+      state: scrolled.state,
+      event: { type: "mouse", action: "press", button: "primary", x: backHit.x, y: backHit.y },
+      approval: false,
+      typeahead: false,
+      attachment: false,
+      steer: false,
+    });
+    expect(closed.state.tasks.inspectedTaskId).toBeUndefined();
+    expect(closed.releaseMouseMode).toBe(true);
+  });
+});
+
+function makeCard(overrides: Partial<TaskCardState> = {}): TaskCardState {
+  return {
+    taskId: "T-104",
+    objective: "Competitor comparison",
+    status: "running",
+    executionPreference: "auto",
+    execution: "foreground",
+    foregroundOwnerActive: true,
+    backgroundContinuation: "available",
+    progress: { completed: 1, skipped: 0, total: 3 },
+    planRevision: { revision: 2, status: "active" },
+    steps: [
+      {
+        stepId: "step-a",
+        position: 0,
+        title: "Research Company A",
+        objective: "Research Company A",
+        executorRole: "worker",
+        status: "running",
+        dependsOn: [],
+        childTaskPolicy: "forbid",
+        usage: cardUsage(0.006),
+        attempts: [{
+          attemptId: "attempt-a-1",
+          taskId: "T-104",
+          stepId: "step-a",
+          attemptNumber: 1,
+          status: "running",
+          workerSessionId: "worker-a",
+          createdAt: "2026-07-20T10:00:00.000Z",
+          updatedAt: "2026-07-20T10:03:18.000Z",
+          startedAt: "2026-07-20T10:00:00.000Z",
+          elapsedMs: 198_000,
+          currentActivity: "Browsing",
+          currentToolCategory: "browser",
+          usage: cardUsage(0.006)
+        }],
+        activeAttempt: {
+          attemptId: "attempt-a-1",
+          taskId: "T-104",
+          stepId: "step-a",
+          attemptNumber: 1,
+          status: "running",
+          workerSessionId: "worker-a",
+          createdAt: "2026-07-20T10:00:00.000Z",
+          updatedAt: "2026-07-20T10:03:18.000Z",
+          startedAt: "2026-07-20T10:00:00.000Z",
+          elapsedMs: 198_000,
+          currentActivity: "Browsing",
+          currentToolCategory: "browser",
+          usage: cardUsage(0.006)
+        },
+      },
+      { stepId: "step-b", position: 1, title: "Define comparison criteria", objective: "Define comparison criteria", executorRole: "worker", status: "completed", dependsOn: [], childTaskPolicy: "forbid", usage: cardUsage(0.0063), attempts: [] },
+      { stepId: "step-c", position: 2, title: "Compare findings", objective: "Compare findings", executorRole: "synthesis", status: "pending", dependsOn: ["step-a", "step-b"], childTaskPolicy: "forbid", usage: cardUsage(0), attempts: [] },
+    ],
+    subagents: [{
+      stepId: "step-a",
+      position: 0,
+      displayIndex: 1,
+      displayLabel: "Subagent 1",
+      title: "Research Company A",
+      objective: "Research Company A",
+      role: "worker",
+      status: "running",
+      dependsOn: [],
+      elapsedMs: 198_000,
+      currentActivity: "Browsing",
+      currentToolCategory: "browser",
+      usage: { total: cardUsage(0.006), currentAttempt: cardUsage(0.006) },
+      attempts: [],
+      trace: [],
+      results: []
+    }],
+    trace: {
+      events: [{
+        eventId: "event-attempt-started",
+        kind: "attempt-started",
+        label: "Attempt started · Research Company A",
+        category: "plan",
+        timestamp: "2026-07-20T10:00:00.000Z",
+        stepId: "step-a",
+        attemptId: "attempt-a-1",
+        subagentIndex: 1
+      }],
+      hasEarlierEvents: false
+    },
+    childTasks: [],
+    recentActivity: [
+      { eventId: "event-attempt-started", kind: "attempt-started", label: "Attempt started · Research Company A", category: "plan", timestamp: "2026-07-20T10:00:00.000Z" },
+    ],
+    currentToolCategory: "browser",
+    elapsedMs: 198_000,
+    usage: {
+      providerCalls: 3,
+      totalTokens: 2_400,
+      estimatedCostUsd: 0.0123,
+      usageComplete: true,
+      pricingComplete: true,
+    },
+    spending: {
+      spentCostUsd: 0.42,
+      reservedCostUsd: 0.18,
+      remainingCostUsd: 0.4,
+      maxEstimatedCostUsd: 1,
+      warningThresholdPercent: 80,
+      state: "available"
+    },
+    results: [{
+      id: "result-safe-1",
+      handle: "result://safe-1",
+      kind: "artifact",
+      disposition: "accepted",
+      status: "available",
+      byteLength: 2_048,
+      primary: true,
+      summary: "Comparison table",
+    }],
+    createdAt: "2026-07-20T09:59:00.000Z",
+    updatedAt: "2026-07-20T10:03:18.000Z",
+    ...overrides,
+    phase: overrides.phase ?? {
+      name: "delegating",
+      workerProgress: { completed: 1, settled: 1, total: 2 },
+    },
+  };
+}
+
+function makeSynthesisCard(
+  synthesisStatus: TaskCardState["steps"][number]["status"],
+  subagentCount = 3
+): TaskCardState {
+  const subagents = Array.from({ length: subagentCount }, (_, index) => {
+    const displayIndex = index + 1;
+    return makeSubagent(displayIndex, {
+      status: "completed",
+      results: [{
+        id: `result-worker-${displayIndex}`,
+        handle: `result://worker-${displayIndex}`,
+        kind: "summary",
+        disposition: "accepted",
+        status: "available",
+        byteLength: 240,
+        primary: true,
+        stepId: `step-${displayIndex}`,
+        summary: `Accepted worker summary ${displayIndex}`,
+      }],
+    });
+  });
+  const active = synthesisStatus === "running" ||
+    synthesisStatus === "waiting_for_input" ||
+    synthesisStatus === "waiting_for_approval";
+  const hasAttempt = synthesisStatus !== "pending" && synthesisStatus !== "ready";
+  const attemptStatus = synthesisStatus === "completed"
+    ? "completed" as const
+    : synthesisStatus === "waiting_for_input"
+      ? "waiting_for_input" as const
+      : synthesisStatus === "waiting_for_approval"
+        ? "waiting_for_approval" as const
+        : "running" as const;
+  const synthesisAttempt = {
+    attemptId: "attempt-synthesis-1",
+    taskId: "T-104",
+    stepId: "step-synthesis",
+    attemptNumber: 1,
+    status: attemptStatus,
+    createdAt: "2026-07-20T10:03:18.000Z",
+    updatedAt: "2026-07-20T10:03:30.000Z",
+    startedAt: "2026-07-20T10:03:18.000Z",
+    ...(synthesisStatus === "completed" ? { completedAt: "2026-07-20T10:03:30.000Z" } : {}),
+    elapsedMs: 12_000,
+    currentActivity: "Comparing overlapping recommendations",
+    currentToolCategory: "read",
+    assistantPreview: "Preparing final response",
+    usage: cardUsage(0.03),
+  };
+  const synthesisStep: TaskCardState["steps"][number] = {
+    stepId: "step-synthesis",
+    position: 3,
+    title: "Synthesize delegated results",
+    objective: `Merge the ${subagentCount} worker reports into one final response.`,
+    executorRole: "synthesis",
+    status: synthesisStatus,
+    dependsOn: subagents.map((subagent) => subagent.stepId),
+    childTaskPolicy: "forbid",
+    usage: cardUsage(0.03),
+    attempts: hasAttempt ? [synthesisAttempt] : [],
+    ...(hasAttempt ? { latestAttempt: synthesisAttempt } : {}),
+    ...(active ? { activeAttempt: synthesisAttempt } : {}),
+  };
+  const results = subagents.flatMap((subagent) => subagent.results);
+  return makeCard({
+    status: synthesisStatus === "completed" ? "completed" : "running",
+    phase: {
+      name: synthesisStatus === "completed"
+        ? "completed"
+        : synthesisStatus === "waiting_for_input" || synthesisStatus === "waiting_for_approval"
+          ? synthesisStatus
+          : synthesisStatus === "running" || synthesisStatus === "ready" || synthesisStatus === "pending"
+          ? "synthesizing"
+          : "running",
+      workerProgress: {
+        completed: subagentCount,
+        settled: subagentCount,
+        total: subagentCount,
+      },
+    },
+    progress: {
+      completed: subagentCount + (synthesisStatus === "completed" ? 1 : 0),
+      skipped: 0,
+      total: subagentCount + 1,
+    },
+    steps: [
+      ...subagents.map((subagent) => ({
+        stepId: subagent.stepId,
+        position: subagent.position,
+        title: subagent.title,
+        objective: subagent.objective,
+        executorRole: subagent.role,
+        status: subagent.status,
+        dependsOn: subagent.dependsOn,
+        childTaskPolicy: "forbid" as const,
+        usage: subagent.usage.total,
+        attempts: subagent.attempts,
+      })),
+      synthesisStep,
+    ],
+    subagents,
+    trace: {
+      events: [
+        {
+          eventId: "synthesis-reading",
+          kind: "attempt-progressed",
+          label: "Comparing overlapping recommendations · Synthesize delegated results",
+          category: "read",
+          timestamp: "2026-07-20T10:03:20.000Z",
+          stepId: "step-synthesis",
+          attemptId: "attempt-synthesis-1",
+        },
+        {
+          eventId: "synthesis-answer",
+          kind: "attempt-progressed",
+          label: "Preparing final response · Synthesize delegated results",
+          category: "answer",
+          timestamp: "2026-07-20T10:03:29.000Z",
+          stepId: "step-synthesis",
+          attemptId: "attempt-synthesis-1",
+        },
+        {
+          eventId: "synthesis-usage",
+          kind: "usage-recorded",
+          label: "Usage recorded · Synthesize delegated results",
+          category: "plan",
+          timestamp: "2026-07-20T10:03:30.000Z",
+          stepId: "step-synthesis",
+          attemptId: "attempt-synthesis-1",
+        },
+      ],
+      hasEarlierEvents: false,
+    },
+    recentActivity: [],
+    results,
+  });
+}
+
+function cardUsage(estimatedCostUsd: number): TaskCardState["usage"] {
+  return {
+    providerCalls: estimatedCostUsd > 0 ? 1 : 0,
+    totalTokens: estimatedCostUsd > 0 ? 100 : 0,
+    estimatedCostUsd,
+    usageComplete: true,
+    pricingComplete: true
+  };
+}
+
+function partialCardUsage(estimatedCostUsd: number, totalTokens: number): TaskCardState["usage"] {
+  return {
+    providerCalls: 3,
+    totalTokens,
+    estimatedCostUsd,
+    usageComplete: true,
+    pricingComplete: false,
+  };
+}
+
+function unavailableCardUsage(): TaskCardState["usage"] {
+  return {
+    providerCalls: 1,
+    totalTokens: 0,
+    usageComplete: false,
+    pricingComplete: false,
+  };
+}
+
+function makeSubagent(
+  index: number,
+  overrides: Partial<TaskCardSubagentState> = {}
+): TaskCardSubagentState {
+  const usage = cardUsage(0.006 * index);
+  return {
+    stepId: `step-${index}`,
+    position: index - 1,
+    displayIndex: index,
+    displayLabel: `Subagent ${index}`,
+    title: `Research Company ${index}`,
+    objective: `Research Company ${index}`,
+    role: "worker",
+    status: "running",
+    dependsOn: [],
+    elapsedMs: 198_000,
+    currentActivity: `Reading company ${index}`,
+    currentToolCategory: "read",
+    usage: { total: usage, currentAttempt: usage },
+    attempts: [],
+    trace: [],
+    results: [],
+    ...overrides,
+  };
+}
+
+function visibleWidth(value: string): number {
+  return [...stripAnsi(value).replace(/[\u2066-\u2069]/gu, "")].length;
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\u001B\[[0-?]*[ -/]*[@-~]/gu, "");
+}
+
+function ansiFg(hex: string): string {
+  const clean = hex.replace("#", "");
+  const red = Number.parseInt(clean.slice(0, 2), 16);
+  const green = Number.parseInt(clean.slice(2, 4), 16);
+  const blue = Number.parseInt(clean.slice(4, 6), 16);
+  return `\x1b[38;2;${red};${green};${blue}m`;
+}

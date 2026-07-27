@@ -195,8 +195,6 @@ describe("StandardRenderer — dispatch", () => {
         toolCount: 1,
         mcpActive: 0,
         mcpTotal: 0,
-        workflowAvailable: false,
-        workflowRunActive: false,
       }),
       buildTableViewModel({ columns: [], rows: [] }),
       buildKeyValueBlockViewModel({ entries: [] }),
@@ -291,8 +289,6 @@ describe("StandardRenderer — dark theme", () => {
       toolCount: 34,
       mcpActive: 2,
       mcpTotal: 3,
-      workflowAvailable: true,
-      workflowRunActive: true,
     });
     const out = r.renderStatus(vm);
     expect(out).toContain("EstaCoda is ready");
@@ -1587,8 +1583,6 @@ describe("StandardRenderer — light theme", () => {
       toolCount: 1,
       mcpActive: 0,
       mcpTotal: 0,
-      workflowAvailable: false,
-      workflowRunActive: false,
     });
     const out = r.renderStatus(vm);
     expect(out).toContain("EstaCoda is ready");
@@ -1607,8 +1601,6 @@ describe("StandardRenderer — light theme", () => {
       toolCount: 1,
       mcpActive: 0,
       mcpTotal: 0,
-      workflowAvailable: false,
-      workflowRunActive: false,
     });
 
     const darkOut = darkR.renderStatus(vm);
@@ -1632,8 +1624,6 @@ describe("StandardRenderer — no-color fallback", () => {
       toolCount: 1,
       mcpActive: 0,
       mcpTotal: 0,
-      workflowAvailable: false,
-      workflowRunActive: false,
     });
     const out = r.renderStatus(vm);
     assertNoAnsi(out);
@@ -1745,8 +1735,6 @@ describe("StandardRenderer — plain mode fallback", () => {
       toolCount: 1,
       mcpActive: 0,
       mcpTotal: 0,
-      workflowAvailable: false,
-      workflowRunActive: false,
     });
     const out = r.renderStatus(vm);
     assertNoAnsi(out);
@@ -1773,8 +1761,6 @@ describe("StandardRenderer — narrow width", () => {
       toolCount: 1,
       mcpActive: 0,
       mcpTotal: 0,
-      workflowAvailable: false,
-      workflowRunActive: false,
     });
     const out = r.renderStatus(vm);
     expect(typeof out).toBe("string");
@@ -1808,8 +1794,6 @@ describe("StandardRenderer — visual primitives", () => {
       toolCount: 1,
       mcpActive: 0,
       mcpTotal: 0,
-      workflowAvailable: false,
-      workflowRunActive: false,
     });
     const out = r.renderStatus(vm);
     // Rail uses toolPrefix glyph ("│" in Unicode mode)
@@ -2311,8 +2295,6 @@ describe("StandardRenderer — deterministic output", () => {
       toolCount: 1,
       mcpActive: 0,
       mcpTotal: 0,
-      workflowAvailable: false,
-      workflowRunActive: false,
     });
     const a = r.render(vm);
     const b = r.render(vm);
@@ -2341,6 +2323,42 @@ describe("StandardRenderer — assistant response", () => {
       expect(measureVisibleWidth(line)).toBeLessThanOrEqual(fullCaps().terminalWidth);
     }
     expect(out).toContain(`${ansiFgForHex(tokens.contract.text.agentMessage)}Hello, body!`);
+  });
+
+  it("renders one muted usage footer inside the assistant frame", () => {
+    const tokens = resolveTokens("standard", "dark", "kemetBlue");
+    const r = new StandardRenderer({ tokens, capabilities: fullCaps() });
+    const out = r.renderAssistantResponse(buildAssistantResponseViewModel({
+      label: "EstaCoda",
+      text: "Finished the review.",
+      usageFooter: "15.2k tokens · ≈ $0.55",
+    }));
+    const lines = out.split("\n");
+    const footerIndex = lines.findIndex((line) => stripAnsi(line).includes("15.2k tokens · ≈ $0.55"));
+    const borderIndex = lines.findIndex((line) => stripAnsi(line).startsWith("╰"));
+
+    expect(footerIndex).toBeGreaterThan(0);
+    expect(footerIndex).toBeLessThan(borderIndex);
+    expect(lines[footerIndex]).toContain(ansiFgForHex(tokens.contract.text.muted));
+    expect(stripAnsi(out)).not.toContain("Main agent:");
+    expect(stripAnsi(out)).not.toContain("Turn total:");
+  });
+
+  it("wraps the usage footer without losing values on narrow terminals", () => {
+    const caps = { ...fullCaps(), terminalWidth: 24 };
+    const r = new StandardRenderer({
+      tokens: resolveTokens("standard", "dark", "kemetBlue"),
+      capabilities: caps,
+    });
+    const out = stripAnsi(r.renderAssistantResponse(buildAssistantResponseViewModel({
+      label: "EstaCoda",
+      text: "Done.",
+      usageFooter: "15.2k tokens · ≈ $0.55",
+    })));
+
+    expect(out).toContain("15.2k tokens");
+    expect(out).toContain("≈ $0.55");
+    expect(out.split("\n").every((line) => measureVisibleWidth(line) <= 24)).toBe(true);
   });
 
   it("keeps Arabic assistant response text directionally stable", () => {
@@ -2533,6 +2551,27 @@ describe("StandardRenderer — prompt chrome rails", () => {
     expect(out).toContain("◷ 3h 37m");
     expect(out).toContain("⧖ 3h 37m");
     expect(out.split("\n")).toHaveLength(1);
+  });
+
+  it("prioritizes session cost when a narrow rail cannot retain every segment", () => {
+    const r = renderer("dark", { ...narrowCaps(), terminalWidth: 20 });
+    const out = stripAnsi(r.render(buildSessionStatusRailViewModel({
+      modelLabel: "openrouter/deepseek-reasoner",
+      turnState: "idle",
+      contextUsage: { filled: 98_765, total: 128_000 },
+      sessionCost: { estimatedCostUsd: 0.84, costComplete: false },
+      sessionElapsedMs: 125_000,
+    })));
+
+    expect(out).toContain("session ≥ $0.84");
+    expect(measureVisibleWidth(out)).toBeLessThanOrEqual(20);
+
+    const minimal = stripAnsi(renderer("dark", { ...narrowCaps(), terminalWidth: 8 }).render(buildSessionStatusRailViewModel({
+      modelLabel: "openrouter/deepseek-reasoner",
+      turnState: "idle",
+      sessionCost: { estimatedCostUsd: 0.84, costComplete: false },
+    })));
+    expect(minimal).toContain("≥ $0.84");
   });
 
   it("renders only the visible model label for fallback-serving state", () => {
@@ -2772,13 +2811,29 @@ describe("StandardRenderer — prompt chrome rails", () => {
     expect(stripAnsi(out)).toBe("↳ line one\n  line two");
   });
 
-  it("renders active turn spinner with brand eye and localized label", () => {
+  it("renders active turn thinking motion with its localized label", () => {
     const r = renderer("dark", { ...fullCaps(), supportsAnimation: false });
     const vm = buildActiveTurnSpinnerViewModel({ phase: "thinking" });
     const out = stripAnsi(r.render(vm));
-    expect(out).toContain("⣾⣷");
+    expect(out).toContain("◜");
     expect(out).not.toContain("𓇠");
     expect(out).toContain("contemplating");
+  });
+
+  it("maps runtime phases to distinct semantic motions and colors", () => {
+    const r = renderer("dark", { ...fullCaps(), supportsAnimation: false });
+    const cases = [
+      ["thinking", "◜", "38;2;184;153;255"],
+      ["routing", "›", "38;2;94;208;230"],
+      ["provider", "⠋", "38;2;90;172;255"],
+      ["finalizing", "◇", "38;2;215;167;255"],
+      ["background", "⠁", "38;2;136;136;136"],
+    ] as const;
+    for (const [phase, frame, color] of cases) {
+      const out = r.render(buildActiveTurnSpinnerViewModel({ phase, elapsedMs: 0 }));
+      expect(stripAnsi(out)).toContain(frame);
+      expect(out).toContain(color);
+    }
   });
 
   it("renders active turn spinner with explicit label overriding phase", () => {
@@ -2812,7 +2867,7 @@ describe("StandardRenderer — prompt chrome rails", () => {
       events: [toolActivityRailEvent("readFile", "running", { label: "preparing" })],
     });
     const out = stripAnsi(r.render(vm));
-    expect(out).toContain("⣾⣷");
+    expect(out).toContain("◴");
     expect(out).not.toContain("𓇠");
     expect(out).toContain("preparing");
   });

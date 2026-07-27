@@ -39,7 +39,7 @@ estacoda setup --provider <p> --model <m> --api-key-env <env>
 
 **حدود الملف التعريف:** يستخدم الملف التعريف النشط، أو الملف المختار عبر `--profile`.
 
-**السلوك:** يوجّه عبر قرار إعداد محدد بناءً على الحالة الحالية (first-run، configured-ready، configured-degraded، partial-provider، missing-credential، broken-config، untrusted-workspace، state-not-writable). حالة configured-ready تفتح Setup Editor وفيه تعديل المسار الرئيسي للنموذج، وتعديل مسار الاحتياطي، وتعديل المسار الإضافي، وإعداد القدرات الاختيارية، وتعديل وضع الأمان، وتعديل `Agent Evolution`، و`EstaCoda Doctor`، والخروج. Doctor هو إجراء الصحة للقراءة فقط للإصلاحات المطلوبة وحالة مسارات المزوّدين. إلغاء المراجعة لا ينتج تعديلاً. البيانات السرية الخام لا تُعرض أبدًا في بيانات المراجعة.
+**السلوك:** يوجّه عبر قرار إعداد محدد بناءً على الحالة الحالية (first-run، configured-ready، configured-degraded، partial-provider، missing-credential، broken-config، untrusted-workspace، state-not-writable). تفتح حالة first-run الداخلية معالج التهيئة. يستخدم onboarding العادي التسلسل `summary -> confirm -> apply -> verify`، بينما يبقى manifest المنقّح وخطة التطبيق قابلين للفحص داخليًا أو للمشغّل. تفتح حالة configured-ready محرّر الإعدادات وفيه تعديل المسار الرئيسي للنموذج، وتعديل مسار الاحتياطي، وتعديل المسار الإضافي، وتعديل وضع الأمان، وتعديل `Agent Evolution`، ومدخل «الميزانيات» المتداخل لحدّي إنفاق المهمة والجلسة المستقلين، واللغة، وإعداد القدرات الاختيارية، و`EstaCoda Doctor`، والخروج. حدود الميزانية مالية، ومتوقفة افتراضيًا، وتُطبق على المهام أو الجلسات الجديدة. Doctor هو إجراء الصحة للقراءة فقط للإصلاحات المطلوبة وحالة مسارات المزوّدين. إلغاء المراجعة أو تأكيد الملخص لا ينتج تعديلاً. البيانات السرية الخام لا تُعرض أبدًا في بيانات المراجعة.
 
 **أنماط الفشل:**
 - الإعداد التالف يحظر التعديلات العادية حتى يصبح التحليل آمناً.
@@ -360,54 +360,22 @@ estacoda memory finalization prune [--keep N]
 
 ---
 
-## Workflow
-
-يتطلب قاعدة بيانات جلسات SQLite. ترفض قاعدة بيانات الذاكرة أوامر Workflow.
+## المهام الدائمة
 
 ```bash
-estacoda workflow begin --session <sessionId> <objective>
-estacoda workflow begin --skill <skillName> --session <sessionId> <objective>
-estacoda workflow list                      # تشغيلات Workflow النشطة (غير النهائية)
-estacoda workflow show <runId>
-estacoda workflow status <runId>
-estacoda workflow trace <runId> [limit]
-estacoda workflow pause <runId> [reason]
-estacoda workflow resume <runId>
-estacoda workflow interrupt <runId> [reason]
-estacoda workflow cancel <runId> [reason]
-estacoda workflow steer <runId> <instruction>
-estacoda workflow approve <stepId>
-estacoda workflow reject <stepId> [reason]
-estacoda workflow retry <stepId>
-estacoda workflow skip <stepId> [reason]
-estacoda workflow checkpoint <runId> <name>
-estacoda workflow summarize <runId>
+estacoda task begin [--session <session-id>] [--background] <objective>
+estacoda task list [limit]
+estacoda task show <task-id>
+estacoda task pause <task-id>
+estacoda task resume <task-id>
+estacoda task cancel <task-id>
+estacoda task retry <task-id> [step-id]
+estacoda task result <task-id>
 ```
 
-**الحالة المُعدّلة:** قاعدة بيانات جلسات SQLite (جداول `workflow_events`، `workflow_steps`).
+**الحالة المُعدّلة:** سجلات المهام الدائمة الخاصة بالملف الشخصي داخل قاعدة بيانات الجلسات العامة `SQLite`، بينما تبقى أجسام النتائج في مخزن النتائج الخاص بالملف الشخصي المحدد.
 
-**السلوك:**
-- `estacoda workflow begin --session <sessionId> <objective>` ينشئ ويبدأ تشغيل Workflow بخطوة محافظة واحدة لجلسة موجودة. يسجل `activationReason: "explicit"` والهدف في metadata التشغيل.
-- `estacoda workflow begin --skill <skillName> --session <sessionId> <objective>` يحل اسم المهارة، ويجمع playbook الخاص بها، ويحوله إلى `WorkflowPlan`، ثم ينشئ التشغيل ويبدأه.
-- أمر CLI المستقل لا يفعّل جلسات تفاعلية لاحقة. استخدم `/workflow activate <runId>` داخل جلسة تفاعلية للتفعيل الحي.
-- `begin` بدون `--skill` لا يستخدم تحويل playbook. خيار `--skill` اشتراك صريح.
-
-ناتج النجاح في CLI المستقل:
-
-```text
-Created workflow: <runId>
-Started workflow: <runId>
-Not activated. Use /workflow activate <runId> inside an interactive session.
-```
-
-**أنماط الفشل:**
-- معرف جلسة مفقود أو غير معروف يرجع خطأ. لا تُنشأ hidden sessions.
-- مهارة غير معروفة ترجع خطأ واضحاً.
-- إعادة المحاولة تعمل فقط إن كان `idempotent` أو `safeToRetry` صحيحاً وتحت `maxRetries`.
-- التخطي يعمل فقط إن لم يبدأ الخطوة وكان `allowSkipIfSkippable` صحيحاً.
-- يُرفض التوجيه لتشغيلات Workflow في حالات نهائية.
-- الإيقاف يرسل SIGTERM مع مهلة 5 ثوانٍ للعمليات النشطة، ثم ينتقل الحالة.
-- لا يوجد automatic workflow promotion، ولا complex-request detection، ولا مشاركة Agent Evolution، ولا إنشاء Workflow تلقائي من اختيار المهارة العادي داخل AgentLoop، ولا خيار `--use-selected-playbook`.
+**السلوك:** يتطلب `begin` مساحة عمل موثوقة وينشئ خطوة وكيل واحدة بصلاحيات متحفظة. تفضيل التنفيذ الدائم الافتراضي هو `auto`: يبدأ التنفيذ في العملية التفاعلية ثم تتولى البوابة المتابعة عند الخروج. يختار `--background` ملكية البوابة منذ البداية. من دون `--session` ينشئ جلسة منشئ ظاهرة ومملوكة للملف الشخصي، ثم يطبع معرّفها مع مقبض المهمة. ومع `--session` يجب أن تكون الجلسة المحددة موجودة مسبقًا في الملف الشخصي المختار. يفصل `show` بين حالة دورة الحياة وملكية التنفيذ الحالية، ويعرض جاهزية المتابعة وسبب الانتظار بصورة محدودة. تغيّر أوامر `pause` و`resume` و`cancel` و`retry` الصريح الحالة الدائمة. يسرد `result` مقابض مبهمة وملخصات من دون الأجسام الكاملة أو المسارات المحلية. لا يغيّر تجاوز `--profile` الخاص بالأمر الملف الشخصي النشط.
 
 ---
 

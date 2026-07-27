@@ -9,6 +9,9 @@ export type SetupEditorActionId =
   | "repair-missing-credential"
   | "edit-security-mode"
   | "edit-workflow-learning"
+  | "edit-budgets"
+  | "edit-spending-limit-for-task"
+  | "edit-spending-limit-for-session"
   | "edit-language"
   | "repair-workspace-trust"
   | "review-optional-capabilities"
@@ -32,6 +35,8 @@ export type SetupEditorPatchField =
   | "auxiliaryModels.*"
   | "security.approvalMode"
   | "skills.autonomy"
+  | "budgets.task"
+  | "budgets.session"
   | "ui.language"
   | "ui.flavor"
   | "ui.activityLabels"
@@ -43,6 +48,7 @@ export type SetupEditorPatchField =
   | "browser";
 
 export type SetupEditorActionEffect =
+  | "navigate"
   | "draft-config-patch"
   | "draft-trust-repair"
   | "draft-state-repair"
@@ -60,6 +66,7 @@ export type SetupEditorActionDraft = {
     | "credentials"
     | "security-mode"
     | "workflow-learning"
+    | "budgets"
     | "interface-preference"
     | "workspace-trust"
     | "optional-capabilities"

@@ -27,6 +27,11 @@ import {
   isSteerInputActive,
 } from "./steerSurface.js";
 import { getTranscriptSurfaceDesiredHeight } from "./transcriptSurface.js";
+import {
+  getTaskCardSurfaceDesiredHeight,
+  getTaskInspectionSurfaceDesiredHeight,
+  hasTaskCards,
+} from "./taskSurface.js";
 
 export type OperatorConsoleRegionKind = OperatorConsoleSurface;
 
@@ -62,6 +67,8 @@ const STREAMING_PRIORITY = 5;
 const ATTACHMENTS_PRIORITY = 5;
 const TRANSCRIPT_PRIORITY = 6;
 const STARTUP_PRIORITY = 7;
+const TASK_CARD_PRIORITY = 4;
+const PROMPT_GAP_PRIORITY = 8;
 const SHOW_LIVE_ACTIVE_WORK_REGION = false;
 
 export function createOperatorConsoleLayout(
@@ -101,6 +108,15 @@ function createRegionDescriptors(
 ): readonly RegionDescriptor[] {
   if (state.mode === "setup") {
     return createSetupRegionDescriptors(state, terminal);
+  }
+
+  if (state.tasks.inspectedTaskId !== undefined) {
+    return [{
+      kind: "taskInspection",
+      priority: PROMPT_PRIORITY,
+      minHeight: 1,
+      desiredHeight: getTaskInspectionSurfaceDesiredHeight(terminal.height),
+    }];
   }
 
   const descriptors: RegionDescriptor[] = [];
@@ -180,12 +196,32 @@ function createRegionDescriptors(
     });
   }
 
+  if (hasTaskCards(state.tasks)) {
+    descriptors.push({
+      kind: "taskCards",
+      priority: TASK_CARD_PRIORITY,
+      minHeight: 1,
+      desiredHeight: getTaskCardSurfaceDesiredHeight(state.tasks, terminal.width),
+    });
+  }
+
   if (state.attachments.length > 0) {
     descriptors.push({
       kind: "attachments",
       priority: ATTACHMENTS_PRIORITY,
       minHeight: 1,
       desiredHeight: getAttachmentSurfaceDesiredHeight(state.attachments, terminal.width),
+    });
+  }
+
+  if (hasTaskCards(state.tasks)) {
+    const selectedTask = state.tasks.cards.find((card) => card.taskId === state.tasks.selectedTaskId)
+      ?? state.tasks.cards[0];
+    descriptors.push({
+      kind: "promptGap",
+      priority: PROMPT_GAP_PRIORITY,
+      minHeight: 1,
+      desiredHeight: selectedTask?.presentation === "receipt" ? 1 : 2,
     });
   }
 
@@ -221,10 +257,23 @@ function shouldShowActiveWorkRegion(state: OperatorConsoleState): boolean {
   if (!hasActiveWork(state.activeWork)) return false;
   if (state.activeWork.completedAtMs !== undefined) return true;
   if (hasRunningDelegationWork(state.activeWork)) {
+    if (hasMatchingDurableSubagentCards(state)) return false;
     return !hasLiveStreamingTail(state.streaming);
   }
   if (!SHOW_LIVE_ACTIVE_WORK_REGION) return false;
   return !hasStreamingSurface(state.streaming);
+}
+
+function hasMatchingDurableSubagentCards(state: OperatorConsoleState): boolean {
+  const projectedTaskIds = new Set(
+    state.tasks.cards
+      .filter((card) => card.subagents.length > 0)
+      .map((card) => card.taskId)
+  );
+  const runningTaskIds = state.activeWork.items
+    .filter((item) => item.source === "subagent" && item.status === "running" && item.taskId !== undefined)
+    .map((item) => item.taskId!);
+  return runningTaskIds.length > 0 && runningTaskIds.every((taskId) => projectedTaskIds.has(taskId));
 }
 
 function createSetupRegionDescriptors(
@@ -297,14 +346,20 @@ function surfaceOrderIndex(kind: OperatorConsoleRegionKind): number {
       return 6;
     case "queuedSteer":
       return 7;
-    case "attachments":
+    case "taskCards":
       return 8;
-    case "prompt":
+    case "taskInspection":
       return 9;
-    case "slashMenu":
+    case "attachments":
       return 10;
-    case "statusRail":
+    case "promptGap":
       return 11;
+    case "prompt":
+      return 12;
+    case "slashMenu":
+      return 13;
+    case "statusRail":
+      return 14;
   }
 }
 

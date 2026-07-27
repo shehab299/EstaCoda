@@ -47,6 +47,7 @@ export type NamedToolExecutionRequest = {
   sessionId: string;
   environmentType?: EnvironmentType;
   toolCallId?: string;
+  visibleTurnId?: string;
   toolCallName?: string;
   providerNativeToolCall?: unknown;
   signal?: AbortSignal;
@@ -244,6 +245,8 @@ export class ToolExecutor {
     } else {
       try {
         result = await tool.run(request.input, {
+          toolCallId: request.toolCallId,
+          visibleTurnId: request.visibleTurnId,
           signal: request.signal,
           environmentType,
           onEvent: request.onEvent

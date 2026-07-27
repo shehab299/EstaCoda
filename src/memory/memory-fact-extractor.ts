@@ -61,7 +61,10 @@ export async function extractMemoryFacts(input: {
       responseFormat: { type: "json_object" }
     },
     signal: input.signal,
-    scopeKey: `${input.profileId}:${input.sessionId}`
+    scopeKey: `${input.profileId}:${input.sessionId}`,
+    usage: {
+      executionSessionId: input.sessionId,
+    }
   });
 
   if (!result.ok || result.response === undefined) {

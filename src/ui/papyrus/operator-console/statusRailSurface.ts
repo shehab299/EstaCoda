@@ -2,13 +2,18 @@ import { stringWidth } from "../screen/stringWidth.js";
 import { truncateVisible } from "../../renderers/layout.js";
 import type { StatusRailState } from "./operatorConsoleState.js";
 import { styleColor, type OperatorConsoleStyle } from "./operatorConsoleStyle.js";
+import { formatUsageCost, formatUsdAmount } from "../../usage-cost-format.js";
+import type { OperatorConsoleLocale } from "./activeWorkCopy.js";
+import { isolateLtr } from "../../bidi.js";
 
 export type StatusRailRenderOptions = {
   readonly width: number;
   readonly style?: OperatorConsoleStyle;
+  readonly locale?: OperatorConsoleLocale;
 };
 
 const CONTEXT_BAR_CELLS = 10;
+const SEGMENT_SEPARATOR = " · ";
 
 export function renderStatusRailSurface(
   state: StatusRailState,
@@ -21,31 +26,112 @@ export function renderStatusRailSurface(
   const narrowModel = shortenModelLabel(state.model.label, 10);
   const minimalModel = shortenModelLabel(state.model.label, 4);
   const contextPercent = resolveContextPercent(state);
-  const percent = state.context.usedTokens === undefined ? "--%" : formatPercent(contextPercent);
   const timer = formatSessionTimer(state.sessionTimer.elapsedMs);
   const sessionIcon = options.style?.tokens.contract.toolIcon.cronjob ?? "◷";
-  const bar = state.context.usedTokens === undefined
-    ? `[${"·".repeat(CONTEXT_BAR_CELLS)}]`
-    : renderContextBar(contextPercent);
+  const timerSegment = formatSessionValue(`${sessionIcon} ${timer}`, options.style);
+  const bar = formatContextBar(state, contextPercent, options.style);
   const numbers = formatContextNumbers(state);
   const symbol = modelStateSymbol(state.model.state, state.model.route, options.style);
   const securityBadge = formatSecurityBadge(state, options.style);
-  const securitySegment = securityBadge === undefined ? "" : ` │ ${securityBadge}`;
+  const cost = state.sessionCost === undefined
+    ? undefined
+    : formatUsageCost(state.sessionCost, { locale: options.locale, compact: true });
+  const sessionTokens = state.sessionCost === undefined
+    ? undefined
+    : formatSessionTokens(
+        state.sessionCost.totalTokens,
+        state.sessionCost.usageComplete,
+        options.locale
+      );
+  const budget = state.sessionCost?.budget;
+  const budgetSuffix = budget === undefined
+    ? ""
+    : `/${formatUsdAmount(budget.maxEstimatedCostUsd, options.locale)} +${formatUsdAmount(budget.reservedCostUsd, options.locale)} ${options.locale === "ar" ? "محجوز" : "reserved"}`;
+  const costWithBudget = cost === undefined ? undefined : `${cost}${budgetSuffix}`;
+  const sessionFull = joinSegments([
+    formatSessionValue(sessionTokens, options.style),
+    formatCostValue(costWithBudget, state, options.style),
+  ], options.style);
+  const contextFull = formatContextSegment(bar, numbers, options.style);
+  const contextCompact = formatContextNumbersSegment(numbers, options.style);
+  const identityFull = formatIdentitySegments(state, securityBadge, false, options.style, options.locale);
+  const identityShort = formatIdentitySegments(state, securityBadge, true, options.style, options.locale);
 
-  const full = `${model}${securitySegment} │ ctx ${bar} ${numbers} ${percent} │ ${sessionIcon} ${timer}`;
-  if (stringWidth(full) <= width) return full;
+  const full = alignRight(
+    joinSegments([model, ...identityFull, contextFull, timerSegment], options.style),
+    sessionFull,
+    width,
+    options.style
+  );
+  if (full !== undefined) return full;
 
-  const compact = `${model}${securitySegment} │ ctx ${bar} ${percent} │ ${sessionIcon} ${timer}`;
-  if (stringWidth(compact) <= width) return compact;
+  const shortIdentity = alignRight(
+    joinSegments([model, ...identityShort, contextFull, timerSegment], options.style),
+    sessionFull,
+    width,
+    options.style
+  );
+  if (shortIdentity !== undefined) return shortIdentity;
 
-  const compactWithoutSecurity = `${model} │ ctx ${bar} ${percent} │ ${sessionIcon} ${timer}`;
-  if (stringWidth(compactWithoutSecurity) <= width) return compactWithoutSecurity;
+  const compactIdentity = alignRight(
+    joinSegments([model, ...identityShort, contextCompact, timerSegment], options.style),
+    sessionFull,
+    width,
+    options.style
+  );
+  if (compactIdentity !== undefined) return compactIdentity;
 
-  const narrow = `${narrowModel} ${symbol} │ ctx ${percent} │ ${timer}`;
-  if (stringWidth(narrow) <= width) return narrow;
+  const fullWithoutIdentity = alignRight(
+    joinSegments([model, contextFull, timerSegment], options.style),
+    sessionFull,
+    width,
+    options.style
+  );
+  if (fullWithoutIdentity !== undefined) return fullWithoutIdentity;
 
-  const minimal = `${minimalModel} ${symbol} ${percent} ${timer}`;
-  return truncateVisibleCells(minimal, width);
+  const compact = alignRight(
+    joinSegments([model, contextCompact, timerSegment], options.style),
+    sessionFull,
+    width,
+    options.style
+  );
+  if (compact !== undefined) return compact;
+
+  const narrowCost = cost === undefined
+    ? undefined
+    : budget === undefined ? cost : `${cost}/${formatUsdAmount(budget.maxEstimatedCostUsd, options.locale)}`;
+  const narrowSession = joinSegments([
+    formatSessionValue(sessionTokens, options.style),
+    formatCostValue(narrowCost, state, options.style),
+  ], options.style);
+  const narrow = alignRight(
+    joinSegments([`${narrowModel} ${symbol}`, contextCompact, timerSegment], options.style),
+    narrowSession,
+    width,
+    options.style
+  );
+  if (narrow !== undefined) return narrow;
+
+  const essential = alignRight(
+    joinSegments([contextCompact, timerSegment], options.style),
+    narrowSession,
+    width,
+    options.style
+  );
+  if (essential !== undefined) return essential;
+
+  const telemetry = joinSegments([sessionTokens, narrowCost], options.style);
+  if (telemetry.length > 0 && stringWidth(telemetry) <= width) {
+    return telemetry;
+  }
+  if (narrowCost !== undefined) {
+    return truncateVisibleCells(narrowCost, width);
+  }
+  const minimal = joinSegments([`${minimalModel} ${symbol}`, numbers, timer], options.style);
+  if (stringWidth(minimal) <= width) return minimal;
+  const contextAndTimer = joinSegments([numbers, timer], options.style);
+  if (stringWidth(contextAndTimer) <= width) return contextAndTimer;
+  return truncateVisibleCells(numbers, width);
 }
 
 export function renderContextBar(percent: number, cells = CONTEXT_BAR_CELLS): string {
@@ -72,7 +158,11 @@ export function formatSessionTimer(elapsedMs: number): string {
 }
 
 function formatModel(state: StatusRailState, style: OperatorConsoleStyle | undefined): string {
-  return `${modelLabelOrFallback(state.model.label)} ${modelStateSymbol(state.model.state, state.model.route, style)}`;
+  const label = modelLabelOrFallback(state.model.label);
+  const styledLabel = style === undefined
+    ? label
+    : styleColor(style, label, style.tokens.contract.text.primary);
+  return `${styledLabel} ${modelStateSymbol(state.model.state, state.model.route, style)}`;
 }
 
 function modelLabelOrFallback(label: string): string {
@@ -113,14 +203,56 @@ function formatSecurityBadge(
   return tokens === undefined ? badge : styleColor(style, badge, tokens.palette.caution);
 }
 
-function formatPercent(percent: number): string {
-  return `${Math.round(clampPercent(percent))}%`;
-}
-
 function formatContextNumbers(state: StatusRailState): string {
   const used = state.context.usedTokens === undefined ? "--" : formatTokenCount(state.context.usedTokens);
   if (state.context.totalTokens === undefined) return used;
   return `${used}/${formatTokenCount(state.context.totalTokens)}`;
+}
+
+function formatContextNumbersSegment(
+  value: string,
+  style: OperatorConsoleStyle | undefined
+): string {
+  if (style === undefined) return `ctx ${value}`;
+  const tokens = style.tokens.contract;
+  return `${styleColor(style, "ctx", tokens.text.muted)} ${styleColor(style, value, tokens.text.secondary)}`;
+}
+
+function formatContextSegment(
+  bar: string,
+  value: string,
+  style: OperatorConsoleStyle | undefined
+): string {
+  if (style === undefined) return `ctx ${bar} ${value}`;
+  const tokens = style.tokens.contract;
+  return `${styleColor(style, "ctx", tokens.text.muted)} ${bar} ${styleColor(style, value, tokens.text.secondary)}`;
+}
+
+function formatContextBar(
+  state: StatusRailState,
+  percent: number,
+  style: OperatorConsoleStyle | undefined
+): string {
+  if (style === undefined) {
+    return state.context.usedTokens === undefined
+      ? `[${"·".repeat(CONTEXT_BAR_CELLS)}]`
+      : renderContextBar(percent);
+  }
+  const tokens = style.tokens.contract;
+  const muted = tokens.text.muted;
+  if (state.context.usedTokens === undefined) {
+    return styleColor(style, `[${"·".repeat(CONTEXT_BAR_CELLS)}]`, muted);
+  }
+  const fullCells = percent <= 0 ? 0 : Math.ceil((clampPercent(percent) / 100) * CONTEXT_BAR_CELLS);
+  const fillColor = percent >= 90
+    ? tokens.severity.error
+    : percent >= 70 ? tokens.palette.caution : tokens.interactive.primary;
+  return [
+    styleColor(style, "[", muted),
+    styleColor(style, "▰".repeat(fullCells), fillColor),
+    styleColor(style, "▱".repeat(Math.max(0, CONTEXT_BAR_CELLS - fullCells)), muted),
+    styleColor(style, "]", muted),
+  ].join("");
 }
 
 function formatTokenCount(value: number): string {
@@ -129,6 +261,97 @@ function formatTokenCount(value: number): string {
   const thousands = normalized / 1000;
   if (Number.isInteger(thousands)) return `${thousands}k`;
   return `${thousands.toFixed(1).replace(/\.0$/u, "")}k`;
+}
+
+function formatSessionTokens(
+  value: number,
+  complete: boolean,
+  locale: OperatorConsoleLocale | undefined
+): string {
+  const count = `${formatTokenCount(value)} tok`;
+  const formatted = complete ? count : `≥ ${count}`;
+  return locale === "ar" ? isolateLtr(formatted) : formatted;
+}
+
+function formatIdentitySegments(
+  state: StatusRailState,
+  securityBadge: string | undefined,
+  compact: boolean,
+  style: OperatorConsoleStyle | undefined,
+  locale: OperatorConsoleLocale | undefined
+): readonly string[] {
+  if (securityBadge !== undefined) return [securityBadge];
+  const workspace = state.workspace;
+  if (workspace === undefined) return [];
+  const label = isolateTechnicalToken(compact ? workspace.shortLabel : workspace.label, locale);
+  const branch = compact || workspace.branch === undefined
+    ? undefined
+    : isolateTechnicalToken(workspace.branch, locale);
+  if (style === undefined) return [label, branch].filter((value): value is string => value !== undefined);
+  const tokens = style.tokens.contract;
+  return [
+    styleColor(style, label, tokens.interactive.primary),
+    ...(branch === undefined
+      ? []
+      : [styleColor(style, branch, tokens.text.secondary)]),
+  ];
+}
+
+function isolateTechnicalToken(value: string, locale: OperatorConsoleLocale | undefined): string {
+  return locale === "ar" ? isolateLtr(value) : value;
+}
+
+function formatSessionValue(
+  value: string | undefined,
+  style: OperatorConsoleStyle | undefined
+): string | undefined {
+  if (value === undefined || style === undefined) return value;
+  return styleColor(style, value, style.tokens.contract.text.secondary);
+}
+
+function formatCostValue(
+  value: string | undefined,
+  state: StatusRailState,
+  style: OperatorConsoleStyle | undefined
+): string | undefined {
+  if (value === undefined || style === undefined) return value;
+  const tokens = style.tokens.contract;
+  const color = state.sessionCost?.budget?.state === "exhausted"
+    ? tokens.severity.error
+    : state.sessionCost?.budget?.state === "warning"
+      ? tokens.palette.caution
+      : tokens.text.secondary;
+  return styleColor(style, value, color);
+}
+
+function joinSegments(
+  segments: readonly (string | undefined)[],
+  style: OperatorConsoleStyle | undefined
+): string {
+  const separator = renderSeparator(style);
+  return segments.filter((segment): segment is string => segment !== undefined && segment.length > 0).join(separator);
+}
+
+function alignRight(
+  left: string,
+  right: string,
+  width: number,
+  style: OperatorConsoleStyle | undefined
+): string | undefined {
+  if (right.length === 0) {
+    const leftWidth = stringWidth(left);
+    return leftWidth <= width ? `${left}${" ".repeat(width - leftWidth)}` : undefined;
+  }
+  const minimumWidth = stringWidth(left) + stringWidth(SEGMENT_SEPARATOR) + stringWidth(right);
+  if (minimumWidth > width) return undefined;
+  const flexibleSpace = width - minimumWidth;
+  return `${left}${" ".repeat(flexibleSpace)}${renderSeparator(style)}${right}`;
+}
+
+function renderSeparator(style: OperatorConsoleStyle | undefined): string {
+  return style === undefined
+    ? SEGMENT_SEPARATOR
+    : styleColor(style, SEGMENT_SEPARATOR, style.tokens.contract.text.muted);
 }
 
 function shortenModelLabel(label: string, maxCells: number): string {

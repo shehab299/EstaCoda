@@ -32,6 +32,7 @@ import { resolveProfileStateHome } from "../config/profile-home.js";
 import { writeCliVoiceMode } from "./voice-mode.js";
 import { CronStore } from "../cron/cron-store.js";
 import type { ProviderExecutionResult } from "../providers/provider-executor.js";
+import type { TaskStatusProjection } from "../tasks/task-operator-service.js";
 import {
   createOperatorConsoleRuntimeHost,
   formatActiveWorkSummary,
@@ -102,8 +103,6 @@ function createMockRuntime(overrides: Partial<Runtime> = {}): Runtime {
       skillCount: 0,
       toolCount: 0,
       mcp: { active: 0, total: 0 },
-      workflowAvailable: false,
-      workflowRunActive: false,
       warnings: [],
     }),
     getModelInfo: () => ({
@@ -571,6 +570,87 @@ describe("runSessionLoop — user prompt rail behavior", () => {
     expect(rendered).toContain("mock-model");
   });
 
+  it("rolls a Task from the previous user turn into a compact receipt", async () => {
+    const host = createOperatorConsoleRuntimeHost();
+    const setTasks = vi.spyOn(host, "setTasks");
+    const runtime = createMockRuntime();
+    await runtime.sessionDb.createSession({ id: runtime.sessionId, profileId: "default" });
+    await runtime.sessionDb.appendMessage({
+      id: "turn-prior",
+      sessionId: runtime.sessionId,
+      role: "user",
+      content: "Run delegated research",
+      channel: "cli",
+    });
+    const projection = {
+      taskId: "task-turn-prior",
+      originTurnId: "turn-prior",
+      objective: "Research and compare the implementation options",
+      status: "running",
+      source: "delegation",
+      executionPreference: "auto",
+      execution: "background",
+      foregroundOwnerActive: false,
+      backgroundContinuation: "available",
+      childTasks: [],
+      phase: { name: "delegating" },
+      progress: { completed: 0, skipped: 0, total: 1 },
+      activeAttempts: 1,
+      steps: [],
+      subagents: [],
+      trace: { events: [], totalEvents: 0, categoryCounts: {}, hasEarlierEvents: false },
+      recentActivity: [],
+      elapsedMs: 1_000,
+      usage: usageSummary(0.01),
+      results: [],
+      createdAt: "2030-01-01T00:00:00.000Z",
+      updatedAt: "2030-01-01T00:00:01.000Z",
+    } as unknown as TaskStatusProjection;
+    let handleCount = 0;
+    const scopedRuntime = {
+      ...runtime,
+      taskOperator: {
+        list: () => [projection],
+      } as unknown as NonNullable<Runtime["taskOperator"]>,
+      handle: async () => {
+        handleCount += 1;
+        const usage = usageSummary(0.01);
+        return mockResponse({
+          turnUsage: {
+            turnId: `turn-current-${handleCount}`,
+            mainAgent: usage,
+            auxiliaryModels: usageSummary(0),
+            delegatedWork: usageSummary(0),
+            total: usage,
+            provisional: false,
+          },
+        });
+      },
+    } as Runtime;
+    let promptIndex = 0;
+
+    await runSessionLoop({
+      runtime: scopedRuntime,
+      output: {
+        write: () => true,
+        isTTY: true,
+        columns: 120,
+        rows: 30,
+      } as unknown as NodeJS.WritableStream,
+      capabilities: interactiveCaps({ terminalWidth: 120, supportsAnimation: false }),
+      operatorConsole: { enabled: true, runtimeHost: host },
+      prompt: Object.assign(
+        async () => ["Start the next turn", "/exit"][promptIndex++] ?? "/exit",
+        { close: () => {} }
+      ),
+      close: () => {},
+    });
+
+    expect(setTasks.mock.calls.some(([state]) =>
+      state.cards.some((card) => card.taskId === projection.taskId && card.presentation === "receipt")
+    )).toBe(true);
+  });
+
   it("enables Operator Console for the production interactive launch", async () => {
     const source = await readFile(new URL("../index.ts", import.meta.url), "utf8");
 
@@ -702,6 +782,128 @@ describe("runSessionLoop — user prompt rail behavior", () => {
     expect(rendered).toContain("Mock response");
     expect(rendered).not.toContain("progress:");
     expect(rendered).not.toContain("received prompt -> ready for direct response");
+  });
+
+  it("renders delivered turn cost and a durable delegated Task handle", async () => {
+    const outputChunks: string[] = [];
+    const mainUsage = usageSummary(0.04);
+    const auxiliaryUsage = usageSummary(0.01);
+    const delegatedUsage = usageSummary(0.02);
+    const totalUsage = usageSummary(0.07);
+    const runtime = createMockRuntime({
+      taskOperator: {
+        status: () => ({
+          status: "running",
+          phase: {
+            name: "synthesizing",
+            workerProgress: { completed: 3, settled: 3, total: 3 },
+          },
+        }),
+      } as unknown as NonNullable<Runtime["taskOperator"]>,
+      handle: async () => mockResponse({
+        turnUsage: {
+          turnId: "turn-1",
+          mainAgent: mainUsage,
+          auxiliaryModels: auxiliaryUsage,
+          delegatedWork: delegatedUsage,
+          total: totalUsage,
+          provisional: false
+        },
+        toolExecutions: [{
+          tool: {
+            name: "delegate_task",
+            description: "Create a durable Task.",
+            inputSchema: {},
+            riskClass: "shared-state-mutation",
+            toolsets: ["core"],
+            progressLabel: "delegating task",
+            maxResultSizeChars: 1_000,
+          },
+          decision: "allow",
+          riskClass: "shared-state-mutation",
+          result: { ok: true, content: "created", metadata: { taskId: "T-104", status: "running" } },
+        }],
+      }),
+    });
+    let promptIndex = 0;
+
+    await runSessionLoop({
+      runtime,
+      output: {
+        write(chunk: string | Uint8Array): boolean {
+          outputChunks.push(String(chunk));
+          return true;
+        },
+        isTTY: false,
+        columns: 120,
+      } as unknown as NodeJS.WritableStream,
+      capabilities: interactiveCaps({ isTTY: false, supportsAnimation: false }),
+      prompt: Object.assign(
+        async () => ["delegate this", "/exit"][promptIndex++] ?? "/exit",
+        { close: () => {} }
+      ),
+      close: () => {},
+    });
+
+    const rendered = outputChunks.join("");
+    expect(rendered).toContain("≥ 120 tokens · ≥ $0.07");
+    expect(rendered).not.toContain("Main agent:");
+    expect(rendered).not.toContain("Auxiliary models:");
+    expect(rendered).not.toContain("Delegated work so far:");
+    expect(rendered).not.toContain("Turn total so far:");
+    expect(rendered).not.toContain("Workers still running");
+    expect(rendered).toContain("Delegated Task T-104 · synthesizing");
+    expect(rendered).toContain("3 of 3 delegated Steps completed");
+  });
+
+  it("renders a partial turn cost as a lower bound with one pricing notice", async () => {
+    const outputChunks: string[] = [];
+    const partial = { ...usageSummary(0.42), costComplete: false, incompleteReasons: ["pricing-missing"] };
+    const runtime = createMockRuntime({
+      handle: async () => mockResponse({
+        turnUsage: {
+          turnId: "turn-partial",
+          mainAgent: partial,
+          auxiliaryModels: usageSummary(0),
+          delegatedWork: usageSummary(0),
+          total: partial,
+          provisional: false
+        }
+      })
+    });
+    let promptIndex = 0;
+
+    await runSessionLoop({
+      runtime,
+      output: {
+        write(chunk: string | Uint8Array): boolean {
+          outputChunks.push(String(chunk));
+          return true;
+        },
+        isTTY: false,
+        columns: 120,
+      } as unknown as NodeJS.WritableStream,
+      capabilities: interactiveCaps({ isTTY: false, supportsAnimation: false }),
+      prompt: Object.assign(
+        async () => ["price this", "/exit"][promptIndex++] ?? "/exit",
+        { close: () => {} }
+      ),
+      close: () => {},
+    });
+
+    const rendered = outputChunks.join("");
+    expect(rendered).toContain("120 tokens · ≥ $0.42");
+    expect(rendered).not.toContain("Some provider pricing was unavailable");
+    expect(rendered).not.toContain("Turn total:");
+  });
+
+  it("restores persisted session cost onto the status rail", async () => {
+    const runtime = createMockRuntime({
+      currentSessionCost: async () => usageSummary(0.73),
+    });
+    const { raw } = await captureStartupSession({ runtime });
+
+    expect(stripAnsi(raw)).toContain("session $0.73");
   });
 
   it("shows assistant response progress when enabled", async () => {
@@ -1452,6 +1654,78 @@ describe("runSessionLoop — user prompt rail behavior", () => {
     expect(rendered).not.toContain("+----------------------------------------------------------+");
   });
 
+  it("renders a delivered Task synthesis as a normal assistant message before the next prompt", async () => {
+    const outputChunks: string[] = [];
+    const drainTaskSessionCompletions = vi.fn()
+      .mockResolvedValueOnce([{
+        bindingId: "delivery-1",
+        messageId: "task-completion-1",
+        taskId: "task-1",
+        resultId: "result-synthesis",
+        text: "The three reports agree on explicit provenance and review gates.",
+      }])
+      .mockResolvedValue([]);
+    const acknowledgeTaskSessionCompletion = vi.fn(async () => undefined);
+    const runtime = createMockRuntime({ drainTaskSessionCompletions, acknowledgeTaskSessionCompletion });
+    const prompt = Object.assign(async () => "/exit", {
+      writeDurable: vi.fn(() => false),
+      close: () => {},
+    });
+
+    await runSessionLoop({
+      runtime,
+      output: {
+        write(chunk: string | Uint8Array): boolean {
+          outputChunks.push(String(chunk));
+          return true;
+        },
+      } as NodeJS.WritableStream,
+      prompt,
+      close: () => {},
+    });
+
+    const rendered = outputChunks.join("");
+    expect(rendered).toContain("EstaCoda");
+    expect(rendered).toContain("The three reports agree on explicit provenance and review gates.");
+    expect(rendered).toContain("Ending EstaCoda session.");
+    expect(drainTaskSessionCompletions).toHaveBeenCalled();
+    expect(acknowledgeTaskSessionCompletion).toHaveBeenCalledWith({
+      bindingId: "delivery-1",
+      messageId: "task-completion-1",
+    });
+  });
+
+  it("does not acknowledge a Task synthesis when its terminal write fails", async () => {
+    const acknowledgeTaskSessionCompletion = vi.fn(async () => undefined);
+    const runtime = createMockRuntime({
+      drainTaskSessionCompletions: vi.fn()
+        .mockResolvedValueOnce([{
+          bindingId: "delivery-1",
+          messageId: "task-completion-1",
+          taskId: "task-1",
+          resultId: "result-synthesis",
+          text: "Durable answer awaiting display.",
+        }])
+        .mockResolvedValue([]),
+      acknowledgeTaskSessionCompletion,
+    });
+    const prompt = Object.assign(async () => "/exit", {
+      writeDurable: vi.fn(() => {
+        throw new Error("terminal unavailable");
+      }),
+      close: () => {},
+    });
+
+    await runSessionLoop({
+      runtime,
+      output: { write: () => true } as unknown as NodeJS.WritableStream,
+      prompt,
+      close: () => {},
+    });
+
+    expect(acknowledgeTaskSessionCompletion).not.toHaveBeenCalled();
+  });
+
   it("does not render a user prompt rail for slash commands", async () => {
     const outputChunks: string[] = [];
     const runtime = createMockRuntime();
@@ -1806,6 +2080,22 @@ function mockResponse(overrides: Partial<AgentLoopResponse> = {}): AgentLoopResp
   };
 }
 
+function usageSummary(estimatedCostUsd: number) {
+  return {
+    providerCalls: 1,
+    inputTokens: 100,
+    outputTokens: 20,
+    reasoningTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 120,
+    estimatedCostUsd,
+    usageComplete: true,
+    costComplete: true,
+    incompleteReasons: [],
+  };
+}
+
 async function renderContextUsageRail(
   eventBatches: RuntimeEvent[][],
   promptValues?: string[]
@@ -1868,6 +2158,8 @@ function providerExecutionPrimarySuccess(
       {
         provider,
         model,
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         ok: true,
         content: "Mock response",
       },
@@ -1890,6 +2182,8 @@ function providerExecutionFallbackSuccess(): ProviderExecutionResult {
       {
         provider: "mock",
         model: "mock-model",
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         credentialId: "secret-primary-credential",
         ok: false,
         errorClass: "rate-limit",
@@ -1898,6 +2192,8 @@ function providerExecutionFallbackSuccess(): ProviderExecutionResult {
       {
         provider: "fallback-provider",
         model: "fallback-model",
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:01.000Z",
         credentialId: "secret-fallback-credential",
         ok: true,
         content: "Fallback response",
@@ -1920,6 +2216,8 @@ function providerExecutionFallbackSuccessWithModel(model: string): ProviderExecu
       {
         provider: "mock",
         model: "mock-model",
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         credentialId: "secret-primary-credential",
         ok: false,
         errorClass: "rate-limit",
@@ -1928,6 +2226,8 @@ function providerExecutionFallbackSuccessWithModel(model: string): ProviderExecu
       {
         provider: "fallback-provider",
         model,
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:01.000Z",
         credentialId: "secret-fallback-credential",
         ok: true,
         content: "Fallback response",
@@ -1944,6 +2244,8 @@ function providerExecutionFailed(): ProviderExecutionResult {
       {
         provider: "mock",
         model: "mock-model",
+        state: "dispatched",
+        dispatchedAt: "2030-01-01T00:00:00.000Z",
         credentialId: "secret-primary-credential",
         ok: false,
         errorClass: "network",
@@ -2626,14 +2928,14 @@ describe("runSessionLoop — active turn spinner", () => {
     });
 
     expect(setActiveWorkSpy.mock.calls.some(([state]) =>
-      state.items.some((item) => item.source === "subagent" && item.displayLabel === "Worker 1")
+      state.items.some((item) => item.source === "subagent" && item.displayLabel === "Subagent 1")
     )).toBe(true);
     const rendered = stripAnsi(outputChunks.join(""));
     expect(rendered).toContain("Delegated work");
     const completedOutput = rendered.slice(rendered.lastIndexOf("Tools completed"));
     expect(completedOutput).toContain("Delegate Task");
     expect(completedOutput).toContain("1 completed");
-    expect(completedOutput).not.toContain("Worker 1");
+    expect(completedOutput).not.toContain("Subagent 1");
     expect(completedOutput).not.toContain("Read File");
     expect(completedOutput).not.toContain("raw delegated task text");
   });
@@ -2812,6 +3114,20 @@ describe("runSessionLoop — active turn spinner", () => {
       mode: "drafting",
       draft: "focus only on approval cards",
     });
+    const baseDraft = "focus only on approval cards";
+    input.press("🙂", { name: "🙂", sequence: "🙂" });
+    expect(host.getState().steer?.draft).toBe(`${baseDraft}🙂`);
+    input.press("\u007f", { name: "backspace", sequence: "\u007f" });
+    expect(host.getState().steer?.draft).toBe(baseDraft);
+    input.press("سَ", { name: "سَ", sequence: "سَ" });
+    expect(host.getState().steer?.draft).toBe(`${baseDraft}سَ`);
+    input.press("\u007f", { name: "backspace", sequence: "\u007f" });
+    expect(host.getState().steer?.draft).toBe(baseDraft);
+    input.press("\u001b[D", { name: "left", sequence: "\u001b[D" });
+    input.press("X", { name: "X", sequence: "X" });
+    expect(host.getState().steer?.draft).toBe("focus only on approval cardXs");
+    input.press("\u007f", { name: "backspace", sequence: "\u007f" });
+    expect(host.getState().steer?.draft).toBe(baseDraft);
     const rendered = stripAnsi(outputChunks.join(""));
     expect(rendered).toContain("Steer current turn");
     expect(rendered).toContain("focus only on approval cards");
@@ -4454,8 +4770,6 @@ describe("runSessionLoop — active turn spinner", () => {
         skillAutonomy: "autonomous",
         toolCount: 96,
         mcp: { active: 0, total: 0 },
-        workflowAvailable: false,
-        workflowRunActive: false,
         warnings: [],
       }),
     });
@@ -6541,6 +6855,50 @@ describe("runSessionLoop — active turn spinner", () => {
     expect(rendered).toContain("provider budget: token limit reached");
     const budgetIndex = rendered.indexOf("provider budget: token limit reached");
     expect(budgetIndex).toBeGreaterThan(-1);
+  });
+
+  it("renders an explicit provider spending warning in managed TTY mode", async () => {
+    const outputChunks: string[] = [];
+    const output = {
+      write(chunk: string | Uint8Array): boolean {
+        outputChunks.push(String(chunk));
+        return true;
+      },
+      isTTY: true,
+      columns: 48,
+    } as unknown as NodeJS.WritableStream;
+
+    const runtime = createEventEmittingMockRuntime([
+      { kind: "agent-start", sessionId: "test-session", input: "hello" },
+      {
+        kind: "provider-spending-warning",
+        warningId: "warning-1",
+        scopeKind: "session",
+        warningThresholdPercent: 80,
+        maxEstimatedCostUsd: 10,
+        committedCostUsd: 8
+      },
+      { kind: "agent-final", text: "Mock response" },
+    ]);
+
+    let promptIndex = 0;
+    await runSessionLoop({
+      runtime,
+      output,
+      capabilities: interactiveCaps(),
+      prompt: Object.assign(
+        async () => {
+          const values = ["hello", "/exit"];
+          return values[promptIndex++] ?? "/exit";
+        },
+        { close: () => {} }
+      ),
+      close: () => {},
+    });
+
+    const rendered = outputChunks.join("");
+    expect(rendered).toContain("Estimated spending warning");
+    expect(rendered).toContain("$8.00 of $10.00");
   });
 });
 

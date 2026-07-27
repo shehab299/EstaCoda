@@ -1,5 +1,6 @@
 import type { RuntimeEvent } from "../../../contracts/runtime-event.js";
 import { toolDisplayLabel, type ToolDisplayLocale } from "../../tool-display.js";
+import { formatSpendingThresholdWarning } from "../../spending-warning-format.js";
 import type {
   ActiveWorkItem,
   ActiveWorkActivity,
@@ -29,6 +30,7 @@ export type ActiveWorkRuntimeEvent = {
   readonly displayLabel?: string;
   readonly source?: "tool" | "subagent";
   readonly groupId?: string;
+  readonly taskId?: string;
   readonly taskIndex?: number;
   readonly taskLabel?: string;
   readonly batchTaskCount?: number;
@@ -141,6 +143,7 @@ export class ActiveWorkRuntimeEventMapper {
       displayLabel: delegationChildLabel(event.role, event.taskIndex, this.#locale),
       source: "subagent",
       groupId: event.batchId ?? event.subagentId,
+      ...(event.taskId === undefined ? {} : { taskId: event.taskId }),
       taskIndex: event.taskIndex,
       taskLabel: event.taskLabel,
       batchTaskCount: event.batchTaskCount,
@@ -284,6 +287,9 @@ function createActiveWorkItem(
     ...(event.groupId === undefined && existing?.groupId === undefined
       ? {}
       : { groupId: event.groupId ?? existing?.groupId }),
+    ...(event.taskId === undefined && existing?.taskId === undefined
+      ? {}
+      : { taskId: event.taskId ?? existing?.taskId }),
     ...(event.taskIndex === undefined && existing?.taskIndex === undefined
       ? {}
       : { taskIndex: normalizeTaskIndex(event.taskIndex ?? existing?.taskIndex) }),
@@ -327,14 +333,11 @@ function createActiveWorkItem(
 }
 
 function delegationChildLabel(
-  role: Extract<RuntimeEvent, { kind: "delegation-progress" }>["role"],
+  _role: Extract<RuntimeEvent, { kind: "delegation-progress" }>["role"],
   taskIndex: number | undefined,
-  locale: ToolDisplayLocale
+  _locale: ToolDisplayLocale
 ): string {
-  const roleLabel = locale === "ar"
-    ? role === "orchestrator" ? "منسق" : "عامل"
-    : role === "orchestrator" ? "Orchestrator" : "Worker";
-  return taskIndex === undefined ? roleLabel : `${roleLabel} ${taskIndex + 1}`;
+  return taskIndex === undefined ? "Subagent" : `Subagent ${taskIndex + 1}`;
 }
 
 function delegationActivityLabel(
@@ -352,10 +355,14 @@ function delegationActivityLabel(
       return locale === "ar" ? "يفكر" : "thinking";
     case "provider-budget-exhausted":
       return locale === "ar" ? "انتهت الميزانية" : "budget exhausted";
+    case "provider-spending-warning":
+      return locale === "ar" ? "تنبيه بشأن الإنفاق" : "spending warning";
     case "agent-final":
       return locale === "ar" ? "إنهاء العمل" : "finalizing";
     case "agent-cancelled":
       return locale === "ar" ? "جارٍ الإلغاء" : "cancelling";
+    case "assistant-preview":
+      return locale === "ar" ? "يكتب الإجابة" : "answering";
     case "delegation-result":
       return delegationResultLabel(event.status, locale);
   }
@@ -413,6 +420,18 @@ export function formatPlainDelegationProgressEvent(
     return locale === "ar"
       ? `${childLabel}: ${delegationResultLabel(event.childEvent.status, locale)}`
       : `${childLabel}: ${delegationResultLabel(event.childEvent.status, locale)}`;
+  }
+  if (event.childEvent.kind === "provider-spending-warning" &&
+      event.childEvent.scopeKind !== undefined &&
+      event.childEvent.warningThresholdPercent !== undefined &&
+      event.childEvent.maxEstimatedCostUsd !== undefined &&
+      event.childEvent.committedCostUsd !== undefined) {
+    return `${childLabel}: ${formatSpendingThresholdWarning({
+      scopeKind: event.childEvent.scopeKind,
+      warningThresholdPercent: event.childEvent.warningThresholdPercent,
+      maxEstimatedCostUsd: event.childEvent.maxEstimatedCostUsd,
+      committedCostUsd: event.childEvent.committedCostUsd
+    }, locale)}`;
   }
   return undefined;
 }

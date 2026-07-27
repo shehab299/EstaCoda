@@ -395,7 +395,7 @@ Provider failures, missing `memory_compaction` routes, scanner blocks, invalid t
 
 Memory File Compaction is separate from:
 
-- Workflow event summaries (`/workflow summarize <runId>` / `estacoda workflow summarize <runId>`)
+- durable Task state and event history
 - semantic session compression (`/compact` / `estacoda sessions compact ...`)
 - deterministic history packing
 
@@ -501,7 +501,7 @@ Compression observability now includes computed summary budgeting, durable anti-
 
 Transcript-preserving semantic compaction creates explicit session lineage where the caller can adopt a rotated session. Gateway `/compact`, gateway hygiene, and provider-turn automatic compression preserve the original transcript by creating an active compacted child session with `parentSessionId`; the parent keeps its transcript, remains searchable, and is marked ended for `compression`. Interactive CLI `/compact` and top-level `estacoda sessions compact` remain non-rotating in this implementation.
 
-Memory File Compaction is also a separate path. It can compact `USER.md` and `MEMORY.md` only, uses the `memory_compaction` auxiliary route, and remains distinct from semantic session compression and Workflow event summaries.
+Memory File Compaction is also a separate path. It can compact `USER.md` and `MEMORY.md` only, uses the `memory_compaction` auxiliary route, and remains distinct from semantic session compression and durable Task state.
 
 ## Limitations
 

@@ -5,6 +5,7 @@ import {
 } from "./focusModel.js";
 import type { OperatorConsoleLocale } from "./activeWorkCopy.js";
 import type { OperatorConsoleStyle } from "./operatorConsoleStyle.js";
+import type { SessionCostSummary, SpendingBudgetSummary } from "../../../contracts/usage-cost.js";
 
 export type OperatorConsoleMode = "session" | "setup";
 
@@ -42,6 +43,15 @@ export type StatusRailState = {
     readonly elapsedMs: number;
     readonly startedAtMs?: number;
   };
+  readonly sessionCost?: Pick<
+    SessionCostSummary,
+    "totalTokens" | "usageComplete" | "estimatedCostUsd" | "costComplete" | "budget"
+  >;
+  readonly workspace?: {
+    readonly label: string;
+    readonly shortLabel: string;
+    readonly branch?: string;
+  };
   readonly security?: {
     readonly yolo: boolean;
   };
@@ -68,7 +78,6 @@ export type TurnActivityState = {
   readonly phase: TurnActivityPhase;
   readonly backgroundKind?: BackgroundActivityKind;
   readonly label?: string;
-  readonly frameIndex?: number;
 };
 
 export type StartupDashboardState = {
@@ -108,6 +117,182 @@ export type AttachmentCardState = {
   };
 };
 
+export type TaskCardStepState = {
+  readonly stepId: string;
+  readonly position: number;
+  readonly title: string;
+  readonly objective: string;
+  readonly executorRole: "worker" | "orchestrator" | "synthesis";
+  readonly status: "pending" | "ready" | "running" | "waiting_for_input" | "waiting_for_approval" | "completed" | "failed" | "skipped" | "cancelled";
+  readonly dependsOn: readonly string[];
+  readonly childTaskPolicy: "forbid" | "fire_and_forget";
+  readonly usage: TaskCardUsageState;
+  readonly attempts: readonly TaskCardAttemptState[];
+  readonly latestAttempt?: TaskCardAttemptState;
+  readonly activeAttempt?: TaskCardAttemptState;
+};
+
+export type TaskCardUsageState = {
+  readonly providerCalls: number;
+  readonly totalTokens: number;
+  readonly estimatedCostUsd?: number;
+  readonly usageComplete: boolean;
+  readonly pricingComplete: boolean;
+};
+
+export type TaskCardAttemptState = {
+  readonly attemptId: string;
+  readonly taskId: string;
+  readonly stepId: string;
+  readonly attemptNumber: number;
+  readonly status: "queued" | "leased" | "running" | "waiting_for_input" | "waiting_for_approval" | "completed" | "failed" | "cancelled" | "interrupted" | "expired";
+  readonly workerSessionId?: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly startedAt?: string;
+  readonly completedAt?: string;
+  readonly elapsedMs: number;
+  readonly currentActivity?: string;
+  readonly currentToolCategory?: string;
+  readonly assistantPreview?: string;
+  readonly usage: TaskCardUsageState;
+};
+
+export type TaskCardActivityState = {
+  readonly eventId: string;
+  readonly kind: string;
+  readonly label: string;
+  readonly category: "terminal" | "search" | "plan" | "read" | "edit" | "answer" | "wait" | "finish" | "failed";
+  readonly timestamp: string;
+  readonly stepId?: string;
+  readonly attemptId?: string;
+  readonly subagentIndex?: number;
+};
+
+export type TaskCardTraceState = {
+  readonly events: readonly TaskCardActivityState[];
+  readonly totalEvents?: number;
+  readonly categoryCounts?: Readonly<Record<TaskCardActivityState["category"], number>>;
+  readonly hasEarlierEvents: boolean;
+};
+
+export type TaskCardResultState = {
+  readonly id: string;
+  readonly handle: string;
+  readonly kind: string;
+  readonly disposition: "accepted" | "diagnostic";
+  readonly status: string;
+  readonly byteLength: number;
+  readonly primary: boolean;
+  readonly stepId?: string;
+  readonly attemptId?: string;
+  readonly mimeType?: string;
+  readonly displaySummary?: string;
+  readonly summary?: string;
+};
+
+export type TaskCardSubagentState = {
+  readonly stepId: string;
+  readonly position: number;
+  readonly displayIndex: number;
+  readonly displayLabel: string;
+  readonly title: string;
+  readonly objective: string;
+  readonly role: "worker" | "orchestrator";
+  readonly status: TaskCardStepState["status"];
+  readonly dependsOn: readonly string[];
+  readonly elapsedMs: number;
+  readonly currentActivity?: string;
+  readonly currentToolCategory?: string;
+  readonly assistantPreview?: string;
+  readonly usage: {
+    readonly total: TaskCardUsageState;
+    readonly currentAttempt?: TaskCardUsageState;
+  };
+  readonly attempts: readonly TaskCardAttemptState[];
+  readonly latestAttempt?: TaskCardAttemptState;
+  readonly activeAttempt?: TaskCardAttemptState;
+  readonly trace: readonly TaskCardActivityState[];
+  readonly traceSummary?: Omit<TaskCardTraceState, "events">;
+  readonly results: readonly TaskCardResultState[];
+};
+
+export type TaskCardState = {
+  readonly taskId: string;
+  /** Immutable user turn that created the Task, when the creation surface supplied one. */
+  readonly originTurnId?: string;
+  /** Compact receipts remain inspectable while keeping settled and superseded turns out of the live work area. */
+  readonly presentation?: "expanded" | "receipt";
+  readonly objective: string;
+  readonly status: "planning" | "queued" | "running" | "waiting_for_host" | "waiting_for_input" | "waiting_for_approval" | "paused" | "completed" | "partial" | "failed" | "cancelled";
+  readonly executionPreference: "auto" | "background";
+  readonly execution: "foreground" | "background" | "waiting";
+  readonly foregroundOwnerActive: boolean;
+  readonly backgroundContinuation: "available" | "unavailable" | "unknown";
+  readonly executionWaitingReason?: string;
+  readonly progress: {
+    readonly completed: number;
+    readonly skipped: number;
+    readonly total: number;
+  };
+  readonly planRevision?: { readonly revision: number; readonly status: string };
+  readonly steps: readonly TaskCardStepState[];
+  readonly subagents: readonly TaskCardSubagentState[];
+  readonly trace: TaskCardTraceState;
+  readonly childTasks: readonly {
+    readonly taskId: string;
+    readonly status: TaskCardState["status"];
+    readonly parentAttemptId?: string;
+  }[];
+  readonly phase: {
+    readonly name: "planning" | "queued" | "running" | "waiting_for_host" | "waiting_for_input" | "waiting_for_approval" | "paused" | "completed" | "partial" | "failed" | "cancelled" | "delegating" | "synthesizing";
+    readonly workerProgress?: {
+      readonly completed: number;
+      readonly settled: number;
+      readonly total: number;
+    };
+  };
+  readonly recentActivity: readonly TaskCardActivityState[];
+  readonly currentToolCategory?: string;
+  readonly elapsedMs: number;
+  readonly usage: TaskCardUsageState;
+  readonly spending?: SpendingBudgetSummary;
+  readonly results: readonly TaskCardResultState[];
+  readonly waitReason?: string;
+  readonly failure?: {
+    readonly class: string;
+    readonly retryable: boolean;
+    readonly uncertainSideEffects: boolean;
+  };
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+export type ActivityTraceInspectionState = {
+  /** Stable event identity selected for inspection. Omitted while following the live tail. */
+  readonly selectedTraceEventId?: string;
+  readonly followLive: boolean;
+};
+
+export type TaskInspectionState = ActivityTraceInspectionState & {
+  /** Stable Step identity focused in the Task's Subagent list. */
+  readonly selectedSubagentStepId?: string;
+  /** Stable Step identity whose Subagent detail is open. */
+  readonly inspectedSubagentStepId?: string;
+  /** Independent trace selection retained while inspecting one Subagent. */
+  readonly subagentTrace?: ActivityTraceInspectionState;
+};
+
+export type TaskSurfaceState = {
+  readonly cards: readonly TaskCardState[];
+  readonly selectedTaskId?: string;
+  readonly inspectedTaskId?: string;
+  readonly inspection?: TaskInspectionState;
+  /** Explicit temporary terminal mouse capture. Native terminal mouse behavior is the default. */
+  readonly mouseModeActive?: boolean;
+  readonly scrollOffset: number;
+};
+
 export type ActiveWorkItemStatus =
   | "queued"
   | "running"
@@ -138,6 +323,7 @@ export type ActiveWorkItem = {
   readonly displayLabel?: string;
   readonly source?: "tool" | "subagent";
   readonly groupId?: string;
+  readonly taskId?: string;
   readonly taskIndex?: number;
   readonly taskLabel?: string;
   readonly batchTaskCount?: number;
@@ -162,7 +348,6 @@ export type ToolActivityState = {
   readonly startedAtMs?: number;
   readonly updatedAtMs?: number;
   readonly completedAtMs?: number;
-  readonly frameIndex?: number;
 };
 
 export type StreamingSegment = {
@@ -306,8 +491,11 @@ export type OperatorConsoleState = {
   readonly transcript: readonly TranscriptBlock[];
   readonly prompt: PromptSurfaceState;
   readonly status: StatusRailState;
+  /** One elapsed-time clock shared by every animated surface. */
+  readonly motionElapsedMs: number;
   readonly turnActivity?: TurnActivityState;
   readonly attachments: readonly AttachmentCardState[];
+  readonly tasks: TaskSurfaceState;
   readonly activeWork: ToolActivityState;
   readonly streaming?: StreamingState;
   readonly approvals: readonly ApprovalCardState[];
@@ -327,7 +515,10 @@ export type OperatorConsoleSurface =
   | "turnActivity"
   | "activeWork"
   | "queuedSteer"
+  | "taskCards"
+  | "taskInspection"
   | "attachments"
+  | "promptGap"
   | "prompt"
   | "slashMenu"
   | "statusRail";
@@ -341,7 +532,10 @@ export const OPERATOR_CONSOLE_SURFACE_ORDER: readonly OperatorConsoleSurface[] =
   "turnActivity",
   "activeWork",
   "queuedSteer",
+  "taskCards",
+  "taskInspection",
   "attachments",
+  "promptGap",
   "prompt",
   "slashMenu",
   "statusRail",
@@ -355,8 +549,10 @@ export type CreateInitialOperatorConsoleStateInput = {
   readonly transcript?: readonly TranscriptBlock[];
   readonly prompt?: PromptSurfaceState;
   readonly status?: StatusRailState;
+  readonly motionElapsedMs?: number;
   readonly turnActivity?: TurnActivityState;
   readonly attachments?: readonly AttachmentCardState[];
+  readonly tasks?: TaskSurfaceState;
   readonly activeWork?: ToolActivityState;
   readonly streaming?: StreamingState;
   readonly approvals?: readonly ApprovalCardState[];
@@ -382,8 +578,10 @@ export function createInitialOperatorConsoleState(
     transcript: input.transcript ?? [],
     prompt: input.prompt ?? createDefaultPromptSurfaceState(),
     status: input.status ?? createDefaultStatusRailState(),
+    motionElapsedMs: normalizeMotionElapsedMs(input.motionElapsedMs),
     ...(input.turnActivity === undefined ? {} : { turnActivity: input.turnActivity }),
     attachments: input.attachments ?? [],
+    tasks: input.tasks ?? createDefaultTaskSurfaceState(),
     activeWork: input.activeWork ?? createDefaultToolActivityState(),
     ...(input.streaming === undefined ? {} : { streaming: input.streaming }),
     approvals: input.approvals ?? [],
@@ -393,6 +591,11 @@ export function createInitialOperatorConsoleState(
     terminal: input.terminal ?? createDefaultTerminalMetrics(),
     ...(input.style === undefined ? {} : { style: input.style }),
   };
+}
+
+function normalizeMotionElapsedMs(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.max(0, value);
 }
 
 export function createDefaultPromptSurfaceState(): PromptSurfaceState {
@@ -423,6 +626,14 @@ export function createDefaultToolActivityState(): ToolActivityState {
     items: [],
     scrollOffset: 0,
     expanded: false,
+  };
+}
+
+export function createDefaultTaskSurfaceState(): TaskSurfaceState {
+  return {
+    cards: [],
+    inspection: { followLive: true },
+    scrollOffset: 0,
   };
 }
 

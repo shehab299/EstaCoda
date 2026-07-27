@@ -8,6 +8,10 @@ import { normalizeMemoryConfig } from "../config/memory-config.js";
 import { DEFAULT_DELEGATION_CONFIG } from "../config/delegation-defaults.js";
 import { resolveProfileStateHome } from "../config/profile-home.js";
 import { createSQLiteSessionDB } from "../session/session-setup.js";
+import { SQLiteTaskStore } from "../tasks/sqlite-task-store.js";
+import { TaskCompletionDeliveryService } from "../tasks/task-completion-delivery.js";
+import { TaskResultService } from "../tasks/task-result-service.js";
+import { resolveTaskWorkspaceBinding } from "../tasks/task-workspace.js";
 import { SessionFinalizationQueue } from "../session/session-finalization-queue.js";
 import { InMemorySessionDB } from "../session/in-memory-session-db.js";
 import { WorkspaceTrustStore } from "../security/workspace-trust-store.js";
@@ -15,12 +19,20 @@ import { WorkspaceApprovalController } from "../security/workspace-approval-cont
 import { ProviderRegistry } from "../providers/provider-registry.js";
 import type { CdpFetchLike, CdpWebSocketEvent, CdpWebSocketLike } from "../browser/cdp-client.js";
 import type { BrowserBackend } from "../contracts/browser.js";
+import type { DeliveryTarget } from "../channels/delivery-router.js";
 import type { ModelProfile, ProviderAdapter, ProviderCompletionOptions, ProviderRequest } from "../contracts/provider.js";
 import type { SecurityApprovalMode, SecurityAssessment, SecurityPolicy, SecurityRequest } from "../contracts/security.js";
 import type { SessionToolContext } from "../contracts/tool-context.js";
 import type { ResolvedTokens } from "../contracts/ui-tokens.js";
 import { resolveTokens } from "../theme/token-resolver.js";
-import { knowledgeMemoryToolProvider, memoryToolProvider, sessionSearchToolProvider, toolRegistrationPlan } from "../tools/index.js";
+import {
+  knowledgeMemoryToolProvider,
+  memoryToolProvider,
+  sessionSearchToolProvider,
+  taskResultToolProvider,
+  taskToolProvider,
+  toolRegistrationPlan
+} from "../tools/index.js";
 import * as pythonEnvManager from "../python-env/manager.js";
 
 type CapturedFasterWhisperOptions = {
@@ -383,6 +395,8 @@ const providerToolNameGroups = [
   { providerName: "memoryRetrieval", toolNames: ["memory.read", "memory.search"] },
   { providerName: "memoryFileCompaction", toolNames: ["memory.file_compact", "memory.file_compaction_restore"] },
   { providerName: "sessionSearch", toolNames: ["session_search"] },
+  { providerName: "taskResult", toolNames: [] },
+  { providerName: "task", toolNames: [] },
   {
     providerName: "skill",
     toolNames: [
@@ -456,6 +470,31 @@ function schemaAliasOrder(inputSchema: unknown): string[] {
 }
 
 describe("createRuntime token branding", () => {
+  it("exposes the durable agent Step executor only for profile-backed SQLite runtimes", async () => {
+    const options = await minimalRuntimeOptions();
+    const memoryRuntime = await createRuntime({ ...options, sessionDb: new InMemorySessionDB() });
+    const sqliteDb = await createSQLiteSessionDB({ path: join(options.workspaceRoot, "sessions.sqlite") });
+    const sqliteRuntime = await createRuntime({
+      ...options,
+      sessionId: `${options.sessionId}-sqlite`,
+      homeDir: options.workspaceRoot,
+      profileId: "default",
+      sessionDb: sqliteDb
+    });
+
+    try {
+      expect(memoryRuntime.taskAgentExecutor).toBeUndefined();
+      expect(sqliteRuntime.taskAgentExecutor).toBeDefined();
+      expect(sqliteRuntime.getStatus().sections).toContainEqual(expect.objectContaining({
+        kind: "kv",
+        title: "Durable tasks"
+      }));
+    } finally {
+      await memoryRuntime.dispose();
+      await sqliteRuntime.dispose();
+    }
+  });
+
   it("generates a non-scaffold session id and default title when omitted", async () => {
     const { sessionId: _sessionId, ...options } = await minimalRuntimeOptions();
     const sessionDb = new InMemorySessionDB();
@@ -471,6 +510,36 @@ describe("createRuntime token branding", () => {
       }));
     } finally {
       await runtime.dispose();
+    }
+  });
+
+  it("applies session spending defaults prospectively without rewriting resumed sessions", async () => {
+    const options = await minimalRuntimeOptions();
+    const sessionDb = new InMemorySessionDB();
+    await sessionDb.createSession({ id: "existing-unbounded", profileId: "default" });
+    const resumed = await createRuntime({
+      ...options,
+      sessionId: "existing-unbounded",
+      sessionDb,
+      closeSessionDbOnDispose: false,
+      budgets: { session: { maxEstimatedCostUsd: 10, warningThresholdPercent: 80 } }
+    });
+    const created = await createRuntime({
+      ...options,
+      sessionId: "new-bounded",
+      sessionDb,
+      closeSessionDbOnDispose: false,
+      budgets: { session: { maxEstimatedCostUsd: 10, warningThresholdPercent: 80 } }
+    });
+    try {
+      await expect(sessionDb.getSession("existing-unbounded")).resolves.not.toHaveProperty("spendingLimit");
+      await expect(sessionDb.getSession("new-bounded")).resolves.toMatchObject({
+        spendingScopeSessionId: "new-bounded",
+        spendingLimit: { maxEstimatedCostUsd: 10, warningThresholdPercent: 80 }
+      });
+    } finally {
+      await resumed.dispose();
+      await created.dispose();
     }
   });
 
@@ -783,7 +852,9 @@ describe("createRuntime MCP trust gating", () => {
     const runtime = await createRuntime(options);
     try {
       const tools = runtime.tools();
-      const expectedToolNames = providerToolNameGroups.flatMap((group) => group.toolNames);
+      const expectedToolNames = providerToolNameGroups
+        .flatMap((group) => group.toolNames)
+        .filter((name) => name !== "delegate_task");
       expect(tools.map((tool) => tool.name)).toEqual(expectedToolNames);
 
       const providerMetadataByToolName = buildProviderMetadataLookup();
@@ -2572,32 +2643,9 @@ describe("createRuntime MCP trust gating", () => {
             ],
           },
           {
-            "maxResultSizeChars": 8000,
-            "name": "delegate_task",
-            "orderIndex": 95,
-            "providerKind": "session",
-            "providerPhase": "post-tool-executor",
-            "requiredConfig": undefined,
-            "riskClass": "shared-state-mutation",
-            "schemaAliasOrder": [
-              "allowedTools",
-              "allowedToolsets",
-              "context",
-              "modelOverride",
-              "role",
-              "task",
-              "tasks",
-            ],
-            "toolsets": [
-              "core",
-              "research",
-              "coding",
-            ],
-          },
-          {
             "maxResultSizeChars": 48000,
             "name": "execute_code",
-            "orderIndex": 96,
+            "orderIndex": 95,
             "providerKind": "session",
             "providerPhase": "post-tool-executor",
             "requiredConfig": undefined,
@@ -2712,7 +2760,6 @@ describe("createRuntime MCP trust gating", () => {
           "knowledge.memory.inspect",
           "knowledge.memory.deactivate",
           "knowledge.code.query",
-          "delegate_task",
           "execute_code",
         ]
       `);
@@ -2791,547 +2838,412 @@ describe("createRuntime MCP trust gating", () => {
     }
   });
 
-  it("runs delegate_task through a real child AgentLoop and records child metadata", async () => {
+  it("omits delegate_task when durable Task persistence is unavailable", async () => {
     const options = await minimalRuntimeOptions();
-    const homeDir = join(options.workspaceRoot, "home");
-    const sessionDb = new InMemorySessionDB();
-    const providerRequests: ProviderRequest[] = [];
-    const model: ModelProfile = {
-      id: "local-child",
-      provider: "local",
-      contextWindowTokens: 4096,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: false
-    };
-    const registry = new ProviderRegistry();
-    registry.register({
-      id: "local",
-      name: "Local",
-      health: () => ({ available: true }),
-      listModels: () => [model],
-      complete: async (request) => {
-        providerRequests.push(request);
-        return {
-          ok: true,
-          provider: "local",
-          model: "local-child",
-          content: "Child final answer",
-          usage: {
-            inputTokens: 12,
-            outputTokens: 5,
-            totalTokens: 17
-          }
-        };
-      }
-    });
-    const runtime = await createRuntime({
-      ...options,
-      model,
-      primaryModelRoute: { provider: "local", id: "local-child", profile: model },
-      providerRegistry: registry,
-      homeDir,
-      sessionDb
-    });
-
+    const runtime = await createRuntime({ ...options, sessionDb: new InMemorySessionDB() });
     try {
-      await runtime.trustWorkspace?.();
-      const execution = await runtime.executeTool?.({
+      expect(runtime.tools().map((tool) => tool.name)).not.toContain("delegate_task");
+      await expect(runtime.executeTool?.({
         tool: "delegate_task",
-        toolInput: {
-          task: "Inspect delegated runtime",
-          context: "Use bounded context only."
-        }
-      });
-      const metadata = execution?.result?.metadata as { childSessionId?: string; status?: string; usage?: Record<string, unknown> } | undefined;
-      const childSessionId = metadata?.childSessionId;
-
-      expect(execution?.result?.ok).toBe(true);
-      expect(metadata).toMatchObject({
-        status: "completed",
-        usage: {
-          inputTokens: 12,
-          outputTokens: 5,
-          totalTokens: 17
-        }
-      });
-      expect(typeof childSessionId).toBe("string");
-      const childSession = await sessionDb.getSession(childSessionId!);
-      expect(childSession).toMatchObject({
-        parentSessionId: runtime.sessionId,
-        metadata: expect.objectContaining({
-          kind: "delegated-child",
-          parentSessionId: runtime.sessionId,
-          role: "leaf",
-          depth: 1,
-          approvalMode: "non-interactive-fail-closed",
-          suppressedRuntimeFeatures: expect.arrayContaining(["memoryRecall", "skillLearning", "sessionCompression"])
-        })
-      });
-      expect(childSession?.metadata?.effectiveAllowedTools).toEqual(expect.arrayContaining(["file.read", "file.search", "terminal.inspect"]));
-      expect(childSession?.metadata?.strippedTools).toEqual(expect.arrayContaining([
-        expect.objectContaining({ name: "delegate_task" }),
-        expect.objectContaining({ name: "execute_code" }),
-        expect.objectContaining({ name: "terminal.run" }),
-        expect.objectContaining({ name: "file.write" })
-      ]));
-      const childMessages = await sessionDb.listMessages(childSessionId!);
-      expect(childMessages.filter((message) => message.role === "user").map((message) => message.content)).toEqual([
-        [
-          "Delegated task: Inspect delegated runtime",
-          "",
-          "Context: Use bounded context only."
-        ].join("\n")
-      ]);
-      expect(childMessages.some((message) => message.role === "agent" && message.content.includes("Child final answer"))).toBe(true);
-      expect(providerRequests[0]?.messages.some((message) =>
-        typeof message.content === "string" && message.content.includes("Inspect delegated runtime")
-      )).toBe(true);
-      const childToolSchemas = providerToolNames(providerRequests[0]?.tools);
-      expect(childToolSchemas).toEqual(expect.arrayContaining(["file_read", "file_search", "terminal_inspect"]));
-      expect(childToolSchemas).not.toEqual(expect.arrayContaining([
-        "delegate_task",
-        "execute_code",
-        "terminal_run",
-        "file_write",
-        "process_start",
-        "process_stop"
-      ]));
-      const memoryPath = resolveProfileStateHome({ homeDir, profileId: "default" }).memoryMdPath;
-      const memory = await readFile(memoryPath, "utf8").catch(() => "");
-      expect(memory).not.toContain("- delegation");
-      expect(memory).not.toContain("Inspect delegated runtime");
-      expect(memory).not.toContain("Child final answer");
+        toolInput: { task: "Do not run" },
+        toolCallId: "missing-store-call"
+      })).resolves.toBeUndefined();
     } finally {
       await runtime.dispose();
     }
   });
 
-  it("exposes bounded active subagent operator status during child execution", async () => {
+  it("creates and idempotently replays a durable delegation Task without launching a worker", async () => {
     const options = await minimalRuntimeOptions();
-    const sessionDb = new InMemorySessionDB();
-    let providerStarted: (() => void) | undefined;
-    let providerRelease: (() => void) | undefined;
-    const providerStartedPromise = new Promise<void>((resolve) => { providerStarted = resolve; });
-    const providerReleasePromise = new Promise<void>((resolve) => { providerRelease = resolve; });
-    const model: ModelProfile = {
-      id: "local-child",
-      provider: "local",
-      contextWindowTokens: 4096,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: false
-    };
+    const sessionDb = await createSQLiteSessionDB({ path: join(options.workspaceRoot, "sessions.sqlite") });
+    await sessionDb.createSession({ id: options.sessionId, profileId: "default" });
+    const provider = vi.fn(async () => ({
+      ok: true as const,
+      provider: "unconfigured" as const,
+      model: mockModel.id,
+      content: "A worker should not run during creation."
+    }));
     const registry = new ProviderRegistry();
     registry.register({
-      id: "local",
-      name: "Local",
+      id: "unconfigured",
+      name: "Mock",
       health: () => ({ available: true }),
-      listModels: () => [model],
-      complete: async () => {
-        providerStarted?.();
-        await providerReleasePromise;
-        return {
-          ok: true,
-          provider: "local",
-          model: "local-child",
-          content: "Child final answer"
-        };
-      }
+      listModels: () => [mockModel],
+      complete: provider
     });
+    const onTaskCreated = vi.fn(async () => undefined);
+    const taskWorkspace = await resolveTaskWorkspaceBinding(options.workspaceRoot);
+    const taskHostAdmission = vi.fn(() => ({
+      workspaceIdentityHash: taskWorkspace.identityHash,
+      ownerId: "foreground-runtime",
+      kind: "foreground" as const,
+      acquiredAt: "2030-01-01T00:00:00.000Z",
+      expiresAt: "2030-01-01T00:01:00.000Z"
+    }));
     const runtime = await createRuntime({
       ...options,
-      model,
-      primaryModelRoute: { provider: "local", id: "local-child", profile: model },
       providerRegistry: registry,
-      sessionDb
+      sessionDb,
+      taskHostAdmission,
+      onTaskCreated
     });
-
     try {
       await runtime.trustWorkspace?.();
-      const delegated = runtime.executeTool?.({
+      const request = {
         tool: "delegate_task",
         toolInput: {
-          task: "Inspect api_key=sk-secret and do not expose it",
-          context: "Context with token ghp_secret should stay out of status."
-        }
-      });
-      await providerStartedPromise;
-
-      const status = runtime.activeSubagents?.();
-      expect(status).toBeDefined();
-      expect(status?.activeCount).toBe(1);
-      expect(status?.subagents[0]).toMatchObject({
-        parentSessionId: runtime.sessionId,
-        role: "leaf",
-        depth: 1,
-        provider: "local",
-        model: "local-child",
-        status: "running"
-      });
-      expect(status?.subagents[0]).not.toHaveProperty("abortController");
-      expect(JSON.stringify(status)).not.toContain("sk-secret");
-      expect(JSON.stringify(status)).not.toContain("ghp_secret");
-      expect(JSON.stringify(status)).not.toContain("Inspect api_key");
-
-      const runtimeStatus = runtime.getStatus();
-      expect(runtimeStatus.sections?.[0]).toMatchObject({
-        kind: "table",
-        title: "Active subagents (1)"
-      });
-      expect(JSON.stringify(runtimeStatus)).not.toContain("Inspect api_key");
-
-      providerRelease?.();
-      const execution = await delegated;
-      expect(execution?.result?.metadata).toMatchObject({ status: "completed" });
-      expect(runtime.activeSubagents?.().activeCount).toBe(0);
-    } finally {
-      providerRelease?.();
-      await runtime.dispose();
-    }
-  });
-
-  it("runs same-provider child model overrides through filtered child tool schemas", async () => {
-    const options = await minimalRuntimeOptions();
-    const sessionDb = new InMemorySessionDB();
-    const providerRequests: ProviderRequest[] = [];
-    const parentModel: ModelProfile = {
-      id: "local-parent",
-      provider: "local",
-      contextWindowTokens: 4096,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: false
-    };
-    const registry = new ProviderRegistry();
-    registry.register({
-      id: "local",
-      name: "Local",
-      health: () => ({ available: true }),
-      listModels: () => [parentModel, { ...parentModel, id: "local-child-override" }],
-      complete: async (request) => {
-        providerRequests.push(request);
-        return {
-          ok: true,
-          provider: "local",
-          model: request.model,
-          content: "Override child answer"
-        };
-      }
-    });
-    const runtime = await createRuntime({
-      ...options,
-      model: parentModel,
-      primaryModelRoute: { provider: "local", id: "local-parent", profile: parentModel },
-      modelFallbackRoutes: [
-        {
-          provider: "local",
-          id: "local-fallback",
-          profile: { ...parentModel, id: "local-fallback" }
-        }
-      ],
-      providerRegistry: registry,
-      providerConfigs: {
-        deepseek: {
-          baseUrl: "https://configured.deepseek.example/v1",
-          apiKeyEnv: "DEEPSEEK_API_KEY",
-          apiMode: "custom_openai_compatible",
-          authMethod: "api_key",
-          enableNetwork: true
-        }
-      },
-      sessionDb
-    });
-
-    try {
-      await runtime.trustWorkspace?.();
-      const execution = await runtime.executeTool?.({
-        tool: "delegate_task",
-        toolInput: {
-          task: "Use override",
-          modelOverride: { provider: "local", model: "local-child-override" }
-        }
-      });
-      const metadata = execution?.result?.metadata as {
-        childSessionId?: string;
-        modelOverride?: Record<string, unknown>;
-      } | undefined;
-      const childSession = await sessionDb.getSession(metadata?.childSessionId ?? "");
-      const childToolSchemas = providerToolNames(providerRequests[0]?.tools);
-
-      expect(execution?.result?.ok).toBe(true);
-      expect(providerRequests[0]?.provider).toBe("local");
-      expect(providerRequests[0]?.model).toBe("local-child-override");
-      expect(metadata?.modelOverride).toEqual({
-        requested: true,
-        status: "applied",
-        provider: "local",
-        model: "local-child-override",
-        fallbackBehavior: "disabled-for-override"
-      });
-      expect(childSession?.metadata?.modelOverride).toEqual(metadata?.modelOverride);
-      expect(childToolSchemas).toEqual(expect.arrayContaining(["file_read", "file_search", "terminal_inspect"]));
-      expect(childToolSchemas).not.toEqual(expect.arrayContaining(["delegate_task", "terminal_run", "file_write"]));
-      expect(JSON.stringify(metadata?.modelOverride)).not.toContain("KEY");
-    } finally {
-      await runtime.dispose();
-    }
-  });
-
-  it("runs reviewed cross-provider child model overrides with target provider routing", async () => {
-    const options = await minimalRuntimeOptions();
-    const sessionDb = new InMemorySessionDB();
-    const providerRequests: ProviderRequest[] = [];
-    const providerOptions: ProviderCompletionOptions[] = [];
-    const parentModel: ModelProfile = {
-      id: "local-parent",
-      provider: "local",
-      contextWindowTokens: 4096,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: false
-    };
-    const targetModel: ModelProfile = {
-      id: "deepseek-chat",
-      provider: "deepseek",
-      contextWindowTokens: 64_000,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: true
-    };
-    const registry = new ProviderRegistry();
-    registry.register({
-      id: "local",
-      name: "Local",
-      health: () => ({ available: true }),
-      listModels: () => [parentModel],
-      complete: async (request) => {
-        providerRequests.push(request);
-        return {
-          ok: true,
-          provider: "local",
-          model: request.model,
-          content: "Unexpected parent provider answer"
-        };
-      }
-    });
-    registry.register({
-      id: "deepseek",
-      name: "DeepSeek",
-      endpoint: {
-        baseUrl: "https://api.deepseek.com/v1",
-        apiKey: { kind: "env", name: "DEEPSEEK_API_KEY" }
-      },
-      health: () => ({ available: true }),
-      listModels: () => [targetModel],
-      complete: async (request, completionOptions) => {
-        providerRequests.push(request);
-        providerOptions.push(completionOptions ?? {});
-        return {
-          ok: true,
-          provider: "deepseek",
-          model: request.model,
-          content: "Cross-provider child answer"
-        };
-      }
-    });
-    const previous = process.env.DEEPSEEK_API_KEY;
-    process.env.DEEPSEEK_API_KEY = "secret-deepseek-value";
-    const runtime = await createRuntime({
-      ...options,
-      model: parentModel,
-      primaryModelRoute: { provider: "local", id: "local-parent", profile: parentModel },
-      modelFallbackRoutes: [
-        {
-          provider: "local",
-          id: "local-fallback",
-          profile: { ...parentModel, id: "local-fallback" }
-        }
-      ],
-      providerRegistry: registry,
-      providerConfigs: {
-        deepseek: {
-          baseUrl: "https://configured.deepseek.example/v1",
-          apiKeyEnv: "DEEPSEEK_API_KEY",
-          apiMode: "custom_openai_compatible",
-          authMethod: "api_key",
-          enableNetwork: true
-        }
-      },
-      sessionDb
-    });
-
-    try {
-      await runtime.trustWorkspace?.();
-      const execution = await runtime.executeTool?.({
-        tool: "delegate_task",
-        toolInput: {
-          task: "Use cross-provider override",
-          modelOverride: { provider: "deepseek", model: "deepseek-chat" }
-        }
-      });
-      const metadata = execution?.result?.metadata as {
-        childSessionId?: string;
-        modelOverride?: Record<string, unknown>;
-      } | undefined;
-      const childSession = await sessionDb.getSession(metadata?.childSessionId ?? "");
-      const childToolSchemas = providerToolNames(providerRequests[0]?.tools);
-
-      expect(execution?.result?.ok).toBe(true);
-      expect(providerRequests).toHaveLength(1);
-      expect(providerRequests[0]?.provider).toBe("deepseek");
-      expect(providerRequests[0]?.model).toBe("deepseek-chat");
-      expect(providerOptions[0]?.endpoint).toMatchObject({
-        baseUrl: "https://configured.deepseek.example/v1",
-        apiKey: { kind: "env", name: "DEEPSEEK_API_KEY" }
-      });
-      expect(metadata?.modelOverride).toEqual({
-        requested: true,
-        status: "applied",
-        provider: "deepseek",
-        model: "deepseek-chat",
-        fallbackBehavior: "disabled-for-override"
-      });
-      expect(childSession?.metadata?.modelOverride).toEqual(metadata?.modelOverride);
-      expect(childToolSchemas).toEqual(expect.arrayContaining(["file_read", "file_search", "terminal_inspect"]));
-      expect(childToolSchemas).not.toEqual(expect.arrayContaining(["delegate_task", "terminal_run", "file_write"]));
-      expect(JSON.stringify(metadata?.modelOverride)).not.toContain("secret-deepseek-value");
-    } finally {
-      if (previous === undefined) {
-        delete process.env.DEEPSEEK_API_KEY;
-      } else {
-        process.env.DEEPSEEK_API_KEY = previous;
-      }
-      await runtime.dispose();
-    }
-  });
-
-  it("blocks cross-provider child model overrides with missing target credentials before execution", async () => {
-    const options = await minimalRuntimeOptions();
-    const sessionDb = new InMemorySessionDB();
-    const providerRequests: ProviderRequest[] = [];
-    const parentModel: ModelProfile = {
-      id: "local-parent",
-      provider: "local",
-      contextWindowTokens: 4096,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: false
-    };
-    const targetModel: ModelProfile = {
-      id: "deepseek-chat",
-      provider: "deepseek",
-      contextWindowTokens: 64_000,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: true
-    };
-    const registry = new ProviderRegistry();
-    registry.register({
-      id: "local",
-      name: "Local",
-      health: () => ({ available: true }),
-      listModels: () => [parentModel],
-      complete: async (request) => {
-        providerRequests.push(request);
-        return { ok: true, provider: "local", model: request.model, content: "parent" };
-      }
-    });
-    registry.register({
-      id: "deepseek",
-      name: "DeepSeek",
-      endpoint: {
-        baseUrl: "https://api.deepseek.com/v1",
-        apiKey: { kind: "env", name: "DEEPSEEK_MISSING_API_KEY" }
-      },
-      health: () => ({ available: true }),
-      listModels: () => [targetModel],
-      complete: async (request) => {
-        providerRequests.push(request);
-        return { ok: true, provider: "deepseek", model: request.model, content: "child" };
-      }
-    });
-    delete process.env.DEEPSEEK_MISSING_API_KEY;
-    const runtime = await createRuntime({
-      ...options,
-      model: parentModel,
-      primaryModelRoute: { provider: "local", id: "local-parent", profile: parentModel },
-      providerRegistry: registry,
-      providerConfigs: {
-        deepseek: {
-          baseUrl: "https://api.deepseek.com/v1",
-          apiKeyEnv: "DEEPSEEK_MISSING_API_KEY",
-          enableNetwork: true
-        }
-      },
-      sessionDb
-    });
-
-    try {
-      await runtime.trustWorkspace?.();
-      const execution = await runtime.executeTool?.({
-        tool: "delegate_task",
-        toolInput: {
-          task: "Use cross-provider override",
-          modelOverride: { provider: "deepseek", model: "deepseek-chat" }
-        }
-      });
-      const metadata = execution?.result?.metadata as {
+          tasks: [
+            { task: "Inspect A" },
+            { task: "Inspect B", role: "orchestrator", modelOverride: { model: "mock-model" } }
+          ]
+        },
+        toolCallId: "provider-delegate-call-1"
+      };
+      const first = await runtime.executeTool?.(request);
+      const replay = await runtime.executeTool?.(request);
+      const firstHandle = first?.result?.metadata as {
+        taskId?: string;
         status?: string;
-        reason?: string;
-        modelOverride?: Record<string, unknown>;
+        stepCount?: number;
+        synthesisStepId?: string;
+        primaryResultStepId?: string;
       } | undefined;
+      const replayHandle = replay?.result?.metadata as { taskId?: string; idempotentReplay?: boolean } | undefined;
+      const taskStore = new SQLiteTaskStore({ db: sessionDb.db, profileId: "default" });
+      const task = taskStore.getTask(firstHandle?.taskId ?? "missing");
+      const steps = task === null ? [] : taskStore.listSteps(task.id, task.activePlanRevisionId ?? "missing");
 
-      expect(execution?.result?.ok).toBe(false);
-      expect(metadata).toMatchObject({
-        status: "blocked",
-        reason: "model-override-unsupported",
-        modelOverride: {
-          requested: true,
-          status: "rejected",
-          provider: "deepseek",
-          model: "deepseek-chat",
-          reason: "missing-credentials"
-        }
+      expect(first?.result?.ok).toBe(true);
+      expect(firstHandle).toMatchObject({
+        status: "queued",
+        stepCount: 3,
+        synthesisStepId: expect.any(String),
+        primaryResultStepId: expect.any(String),
       });
-      expect(providerRequests).toEqual([]);
+      expect(replayHandle).toMatchObject({ taskId: firstHandle?.taskId, idempotentReplay: true });
+      expect(task).toMatchObject({ source: "delegation", status: "queued", creatorSessionId: runtime.sessionId });
+      expect(taskStore.getTaskHostLease(task!.id)).toMatchObject({
+        ownerId: "foreground-runtime",
+        kind: "foreground",
+        fencingToken: 1
+      });
+      expect(steps.map((step) => step.executor.role)).toEqual(["worker", "orchestrator", "synthesis"]);
+      expect(steps[1]?.executor.model).toEqual({ id: "mock-model" });
+      expect(new Set(steps[2]?.dependsOn)).toEqual(new Set([steps[0]?.id, steps[1]?.id]));
+      expect(onTaskCreated).toHaveBeenCalledTimes(2);
+      expect(taskHostAdmission).toHaveBeenCalledTimes(1);
+      expect(onTaskCreated).toHaveBeenNthCalledWith(1, firstHandle?.taskId);
+      expect(provider).not.toHaveBeenCalled();
+      expect((await sessionDb.listSessions("default")).map((session) => session.id)).toEqual([runtime.sessionId]);
     } finally {
       await runtime.dispose();
     }
   });
 
-  it("reflects delegation config limits in delegate_task provider schema descriptions", async () => {
+  it("binds single and synthesized batch answers to the CLI outbox and honors the inspection-only opt-out", async () => {
     const options = await minimalRuntimeOptions();
-    const providerRequests: ProviderRequest[] = [];
-    const model: ModelProfile = {
-      id: "local-schema",
-      provider: "local",
-      contextWindowTokens: 4096,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: false
-    };
-    const registry = new ProviderRegistry();
-    registry.register({
-      id: "local",
-      name: "Local",
-      health: () => ({ available: true }),
-      listModels: () => [model],
-      complete: async (request) => {
-        providerRequests.push(request);
-        return {
-          ok: true,
-          provider: "local",
-          model: model.id,
-          content: "ok"
-        };
-      }
-    });
+    const sessionDb = await createSQLiteSessionDB({ path: join(options.workspaceRoot, "cli-completion-sessions.sqlite") });
+    await sessionDb.createSession({ id: options.sessionId, profileId: "default" });
     const runtime = await createRuntime({
       ...options,
-      model,
-      primaryModelRoute: { provider: "local", id: model.id, profile: model },
-      providerRegistry: registry,
+      sessionDb,
+      enableTaskSessionCompletion: true,
+    });
+    try {
+      await runtime.trustWorkspace?.();
+      const delegated = await runtime.executeTool?.({
+        tool: "delegate_task",
+        toolInput: {
+          tasks: [{ task: "Research the first source." }, { task: "Research the second source." }],
+        },
+        toolCallId: "cli-synthesis-completion-1",
+      });
+      const delegatedHandle = delegated?.result?.metadata as {
+        taskId?: string;
+        stepCount?: number;
+        synthesisStepId?: string;
+        primaryResultStepId?: string;
+      } | undefined;
+      const taskId = delegatedHandle?.taskId;
+      if (taskId === undefined) throw new Error("Expected durable Task ID.");
+      const store = new SQLiteTaskStore({ db: sessionDb.db, profileId: "default" });
+
+      expect(delegatedHandle).toMatchObject({
+        stepCount: 3,
+        synthesisStepId: expect.any(String),
+        primaryResultStepId: expect.any(String),
+      });
+      expect(store.listDeliveryBindings({ taskId })).toEqual([
+        expect.objectContaining({
+          authorizedSessionId: runtime.sessionId,
+          deliveryKey: "origin-completion",
+          destination: { platform: "cli" },
+          status: "pending",
+        }),
+      ]);
+      expect(runtime.drainTaskSessionCompletions).toBeTypeOf("function");
+      expect(runtime.acknowledgeTaskSessionCompletion).toBeTypeOf("function");
+      await expect(runtime.drainTaskSessionCompletions?.()).resolves.toEqual([]);
+      expect(store.getDeliveryBinding(store.listDeliveryBindings({ taskId })[0]!.id)?.status).toBe("pending");
+
+      const single = await runtime.executeTool?.({
+        tool: "delegate_task",
+        toolInput: { tasks: [{ task: "Return one delegated answer." }] },
+        toolCallId: "cli-single-completion-1",
+      });
+      const singleReplay = await runtime.executeTool?.({
+        tool: "delegate_task",
+        toolInput: { tasks: [{ task: "Return one delegated answer." }] },
+        toolCallId: "cli-single-completion-1",
+      });
+      const singleHandle = single?.result?.metadata as {
+        taskId?: string;
+        stepCount?: number;
+        synthesisStepId?: string;
+      } | undefined;
+      const singleReplayHandle = singleReplay?.result?.metadata as {
+        taskId?: string;
+        idempotentReplay?: boolean;
+      } | undefined;
+      expect(singleHandle).toMatchObject({ stepCount: 1 });
+      expect(singleHandle?.synthesisStepId).toBeUndefined();
+      expect(singleReplayHandle).toMatchObject({ taskId: singleHandle?.taskId, idempotentReplay: true });
+      expect(store.listDeliveryBindings({ taskId: singleHandle!.taskId! })).toEqual([
+        expect.objectContaining({
+          authorizedSessionId: runtime.sessionId,
+          deliveryKey: "origin-completion",
+          destination: { platform: "cli" },
+          status: "pending",
+        }),
+      ]);
+
+      const inspectionOnly = await runtime.executeTool?.({
+        tool: "delegate_task",
+        toolInput: {
+          tasks: [{ task: "Inspect the first source." }, { task: "Inspect the second source." }],
+          synthesis: false,
+        },
+        toolCallId: "cli-inspection-only-1",
+      });
+      const inspectionHandle = inspectionOnly?.result?.metadata as {
+        taskId?: string;
+        stepCount?: number;
+        synthesisStepId?: string;
+      } | undefined;
+      expect(inspectionHandle).toMatchObject({ stepCount: 2 });
+      expect(inspectionHandle?.synthesisStepId).toBeUndefined();
+      expect(store.listDeliveryBindings({ taskId: inspectionHandle!.taskId! })).toEqual([]);
+
+      const singleInspectionOnly = await runtime.executeTool?.({
+        tool: "delegate_task",
+        toolInput: {
+          tasks: [{ task: "Inspect one source without returning it to the transcript." }],
+          synthesis: false,
+        },
+        toolCallId: "cli-single-inspection-only-1",
+      });
+      const singleInspectionHandle = singleInspectionOnly?.result?.metadata as {
+        taskId?: string;
+        stepCount?: number;
+        synthesisStepId?: string;
+      } | undefined;
+      expect(singleInspectionHandle).toMatchObject({ stepCount: 1 });
+      expect(singleInspectionHandle?.synthesisStepId).toBeUndefined();
+      expect(store.listDeliveryBindings({ taskId: singleInspectionHandle!.taskId! })).toEqual([]);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("activates operator-created Tasks through the process hook", async () => {
+    const options = await minimalRuntimeOptions();
+    const sessionDb = await createSQLiteSessionDB({ path: join(options.workspaceRoot, "operator-task-sessions.sqlite") });
+    await sessionDb.createSession({ id: options.sessionId, profileId: "default" });
+    const onTaskCreated = vi.fn(async () => undefined);
+    const taskWorkspace = await resolveTaskWorkspaceBinding(options.workspaceRoot);
+    const taskHostAdmission = vi.fn(() => ({
+      workspaceIdentityHash: taskWorkspace.identityHash,
+      ownerId: "foreground-operator",
+      kind: "foreground" as const,
+      acquiredAt: "2030-01-01T00:00:00.000Z",
+      expiresAt: "2030-01-01T00:01:00.000Z"
+    }));
+    const runtime = await createRuntime({ ...options, sessionDb, taskHostAdmission, onTaskCreated });
+    try {
+      await runtime.trustWorkspace?.();
+      const task = await runtime.beginTask?.("Execute this Task in the foreground.");
+      const taskStore = new SQLiteTaskStore({ db: sessionDb.db, profileId: "default" });
+
+      expect(task?.status).toBe("queued");
+      expect(task?.execution).toBe("foreground");
+      expect(taskStore.getTaskHostLease(task!.taskId)).toMatchObject({
+        ownerId: "foreground-operator",
+        kind: "foreground",
+        fencingToken: 1
+      });
+      expect(taskHostAdmission).toHaveBeenCalledOnce();
+      expect(onTaskCreated).toHaveBeenCalledWith(task?.taskId);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("returns an operator Task handle when post-commit foreground activation fails", async () => {
+    const options = await minimalRuntimeOptions();
+    const sessionDb = await createSQLiteSessionDB({ path: join(options.workspaceRoot, "operator-task-activation-failure.sqlite") });
+    await sessionDb.createSession({ id: options.sessionId, profileId: "default" });
+    const onTaskCreated = vi.fn(async () => {
+      throw new Error("sensitive foreground activation detail");
+    });
+    const runtime = await createRuntime({ ...options, sessionDb, onTaskCreated });
+    try {
+      await runtime.trustWorkspace?.();
+      const task = await runtime.beginTask?.("Remain durable after activation failure.");
+      const taskStore = new SQLiteTaskStore({ db: sessionDb.db, profileId: "default" });
+
+      expect(task).toMatchObject({
+        status: "queued",
+        activationFailure: "post-commit-activation-failed"
+      });
+      expect(JSON.stringify(task)).not.toContain("sensitive foreground activation detail");
+      expect(taskStore.getTask(task!.taskId)).toMatchObject({ id: task!.taskId, status: "queued" });
+      expect(onTaskCreated).toHaveBeenCalledWith(task?.taskId);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("sends explicitly background operator Tasks directly to the gateway path", async () => {
+    const options = await minimalRuntimeOptions();
+    const sessionDb = await createSQLiteSessionDB({ path: join(options.workspaceRoot, "background-operator-task-sessions.sqlite") });
+    await sessionDb.createSession({ id: options.sessionId, profileId: "default" });
+    const onTaskCreated = vi.fn(async () => undefined);
+    const runtime = await createRuntime({
+      ...options,
+      sessionDb,
+      onTaskCreated,
+      taskBackgroundContinuation: "available"
+    });
+    try {
+      await runtime.trustWorkspace?.();
+      const task = await runtime.beginTask?.("Execute this Task in the background.", {
+        executionPreference: "background"
+      });
+
+      expect(task).toMatchObject({
+        executionPreference: "background",
+        execution: "waiting",
+        foregroundOwnerActive: false,
+        backgroundContinuation: "available"
+      });
+      expect(onTaskCreated).not.toHaveBeenCalled();
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it("persists and delivers one terminal completion for a gateway-created Task after restart", async () => {
+    const options = await minimalRuntimeOptions();
+    const databasePath = join(options.workspaceRoot, "gateway-task-sessions.sqlite");
+    let sessionDb = await createSQLiteSessionDB({ path: databasePath });
+    const runtime = await createRuntime({
+      ...options,
+      sessionDb,
+      closeSessionDbOnDispose: false
+    });
+    await runtime.trustWorkspace?.();
+    const delegated = await runtime.withTaskCreationOrigin!({
+      source: "gateway",
+      completionDestination: {
+        platform: "telegram",
+        chatId: "authorized-chat",
+        threadId: "authorized-thread"
+      }
+    }, () => runtime.executeTool!({
+      tool: "delegate_task",
+      toolInput: { tasks: [{ task: "Inspect the production runtime and report the result." }] },
+      toolCallId: "gateway-production-task-1"
+    }));
+    const taskId = (delegated?.result?.metadata as { taskId?: string } | undefined)?.taskId;
+    const localDelegated = await runtime.executeTool!({
+      tool: "delegate_task",
+      toolInput: { tasks: [{ task: "Keep this local to the CLI runtime." }] },
+      toolCallId: "local-production-task-1"
+    });
+    const localTaskId = (localDelegated?.result?.metadata as { taskId?: string } | undefined)?.taskId;
+    expect(delegated?.result?.ok).toBe(true);
+    expect(localDelegated?.result?.ok).toBe(true);
+    const store = new SQLiteTaskStore({ db: sessionDb.db, profileId: "default" });
+    const queued = store.getTask(taskId ?? "missing")!;
+    const binding = store.listDeliveryBindings({ taskId: queued.id })[0]!;
+
+    expect(queued).toMatchObject({ source: "delegation", creatorSessionId: runtime.sessionId });
+    expect(binding).toMatchObject({
+      authorizedSessionId: runtime.sessionId,
+      deliveryKey: "origin-completion",
+      destination: {
+        platform: "telegram",
+        chatId: "authorized-chat",
+        threadId: "authorized-thread"
+      },
+      status: "pending"
+    });
+    expect(store.listDeliveryBindings({ taskId: localTaskId ?? "missing" })).toEqual([]);
+    store.atomicWrite((tx) => {
+      const startedAt = "2030-01-01T00:00:00.000Z";
+      const running = { ...queued, status: "running" as const, startedAt, updatedAt: startedAt };
+      tx.updateTask(running);
+      tx.updateTask({
+        ...running,
+        status: "completed",
+        completedAt: "2030-01-01T00:00:01.000Z",
+        updatedAt: "2030-01-01T00:00:01.000Z"
+      });
+    });
+    await runtime.dispose();
+    sessionDb.close();
+
+    sessionDb = await createSQLiteSessionDB({ path: databasePath });
+    const restartedStore = new SQLiteTaskStore({ db: sessionDb.db, profileId: "default" });
+    const resultService = new TaskResultService({
+      store: restartedStore,
+      profileId: "default",
+      contentRoot: join(options.workspaceRoot, "gateway-task-results"),
+      sessionDb
+    });
+    const deliverText = vi.fn(async (_targets: DeliveryTarget[], _text: string) => new Map([
+      ["telegram:authorized-chat:authorized-thread", { success: true }]
+    ]));
+    const delivery = new TaskCompletionDeliveryService({
+      store: restartedStore,
+      resultService,
+      router: { deliverText }
+    });
+
+    await expect(delivery.runOnce()).resolves.toEqual({
+      recovered: 0, recoveryFailed: 0, claimed: 1, delivered: 1, failed: 0
+    });
+    await expect(delivery.runOnce()).resolves.toEqual({
+      recovered: 0, recoveryFailed: 0, claimed: 0, delivered: 0, failed: 0
+    });
+    expect(deliverText).toHaveBeenCalledOnce();
+    expect(deliverText.mock.calls[0]?.[0]).toEqual([{
+      kind: "channel",
+      platform: "telegram",
+      chatId: "authorized-chat",
+      threadId: "authorized-thread"
+    }]);
+    expect(restartedStore.getDeliveryBinding(binding.id)?.status).toBe("delivered");
+    sessionDb.close();
+  });
+
+  it("reflects durable delegation limits in the registered tool schema", async () => {
+    const options = await minimalRuntimeOptions();
+    const sessionDb = await createSQLiteSessionDB({ path: join(options.workspaceRoot, "sessions.sqlite") });
+    await sessionDb.createSession({ id: options.sessionId, profileId: "default" });
+    const runtime = await createRuntime({
+      ...options,
+      sessionDb,
       delegationConfig: {
         ...DEFAULT_DELEGATION_CONFIG,
         maxConcurrentChildren: 2,
@@ -3339,108 +3251,13 @@ describe("createRuntime MCP trust gating", () => {
         maxSpawnDepth: 3
       }
     });
-
     try {
-      await runtime.handle({ text: "hello", channel: "cli", trustedWorkspace: true });
-      const delegateSchema = (providerRequests[0]?.tools as Array<{ function: { name: string; description: string } }> | undefined)?.find((tool) =>
-        tool.function.name === "delegate_task"
-      );
-      expect(delegateSchema?.function.description).toContain("up to 4 batch tasks");
-      expect(delegateSchema?.function.description).toContain("at most 2 children");
-      expect(delegateSchema?.function.description).toContain("limited to 3");
-      expect(JSON.stringify(delegateSchema)).not.toContain(options.workspaceRoot);
-    } finally {
-      await runtime.dispose();
-    }
-  });
-
-  it("lets a child provider request a safe tool and receive tool feedback", async () => {
-    const options = await minimalRuntimeOptions();
-    await writeFile(join(options.workspaceRoot, "needle.txt"), "needle-value");
-    const sessionDb = new InMemorySessionDB();
-    const providerRequests: ProviderRequest[] = [];
-    const model: ModelProfile = {
-      id: "local-child-tools",
-      provider: "local",
-      contextWindowTokens: 4096,
-      supportsTools: true,
-      supportsVision: false,
-      supportsStructuredOutput: false
-    };
-    const responses = [
-      {
-        ok: true,
-        provider: "local" as const,
-        model: "local-child-tools",
-        content: "",
-        finishReason: "tool_calls" as const,
-        raw: {
-          choices: [
-            {
-              message: {
-                tool_calls: [
-                  {
-                    id: "call-1",
-                    function: {
-                      name: "file.search",
-                      arguments: JSON.stringify({ query: "needle-value" })
-                    }
-                  }
-                ]
-              }
-            }
-          ]
-        }
-      },
-      {
-        ok: true,
-        provider: "local" as const,
-        model: "local-child-tools",
-        content: "Tool feedback received."
-      }
-    ];
-    const registry = new ProviderRegistry();
-    registry.register({
-      id: "local",
-      name: "Local",
-      health: () => ({ available: true }),
-      listModels: () => [model],
-      complete: async (request) => {
-        providerRequests.push(request);
-        return responses.shift()!;
-      }
-    });
-    const runtime = await createRuntime({
-      ...options,
-      model,
-      primaryModelRoute: { provider: "local", id: "local-child-tools", profile: model },
-      providerRegistry: registry,
-      sessionDb
-    });
-
-    try {
-      await runtime.trustWorkspace?.();
-      const execution = await runtime.executeTool?.({
-        tool: "delegate_task",
-        toolInput: {
-          task: "Find the needle"
-        }
-      });
-
-      expect(execution?.result?.metadata).toMatchObject({
-        status: "completed",
-        summary: "Tool feedback received."
-      });
-      expect(providerRequests.length).toBeGreaterThanOrEqual(2);
-      expect(providerToolNames(providerRequests[0]?.tools)).toContain("file_search");
-      const metadata = execution?.result?.metadata as { childSessionId?: string } | undefined;
-      const childMessages = await sessionDb.listMessages(metadata!.childSessionId!);
-      expect(childMessages.some((message) => message.role === "tool" && message.metadata?.tool === "file.search")).toBe(true);
-      const childEvents = await sessionDb.listEvents(metadata!.childSessionId!);
-      expect(childEvents).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "tool-called", tool: "file.search" }),
-        expect.objectContaining({ kind: "tool-result", tool: "file.search" })
-      ]));
+      const delegateTool = runtime.tools().find((tool) => tool.name === "delegate_task");
+      expect(delegateTool?.description).toContain("up to 4 batch tasks");
+      expect(delegateTool?.description).toContain("at most 2 Steps");
+      expect(delegateTool?.description).toContain("limited to 3");
+      expect(delegateTool?.description).toContain("Returns a Task handle immediately");
+      expect(JSON.stringify(delegateTool)).not.toContain(options.workspaceRoot);
     } finally {
       await runtime.dispose();
     }
@@ -4620,6 +4437,26 @@ describe("createRuntime faster-whisper runtime wiring", () => {
 });
 
 describe("createRuntime SQLite session lifecycle", () => {
+  it("registers durable Task result reads only for SQLite runtimes", async () => {
+    const options = await minimalRuntimeOptions();
+    const sessionDb = await createSQLiteSessionDB({
+      path: join(options.workspaceRoot, ".estacoda", "sessions.sqlite")
+    });
+    try {
+      const runtime = await createRuntime({ ...options, sessionDb, closeSessionDbOnDispose: false });
+      try {
+        expect(taskResultToolProvider.name).toBe("taskResult");
+        expect(taskToolProvider.name).toBe("task");
+        expect(runtime.tools().map((tool) => tool.name)).toContain("task.result.read");
+        expect(runtime.tools().map((tool) => tool.name)).toContain("task.status");
+      } finally {
+        await runtime.dispose();
+      }
+    } finally {
+      sessionDb.close();
+    }
+  });
+
   it("queues finalization only when an explicit session boundary requests it", async () => {
     const options = await minimalRuntimeOptions();
     const sessionDb = await createSQLiteSessionDB({

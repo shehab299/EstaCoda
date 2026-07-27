@@ -27,6 +27,9 @@ export type ModelProfile = {
   cost?: {
     inputPerMillionTokens?: number;
     outputPerMillionTokens?: number;
+    reasoningPerMillionTokens?: number;
+    cacheReadPerMillionTokens?: number;
+    cacheWritePerMillionTokens?: number;
   };
   rateLimits?: {
     requestsPerMinute?: number;
@@ -150,6 +153,8 @@ export type ProviderUsage = {
   outputTokens?: number;
   totalTokens?: number;
   reasoningTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
 };
 
 export type ProviderRouteRole =
@@ -158,6 +163,11 @@ export type ProviderRouteRole =
   | "alias"
   | "override"
   | "unknown";
+
+/** Explicitly distinguishes local route rejection from an adapter invocation. */
+export type ProviderAttemptState =
+  | { state: "preflight" }
+  | { state: "dispatched"; dispatchedAt: string };
 
 export type ProviderStreamFinish =
   | "done"

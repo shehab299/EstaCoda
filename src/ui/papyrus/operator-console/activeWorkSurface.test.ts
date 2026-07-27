@@ -445,8 +445,8 @@ describe("Papyrus operator console active work surface", () => {
       tokens: resolveTokens("plain", "dark", "kemetBlue"),
       capabilities: { supportsColor: true, supportsTrueColor: true },
     });
-    const state = { ...createDelegationState(2), frameIndex: 1 };
-    const animated = stripAnsi(renderActiveWorkSurface(state, { width: 100, style: standard })[1] ?? "");
+    const state = createDelegationState(2);
+    const animated = stripAnsi(renderActiveWorkSurface(state, { width: 100, style: standard, motionElapsedMs: 105 })[1] ?? "");
     const staticPlain = renderActiveWorkSurface(state, { width: 100, style: plain })[1] ?? "";
 
     expect(animated).toContain("∙ Worker 1");
@@ -579,6 +579,19 @@ describe("Papyrus operator console active work surface", () => {
     expect(output.every((line) => stringWidth(line) <= 96)).toBe(true);
   });
 
+  it("keeps response accounting out of the completed tool footer", () => {
+    const output = renderCompletedActiveWorkSurface(createState({
+      items: [item("read", "succeeded", { toolName: "read_file", target: "src/app.ts" })],
+    }), {
+      width: 72,
+    }).join("\n");
+
+    expect(output).toContain("1 completed · 0 failed");
+    expect(output).not.toContain("Main agent");
+    expect(output).not.toContain("Turn total");
+    expect(output).not.toContain("$0.14");
+  });
+
   it("renders Arabic completed tool logs with localized duration copy within bounds", () => {
     const output = renderCompletedActiveWorkSurface(createState({
       startedAtMs: 0,
@@ -673,7 +686,7 @@ describe("Papyrus operator console active work surface", () => {
     });
   });
 
-  it("animates running tool rows from the active work frame index", () => {
+  it("animates running tool rows from elapsed time and the tool cadence", () => {
     const tokens = resolveTokens("standard", "dark", "kemetBlue");
     const style = createOperatorConsoleStyle({
       tokens,
@@ -682,15 +695,12 @@ describe("Papyrus operator console active work surface", () => {
         supportsTrueColor: true,
       },
     });
-    const state = createState({
-      frameIndex: 1,
-      items: [item("run", "running", { toolName: "read_file" })],
-    });
+    const state = createState({ items: [item("run", "running", { toolName: "read_file" })] });
 
-    const output = renderActiveWorkSurface(state, { width: 72, height: 4, style }).join("\n");
+    const output = renderActiveWorkSurface(state, { width: 72, height: 4, style, motionElapsedMs: 90 }).join("\n");
 
-    expect(output).toContain("⣽");
-    expect(output).not.toContain("⣾ read_file");
+    expect(output).toContain("◷");
+    expect(output).not.toContain("◴ read_file");
   });
 
   it("truncates long tool names and targets safely", () => {
