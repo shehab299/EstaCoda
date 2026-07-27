@@ -391,6 +391,21 @@ above the status rail. Arabic console surfaces must measure visible width, keep
 technical tokens LTR-isolated, and preserve balanced bidi isolates after
 truncation or padding.
 
+Live and settled assistant text share one render-time bidi preparation path.
+It contains untrusted directional controls to each logical line, isolates mixed
+LTR runs before wrapping, and gives each wrapped Arabic row its own directional
+isolate. Stored transcript and streaming state remain in logical order. Editable
+prompt rows continue to use terminal-native bidi and are not software-reordered.
+
+Inside the Papyrus screen buffer, zero-width direction controls are packed into
+an adjacent visible cell's string when that content exists. They never receive
+a standalone narrow or spacer cell, so clipping, cursor advancement, and diff
+coordinates continue to reflect terminal columns while serialized visible text
+retains its controls. Zero-width-only writes remain inert. Papyrus also gathers
+ANSI parser text actions through each logical newline before applying its
+optional software bidi ordering, so style and hyperlink transitions do not split
+a directional run; the reordered clusters retain their original ownership.
+
 ---
 
 ## Papyrus Full Interactive Migration

@@ -215,11 +215,42 @@ Customize the fixed synthesis Step when the Task needs a specific combined-answe
 }
 ```
 
+For evidence-bound research, give every worker a distinct `research.scope` and declare the evidence it must collect:
+
+```json
+{
+  "tasks": [
+    {
+      "task": "Check the current upstream documentation.",
+      "allowedTools": ["web.search"],
+      "research": {
+        "scope": "Current upstream behavior",
+        "requireLiveSources": true,
+        "requireRepositoryEvidence": false
+      }
+    },
+    {
+      "task": "Trace the local implementation and tests.",
+      "allowedTools": ["file.read", "file.grep"],
+      "research": {
+        "scope": "Local implementation",
+        "requireLiveSources": false,
+        "requireRepositoryEvidence": true
+      }
+    }
+  ]
+}
+```
+
+Task creation fails if the effective delegated tools cannot satisfy the contract. A worker Result is accepted only when its cited HTTP(S) URLs and workspace-relative repository paths were observed in successful tool results. Missing tool use, training-only claims, or fabricated references produce diagnostic-only `evidence-contract-unsatisfied` output. Synthesis cannot use that output and reports the unavailable research scope instead.
+
 The initial immutable plan contains all workers and one terminal synthesis Step. Synthesis waits for every worker, reads their bounded Result handles with `task.result.read`, and cannot delegate. If a worker fails, synthesis is skipped and the Task becomes `partial`. If it succeeds, its Result is shown as the primary Result and completion delivery expands only that answer; intermediate worker Results remain readable by handle.
+
+Once a non-terminal root Task with a primary Result Step is created, it owns the requested answer. The current provider turn ends with a deterministic acknowledgement showing the Task ID and execution state; it cannot continue with a substitute synthesis while workers are still running. The durable answer arrives through the normal CLI or channel completion path. If the Task settles without an accepted answer, that path sends a deterministic failure receipt instead of diagnostic text or an improvised answer. Nested child Tasks remain internal to their owning Task.
 
 Use `"synthesis": false` only when the batch is deliberately inspection-only and should not produce or deliver one combined answer.
 
-Delegated authority is deliberately narrower than the creating runtime. Parent-visible tools are intersected with the requested tools and default risk policy before the Step is persisted. Worker Steps cannot delegate. Orchestrator Steps may create linked child Tasks only while their persisted authority retains child depth; the child workspace, authority, and budget cannot exceed the active parent Step. Child call, token, and estimated-cost budgets are reserved atomically, so repeated calls divide one parent ceiling instead of creating new budget. Live concurrency, elapsed time, and actual usage are enforced across the complete Task tree.
+Delegated authority is deliberately narrower than the creating runtime. The final provider-visible tools are intersected with the requested tools and default risk policy before the Step is persisted. Treat `allowedTools` and `allowedToolsets` as requirements: if one is unavailable, or the resulting tool set is empty, Task creation fails with structured diagnostics and no worker is queued. Successful creation stores a bounded access audit; worker construction rejects zero or widened access before contacting the provider. Worker Steps cannot delegate. Orchestrator Steps may create linked child Tasks only while their persisted authority retains child depth; the child workspace, authority, and budget cannot exceed the active parent Step. Child call, token, and estimated-cost budgets are reserved atomically, so repeated calls divide one parent ceiling instead of creating new budget. Live concurrency, elapsed time, and actual usage are enforced across the complete Task tree.
 
 Provider tool-call IDs make creation idempotent. The execution preference is part of that immutable definition: replaying the same call returns the existing Task, while changing the preference or any other definition under the same identity fails closed. `delegate_task` is unavailable when profile-bound durable Task storage is unavailable—there is no in-memory fallback.
 

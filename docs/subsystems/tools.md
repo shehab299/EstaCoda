@@ -182,6 +182,12 @@ Output is bounded, redacted, source-labeled, and explicitly marked as untrusted 
 
 `delegate_task` creates a fixed durable Task graph and returns its handle immediately. It does not run or await a child inside the provider turn. A single request creates one Step; a batch creates independent worker Steps plus a terminal synthesis Step unless it explicitly sets `synthesis: false`. Text workers deliberately begin with a concise plain-language paragraph, persisted separately as the bounded Result `displaySummary`; older generic Result summaries remain a compatibility fallback. In an interactive CLI session, the accepted Result from a default single request and the primary Result from batch synthesis both return later as one ordinary assistant message through the same durable local outbox. Explicit `synthesis: false` work remains inspection-only. The immutable `executionPreference` is `auto` or `background`: interactive `auto` work is claimed by the process Task host, while `background` bypasses foreground admission. The durable scheduler owns execution, concurrency, cancellation, recovery, results, usage, and settlement.
 
+Because the tool reports durable admission rather than worker settlement, an immediate successful `delegate_task` row is labeled `task created` (`تم إنشاء المهمة` in Arabic). Once child progress has actually been observed, terminal summaries continue to report the settled worker counts rather than reusing the creation label.
+
+When a successful tool Result identifies a non-terminal root Task and its `primaryResultStepId`, the durable Task owns the requested answer. The provider loop stops immediately after Task creation and does not request a substitute continuation. The parent returns and persists deterministic “Task created” text containing the Task ID and current execution state; CLI, gateway delivery, trajectories, skill learning, and voice surfaces therefore never receive a provider-authored substitute answer. The accepted primary Result is delivered through the existing completion outbox when the Task settles. A terminal Task without an accepted answer delivers a deterministic failure receipt instead of diagnostic content or an improvised answer. Nested child Tasks remain internal to their owning Task, while inspection-only `synthesis: false` calls have no primary Result Step and retain ordinary continuation behavior.
+
+For the primary Result Step, status inspection exposes only seven optional timestamps: provider completion, successful result capture, durable Result recording, Attempt settlement, Task finalization, delivery claim, and confirmed parent delivery. The first two are bounded Attempt milestones; the remaining timestamps come from existing Result, Attempt, Task, and delivery records. No lifecycle field contains output, arguments, message bodies, or private paths.
+
 Single-task input:
 
 ```json
@@ -219,11 +225,42 @@ Fixed fan-out with synthesis:
 }
 ```
 
+Evidence-bound research uses a per-item `research` contract. Scopes must be non-empty, bounded, and distinct within a batch after normalization:
+
+```json
+{
+  "tasks": [
+    {
+      "task": "Research the current upstream behavior.",
+      "allowedTools": ["web.search"],
+      "research": {
+        "scope": "Upstream behavior",
+        "requireLiveSources": true,
+        "requireRepositoryEvidence": false
+      }
+    },
+    {
+      "task": "Find the local implementation and tests.",
+      "allowedTools": ["file.read", "file.grep"],
+      "research": {
+        "scope": "Repository implementation",
+        "requireLiveSources": false,
+        "requireRepositoryEvidence": true
+      }
+    }
+  ]
+}
+```
+
 A batch creates every independent worker Step plus one terminal `synthesis` agent Step by default. Supplying a synthesis object customizes its objective/model; `"synthesis": false` is the explicit inspection-only opt-out. The graph is fixed before execution, and no running worker may insert a dependency. The synthesis Step receives only bounded dependency metadata and opaque result handles, reads bodies through `task.result.read`, and cannot delegate. It becomes runnable after every worker settles when at least one completed worker published an accepted Result. Failed, cancelled, skipped, or missing coverage is included as bounded status metadata, and synthesis must disclose that incomplete coverage instead of implying every worker succeeded. Diagnostic Results never enter synthesis context. If no accepted worker Result exists, synthesis is skipped and the Task settles `partial`. A partial synthesis Result is still marked primary on status/UI surfaces and is the only body expanded by completion delivery; intermediate Results remain available by handle.
 
-When `recoverJsonStringTasks` is enabled, `tasks` may be a JSON string containing an array of task objects. Recovery is strict: each object must contain only `task`, `context`, `allowedToolsets`, `allowedTools`, `role`, and `modelOverride`; `context` must be a string when present; tool lists must be arrays of strings; `role` must be `leaf` or `orchestrator`; model overrides must be bounded strings.
+When `recoverJsonStringTasks` is enabled, `tasks` may be a JSON string containing an array of task objects. Recovery is strict: each object must contain only `task`, `context`, `allowedToolsets`, `allowedTools`, `role`, `modelOverride`, and `research`; `context` must be a string when present; tool lists must be arrays of strings; `role` must be `leaf` or `orchestrator`; model overrides must be bounded strings; research contracts must use the bounded shape shown above.
 
-Default Step capability is risk-class based. After intersecting with parent-visible tools, delegated Steps receive `read-only-local` and `read-only-network` tools unless exact names, prefixes, or excluded toolsets strip them. Browser, media, and MCP toolsets are excluded by default. Workspace-write, credential, process-control, memory/session search, skill mutation, config mutation, cron mutation, trust mutation, and dangerous shell/process tools are stripped before the authority policy is persisted. `terminal.run` is excluded by default. `terminal.inspect` may remain visible through the parent-visible read-only policy.
+Default Step capability is risk-class based. The parent boundary is the final provider-visible tool inventory after availability checks and disabled-toolset filtering. Delegated Steps then receive `read-only-local` and `read-only-network` tools unless exact names, prefixes, or excluded toolsets strip them. Browser, media, and MCP toolsets are excluded by default. Workspace-write, credential, process-control, memory/session search, skill mutation, config mutation, cron mutation, trust mutation, and dangerous shell/process tools are stripped before the authority policy is persisted. `terminal.run` is excluded by default. `terminal.inspect` may remain visible through the parent-visible read-only policy.
+
+Explicit `allowedTools` and `allowedToolsets` are required access contracts as well as upper bounds. If any explicitly requested name or toolset is unavailable after intersection, or if the effective set is empty, admission returns a structured failure and writes no Task graph. Successful creation persists a bounded access audit containing the request, parent-visible inventory, effective access, and strip reasons. Exact idempotent replay uses that immutable decision. When the worker runtime is constructed, its access is checked against the persisted audit and authority again; zero access or widening fails the Attempt before the provider is called.
+
+Research evidence requirements are admitted against that effective access. Live-source work requires `web.search`; repository-evidence work requires `file.read` plus one of `file.search`, `file.grep`, or `file.glob`. A missing capability prevents Task creation. The contract is persisted with the Step and injected into the worker objective. At result capture, live citations must match HTTP(S) URLs observed in successful `web.search` results, while repository references must match workspace-relative paths observed through successful file reads and discovery. An unmet contract fails with `evidence-contract-unsatisfied`; any safe text is diagnostic-only and cannot satisfy synthesis. Synthesis receives accepted Results only and identifies their research scopes, so unavailable scopes remain explicit instead of being replaced with training knowledge.
 
 Roles, depth, and the Step's immutable child policy are enforced at Task creation and again before worker schemas are built. A worker Step is `forbid` and cannot see `delegate_task`. An orchestrator Step may use `fire_and_forget` only with persisted child-creation authority and remaining depth. A nested call creates a detached linked child Task whose authority, budget, workspace, parent/root Task, parent Attempt, and origin attribution are validated atomically. The same transaction reserves the child's provider-call, token, and cost ceilings against the parent Step; repeated calls share that one ceiling. Tree-wide wall-clock and live-concurrency checks remain hard ceilings, and sequential child phases divide the inherited wall-clock limit. The child cannot silently add a required dependency to the parent PlanRevision.
 

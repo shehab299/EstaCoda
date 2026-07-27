@@ -3,7 +3,10 @@ import {
   MAX_DELEGATE_MODEL_OVERRIDE_ID_LENGTH,
   MAX_DELEGATE_PROVIDER_OVERRIDE_ID_LENGTH
 } from "../contracts/delegation.js";
-import type { DurableDelegationService } from "../delegation/durable-delegation-service.js";
+import {
+  DelegationAccessError,
+  type DurableDelegationService
+} from "../delegation/durable-delegation-service.js";
 import { createDelegationTools, delegationToolProvider } from "./delegation-tools.js";
 
 describe("createDelegationTools", () => {
@@ -20,6 +23,7 @@ describe("createDelegationTools", () => {
         allowedTools: { type: "array" },
         role: { enum: ["leaf", "orchestrator"] },
         modelOverride: { required: ["model"] },
+        research: { required: ["scope"] },
         synthesis: {
           oneOf: [
             expect.objectContaining({ required: ["objective"] }),
@@ -129,6 +133,65 @@ describe("createDelegationTools", () => {
     });
   });
 
+  it("normalizes and forwards durable research evidence contracts", async () => {
+    const create = vi.fn(() => handle("task-research", 1));
+    const [tool] = tools(create);
+
+    const result = await tool!.run({
+      task: "Research lifecycle hooks",
+      research: {
+        scope: "  Lifecycle-Hooks  ",
+        requireLiveSources: true,
+        requireRepositoryEvidence: true
+      }
+    }, { toolCallId: "provider-call-research" });
+
+    expect(result.ok).toBe(true);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      tasks: [expect.objectContaining({
+        research: {
+          scope: "lifecycle-hooks",
+          requireLiveSources: true,
+          requireRepositoryEvidence: true
+        }
+      })]
+    }));
+  });
+
+  it("rejects duplicate normalized research scopes before Task creation", async () => {
+    const create = vi.fn();
+    const [tool] = tools(create);
+
+    const result = await tool!.run({
+      tasks: [
+        { task: "Research A", research: { scope: "Lifecycle-Hooks", requireLiveSources: true } },
+        { task: "Research B", research: { scope: " lifecycle-hooks ", requireRepositoryEvidence: true } }
+      ]
+    }, { toolCallId: "provider-call-duplicate-research" });
+
+    expect(result).toMatchObject({
+      ok: false,
+      metadata: { reason: "validation-error", code: "duplicate-research-scope" }
+    });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("requires batch research contracts to be declared per item", async () => {
+    const create = vi.fn();
+    const [tool] = tools(create);
+
+    const result = await tool!.run({
+      tasks: [{ task: "Research one." }, { task: "Research two." }],
+      research: { scope: "shared", requireLiveSources: true }
+    }, { toolCallId: "provider-call-batch-default-research" });
+
+    expect(result).toMatchObject({
+      ok: false,
+      metadata: { reason: "validation-error", code: "invalid-research-contract" }
+    });
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("reports post-commit activation failure while returning the durable Task handle", async () => {
     const create = vi.fn(() => ({
       ...handle("task-durable-after-activation-failure", 1),
@@ -177,6 +240,55 @@ describe("createDelegationTools", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it("returns structured access diagnostics when admission fails before Task creation", async () => {
+    const create = vi.fn(async () => {
+      throw new DelegationAccessError({
+        code: "requested-tool-unavailable",
+        taskIndex: 0,
+        message: "Delegated work requested unavailable tools: web.search.",
+        access: {
+          version: 1,
+          requestedTools: ["web.search"],
+          requestedToolsets: ["web"],
+          parentVisibleTools: ["file.read"],
+          effectiveAllowedTools: [],
+          effectiveAllowedToolsets: [],
+          strippedTools: [{
+            name: "file.read",
+            reasons: ["outside-requested-allowed-tools", "outside-requested-allowed-toolsets"],
+            toolsets: ["files"],
+            riskClass: "read-only-local"
+          }],
+          rejectedRequestedTools: [{ name: "web.search", reasons: ["not-parent-visible"] }],
+          rejectedRequestedToolsets: [{ name: "web", reasons: ["not-parent-visible"] }]
+        }
+      });
+    });
+    const [tool] = tools(create);
+
+    const result = await tool!.run({
+      task: "Search live sources",
+      allowedTools: ["web.search"],
+      allowedToolsets: ["web"]
+    }, { toolCallId: "provider-call-access-failure" });
+
+    expect(result).toMatchObject({
+      ok: false,
+      metadata: {
+        reason: "delegation-access-error",
+        code: "requested-tool-unavailable",
+        taskIndex: 0,
+        access: {
+          requestedTools: ["web.search"],
+          parentVisibleTools: ["file.read"],
+          effectiveAllowedTools: []
+        }
+      }
+    });
+    expect(result.content).toContain("delegate_task tasks[0]");
+    expect(result.content).toContain("web.search");
+  });
+
   it.each([
     [{}, "missing-task"],
     [{ tasks: [] }, "empty-tasks"],
@@ -187,6 +299,8 @@ describe("createDelegationTools", () => {
     [{ task: "A", synthesis: true }, "invalid-synthesis"],
     [{ task: "A", synthesis: { objective: "S", extra: true } }, "invalid-synthesis"],
     [{ task: "A", executionPreference: "later" }, "invalid-execution-preference"],
+    [{ task: "A", research: {} }, "invalid-research-contract"],
+    [{ task: "A", research: { scope: "x", requireLiveSources: "yes" } }, "invalid-research-contract"],
     [{ modelOverride: { model: "x".repeat(MAX_DELEGATE_MODEL_OVERRIDE_ID_LENGTH + 1) }, task: "A" }, "invalid-model-override"],
     [{ modelOverride: { model: "m", provider: "x".repeat(MAX_DELEGATE_PROVIDER_OVERRIDE_ID_LENGTH + 1) }, task: "A" }, "invalid-model-override"]
   ])("rejects malformed input %#", async (input, code) => {

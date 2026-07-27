@@ -13,7 +13,10 @@ import { SQLiteTaskStore } from "../tasks/sqlite-task-store.js";
 import { TaskOperatorService } from "../tasks/task-operator-service.js";
 import { TaskResultService } from "../tasks/task-result-service.js";
 import { TaskScheduler } from "../tasks/task-scheduler.js";
-import { DurableDelegationService } from "./durable-delegation-service.js";
+import {
+  DurableDelegationService,
+  type DurableDelegationRequest
+} from "./durable-delegation-service.js";
 
 describe("DurableDelegationService", () => {
   let root: string;
@@ -140,6 +143,215 @@ describe("DurableDelegationService", () => {
       idempotentReplay: true
     });
     expect(store.listTasks()).toHaveLength(3);
+  });
+
+  it("fails closed before persistence when requested or effective child access is unavailable", () => {
+    const unavailableRequest = new DurableDelegationService({
+      store,
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => [tool("file.read", "read-only-local", ["files"])]
+    });
+
+    expect(() => unavailableRequest.create({
+      toolCallId: "call-missing-tool",
+      trustedWorkspace: true,
+      tasks: [{ task: "Search live sources", allowedTools: ["web.search"] }]
+    })).toThrow(expect.objectContaining({
+      name: "DelegationAccessError",
+      code: "requested-tool-unavailable",
+      taskIndex: 0
+    }));
+    expect(() => unavailableRequest.create({
+      toolCallId: "call-missing-toolset",
+      trustedWorkspace: true,
+      tasks: [{ task: "Search live sources", allowedToolsets: ["web"] }]
+    })).toThrow(expect.objectContaining({
+      name: "DelegationAccessError",
+      code: "requested-toolset-unavailable",
+      taskIndex: 0
+    }));
+
+    const zeroAccess = new DurableDelegationService({
+      store,
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => [tool("terminal.run", "workspace-write", ["files"])]
+    });
+    expect(() => zeroAccess.create({
+      toolCallId: "call-zero-tools",
+      trustedWorkspace: true,
+      tasks: [{ task: "Do not create an inert child" }]
+    })).toThrow(expect.objectContaining({
+      name: "DelegationAccessError",
+      code: "zero-effective-tools",
+      taskIndex: 0
+    }));
+    expect(store.listTasks()).toEqual([]);
+  });
+
+  it("persists bounded access provenance and replays it without widening or re-resolving", () => {
+    let currentlyVisible = [
+      tool("file.read", "read-only-local", ["files"]),
+      tool("web.search", "read-only-network", ["web", "research"])
+    ];
+    const service = new DurableDelegationService({
+      store,
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => currentlyVisible
+    });
+    const request: DurableDelegationRequest = {
+      toolCallId: "call-access-audit",
+      trustedWorkspace: true,
+      tasks: [{
+        task: "Research with live sources",
+        allowedTools: ["web.search"],
+        allowedToolsets: ["web", "research"]
+      }]
+    };
+    const created = service.create(request);
+    const task = store.getTask(created.taskId)!;
+    const step = store.listSteps(task.id, task.activePlanRevisionId!)[0]!;
+
+    expect(step.executor.delegationAccess).toEqual(expect.objectContaining({
+      version: 1,
+      requestedTools: ["web.search"],
+      requestedToolsets: ["research", "web"],
+      parentVisibleTools: ["file.read", "web.search"],
+      effectiveAllowedTools: ["web.search"],
+      effectiveAllowedToolsets: ["research", "web"],
+      rejectedRequestedTools: [],
+      rejectedRequestedToolsets: []
+    }));
+    const projected = new TaskOperatorService({ store }).status(task.id, "parent");
+    expect(projected.steps[0]?.delegationAccess).toEqual(step.executor.delegationAccess);
+    expect(projected.subagents[0]?.delegationAccess).toEqual(step.executor.delegationAccess);
+
+    currentlyVisible = [];
+    const restartedService = new DurableDelegationService({
+      store: new SQLiteTaskStore({ db: sessionDb.db, profileId: "alpha" }),
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => currentlyVisible
+    });
+    expect(restartedService.create(request)).toMatchObject({
+      taskId: created.taskId,
+      idempotentReplay: true
+    });
+    expect(() => restartedService.create({
+      ...request,
+      tasks: [{ task: "Research with live sources", allowedTools: ["file.read"], allowedToolsets: ["files"] }]
+    })).toThrow(FixedTaskCreationConflictError);
+  });
+
+  it("admits only research contracts whose required evidence capabilities are effective", () => {
+    const withoutLiveSearch = new DurableDelegationService({
+      store,
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => [
+        tool("file.read", "read-only-local", ["files", "research"]),
+        tool("file.search", "read-only-local", ["files", "research"])
+      ]
+    });
+    expect(() => withoutLiveSearch.create({
+      toolCallId: "call-research-no-web",
+      trustedWorkspace: true,
+      tasks: [{
+        task: "Research current behavior",
+        research: { scope: "live-behavior", requireLiveSources: true, requireRepositoryEvidence: false }
+      }]
+    })).toThrow(expect.objectContaining({
+      name: "DelegationAccessError",
+      code: "requested-tool-unavailable",
+      taskIndex: 0
+    }));
+
+    const withoutDiscovery = new DurableDelegationService({
+      store,
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => [tool("file.read", "read-only-local", ["files", "research"])]
+    });
+    expect(() => withoutDiscovery.create({
+      toolCallId: "call-research-no-discovery",
+      trustedWorkspace: true,
+      tasks: [{
+        task: "Research repository behavior",
+        research: { scope: "repository", requireLiveSources: false, requireRepositoryEvidence: true }
+      }]
+    })).toThrow(expect.objectContaining({
+      name: "DelegationAccessError",
+      code: "requested-tool-unavailable",
+      taskIndex: 0
+    }));
+    expect(store.listTasks()).toEqual([]);
+  });
+
+  it("persists normalized distinct research scopes, instructions, and inspection projections", () => {
+    const service = new DurableDelegationService({
+      store,
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => [
+        tool("file.read", "read-only-local", ["files", "research"]),
+        tool("file.grep", "read-only-local", ["files", "research"]),
+        tool("web.search", "read-only-network", ["web", "research"])
+      ]
+    });
+    expect(() => service.create({
+      toolCallId: "call-duplicate-research-scopes",
+      trustedWorkspace: true,
+      synthesis: false,
+      tasks: [
+        { task: "Research A", research: { scope: "Lifecycle", requireLiveSources: true, requireRepositoryEvidence: false } },
+        { task: "Research B", research: { scope: " lifecycle ", requireLiveSources: false, requireRepositoryEvidence: true } }
+      ]
+    })).toThrow(expect.objectContaining({
+      name: "DelegationResearchContractError",
+      code: "duplicate-research-scope",
+      taskIndex: 1
+    }));
+
+    const request: DurableDelegationRequest = {
+      toolCallId: "call-distinct-research-scopes",
+      trustedWorkspace: true,
+      synthesis: false,
+      tasks: [
+        { task: "Research current sources", research: { scope: " Live-Sources ", requireLiveSources: true, requireRepositoryEvidence: false } },
+        { task: "Research repository", research: { scope: "Repository", requireLiveSources: false, requireRepositoryEvidence: true } }
+      ]
+    };
+    const created = service.create(request);
+    const task = store.getTask(created.taskId)!;
+    const steps = store.listSteps(task.id, task.activePlanRevisionId!);
+
+    expect(steps.map((step) => step.executor.research)).toEqual([
+      { scope: "live-sources", requireLiveSources: true, requireRepositoryEvidence: false },
+      { scope: "repository", requireLiveSources: false, requireRepositoryEvidence: true }
+    ]);
+    expect(steps[0]?.objective).toContain("Research evidence contract:");
+    expect(steps[0]?.objective).toContain("Assigned scope: live-sources");
+    expect(steps[0]?.objective).toContain("never substitute training knowledge or fabricate citations");
+    const projected = new TaskOperatorService({ store }).status(task.id, "parent");
+    expect(projected.subagents.map((subagent) => subagent.research?.scope)).toEqual(["live-sources", "repository"]);
+
+    const restarted = new DurableDelegationService({
+      store: new SQLiteTaskStore({ db: sessionDb.db, profileId: "alpha" }),
+      creatorSessionId: () => "parent",
+      workspace: workspace(),
+      config: DEFAULT_DELEGATION_CONFIG,
+      visibleTools: () => [],
+    });
+    expect(restarted.create(request)).toMatchObject({ taskId: created.taskId, idempotentReplay: true });
   });
 
   it("snapshots the configured root spending limit and only permits finite narrowing", () => {
