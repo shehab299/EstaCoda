@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { runCliCommand } from "./cli.js";
@@ -8,7 +8,8 @@ import type { Prompt } from "./prompt-contract.js";
 import type { SelectPromptInput } from "./interactive-select.js";
 import { WorkspaceTrustStore } from "../security/workspace-trust-store.js";
 import { resolveGlobalStateHome, resolveProfileStateHome } from "../config/profile-home.js";
-import { runInitCommand } from "./init-command.js";
+import { ensureDefaultProfileState } from "./profile-state.js";
+import { ensureGlobalStateDirectories } from "../storage/state-bootstrap.js";
 import { CURRENT_OAUTH_STORE_VERSION } from "../providers/oauth/oauth-types.js";
 import { openSQLiteDatabase } from "../storage/factory.js";
 import { SQLiteSessionDB } from "../session/sqlite-session-db.js";
@@ -127,6 +128,7 @@ describe("cli setup command", () => {
     const trusted = await new WorkspaceTrustStore({
       path: join(tempDir, ".estacoda", "trust.json"),
     }).isTrusted(workspaceRoot);
+    const globalPaths = resolveGlobalStateHome({ homeDir: tempDir });
 
     expect(result.handled).toBe(true);
     expect(result.exitCode).toBe(0);
@@ -134,6 +136,9 @@ describe("cli setup command", () => {
     expect(config.providers?.local?.apiKeyEnv).toBeUndefined();
     expect(trusted).toBe(true);
     expect(result.output).not.toContain("Dry-run apply plan");
+    expect((await stat(globalPaths.sharedMemoryPath)).isDirectory()).toBe(true);
+    expect((await stat(globalPaths.packsPath)).isDirectory()).toBe(true);
+    expect((await stat(join(globalPaths.stateRoot, ".backups"))).isDirectory()).toBe(true);
   });
 
   it("returns a launch request after first-run setup when requested", async () => {
@@ -154,7 +159,10 @@ describe("cli setup command", () => {
 
       expect(result.handled).toBe(true);
       expect(result.exitCode).toBe(0);
-      expect(result.launchRequested).toBe(true);
+      expect(result.launchHandoff).toEqual({
+        workspaceRoot: await realpath(workspaceRoot),
+        locale: "en",
+      });
     } finally {
       if (previousOpenAiKey === undefined) {
         delete process.env.OPENAI_API_KEY;
@@ -175,7 +183,7 @@ describe("cli setup command", () => {
 
     expect(result.handled).toBe(true);
     expect(result.exitCode).toBe(0);
-    expect(result.launchRequested).toBe(false);
+    expect(result.launchHandoff).toBeUndefined();
   });
 
   it("cancels reviewed setup without applying config changes or trust", async () => {
@@ -211,8 +219,40 @@ describe("cli setup command", () => {
     expect(result.stderr).not.toContain("Warning: Detected unsettled");
   });
 
-  it("routes init-created default profile state through the real entrypoint to onboarding", async () => {
-    const init = await runInitCommand({ homeDir: tempDir });
+  it("rejects a bare non-TTY launch before creating an unconfigured runtime", async () => {
+    const result = await runEntrypoint({
+      argv: [],
+      cwd: process.cwd(),
+      homeDir: tempDir,
+      input: "",
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain("Interactive session requires a TTY");
+    expect(result.stdout).not.toContain("EstaCoda is ready");
+    expect(result.stdout).not.toContain("model: unconfigured/unconfigured");
+    expect(result.stderr).toBe("");
+    await expect(stat(join(tempDir, ".estacoda", "sessions.sqlite"))).rejects.toThrow();
+  });
+
+  it("rejects the retired init command before runtime loading without creating state", async () => {
+    const result = await runEntrypoint({
+      argv: ["init"],
+      cwd: process.cwd(),
+      homeDir: tempDir,
+      input: "",
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain("`estacoda init` has been removed");
+    expect(result.stdout).toContain("Run `estacoda` to start onboarding");
+    expect(result.stderr).toBe("");
+    await expect(stat(join(tempDir, ".estacoda"))).rejects.toThrow();
+  });
+
+  it("routes an interrupted bootstrap skeleton through the real entrypoint to onboarding", async () => {
+    await ensureGlobalStateDirectories({ homeDir: tempDir });
+    await ensureDefaultProfileState({ homeDir: tempDir });
     const result = await runEntrypoint({
       argv: ["setup", "--interactive"],
       cwd: process.cwd(),
@@ -220,7 +260,6 @@ describe("cli setup command", () => {
       input: "n\n",
     });
 
-    expect(init.ok).toBe(true);
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("EstaCoda Onboarding Wizard");
     expect(result.stdout).toContain("Setup language");
@@ -869,6 +908,8 @@ describe("cli setup command", () => {
     expect(result.output).toContain("Applied safe repairs");
     expect(result.output).toContain("◇ Fixed");
     expect(result.output).toContain("◇ Not Changed");
+    expect(result.output).toContain("~/.estacoda/profiles/default/cron/output/");
+    expect(result.output).toContain("~/.estacoda/profiles/default/cron/locks/");
     expect(result.output).toContain("Workspace trust requires explicit user approval");
     expect(result.output).toContain("Provider credentials were not created");
     expect(result.output).toContain("Config migrations were not applied");
@@ -877,6 +918,8 @@ describe("cli setup command", () => {
     await expect(stat(profilePaths.userMdPath)).resolves.toMatchObject({ });
     await expect(stat(profilePaths.soulMdPath)).resolves.toMatchObject({ });
     await expect(stat(profilePaths.memoryMdPath)).resolves.toMatchObject({ });
+    await expect(stat(join(profilePaths.cronPath, "output"))).resolves.toMatchObject({ });
+    await expect(stat(join(profilePaths.cronPath, "locks"))).resolves.toMatchObject({ });
     await expect(stat(profilePaths.envPath)).resolves.toMatchObject({ });
     await expect(stat(profilePaths.authJsonPath)).resolves.toMatchObject({ });
     await expect(stat(globalPaths.trustJsonPath)).rejects.toThrow();
@@ -984,15 +1027,14 @@ describe("cli setup command", () => {
     expect(launcherSource).not.toContain("runInteractiveOnboarding");
   });
 
-  it("entrypoint setup launch handoff re-enters the fresh interactive launch path", async () => {
+  it("entrypoint shares setup launch handoff orchestration with bare startup", async () => {
     const entrypointSource = await readFile(join(process.cwd(), "src", "index.ts"), "utf8");
 
-    expect(entrypointSource).toContain("setupCommand.launchRequested === true");
-    expect(entrypointSource).toContain("launchInteractiveSession({ workspaceRoot, homeDir, profileId })");
+    expect(entrypointSource).toContain("runSetupStartup({");
+    expect(entrypointSource).toContain("runInteractiveStartup({ workspaceRoot, homeDir, profileId })");
     expect(entrypointSource).toContain("argv = []");
     expect(entrypointSource).toContain("const nowTrusted = await trustStore.isTrusted(workspaceRoot)");
     expect(entrypointSource).toContain("const latestConfig = await loadRuntimeConfig({ workspaceRoot, homeDir, profileId })");
-    expect(entrypointSource).toContain("onboarding.workspace.trust.deferredFinal");
     expect(entrypointSource).toContain("return createRuntime({");
   });
 });

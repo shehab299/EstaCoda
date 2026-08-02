@@ -24,7 +24,7 @@ Pick the row that matches your goal:
 
 | Goal | Start here | Then |
 |---|---|---|
-| I want EstaCoda working locally | Install, then run `estacoda setup` | Accept the launch prompt or run `estacoda` |
+| I want EstaCoda working locally | Install, then run `estacoda` | Complete onboarding and accept the launch prompt |
 | I already installed it | `estacoda verify` | Check `estacoda model status` |
 | I ran `estacoda` and setup appears | Continue the setup prompt | Use `estacoda setup` if you exit early |
 | I want Telegram or WhatsApp | Get one local CLI session working first | Configure channels after verification |
@@ -44,7 +44,7 @@ The default install path uses the public installer:
 curl -fsSL https://www.estacoda.com/install.sh | bash
 ```
 
-This creates a managed-source install under `~/.estacoda/estacoda`, builds the project, writes a wrapper to `~/.local/bin/estacoda`, and runs `estacoda init`.
+This creates a managed-source install under `~/.estacoda/estacoda`, builds the project, and writes a wrapper to `~/.local/bin/estacoda`. It does not create profile or trust state before first run.
 
 If `~/.local/bin` is not on your `PATH`, add it:
 
@@ -57,10 +57,10 @@ export PATH="$HOME/.local/bin:$PATH"
 Start the reviewed setup flow:
 
 ```bash
-estacoda setup
+estacoda
 ```
 
-If you run bare `estacoda` before setup is complete, EstaCoda detects the incomplete state and guides you back to setup.
+On a fresh state home, bare `estacoda` opens the Onboarding Wizard directly. It prepares the required state through the reviewed setup path, then offers to launch the session after verification.
 
 The Onboarding Wizard walks through the setup in this order:
 
@@ -194,10 +194,10 @@ Use `estacoda doctor --live` after that only if provider connectivity is still t
 
 ## 10. Advanced install paths
 
-Install to a custom directory and skip the initial state bootstrap:
+Install to a custom directory:
 
 ```bash
-curl -fsSL https://www.estacoda.com/install.sh | bash -s -- --dir <path> --skip-init
+curl -fsSL https://www.estacoda.com/install.sh | bash -s -- --dir <path>
 ```
 
 If you plan to modify the source, clone the repo and run the setup script:
