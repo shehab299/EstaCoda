@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1
+#
+# EstaCoda binary-based Docker image.
+#
+# Builds a prebuilt pkg binary inside the image, then runs it in a minimal
+# Debian runtime.  The binary embeds the Node.js runtime so the runtime
+# stage does not need Node.js installed.
+#
+# Build:  docker build -f Dockerfile.binary -t estacoda:binary .
+# Run:    docker run --rm -v ~/.estacoda:/home/estacoda/.estacoda estacoda:binary --version
+#
+
+FROM node:22.18.0-slim AS build
+
+WORKDIR /app
+
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    g++ \
+    git \
+    make \
+    python3 \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json tsconfig.build.json ./
+RUN pnpm install --frozen-lockfile
+
+COPY src ./src
+COPY skills ./skills
+COPY assets ./assets
+COPY workers ./workers
+COPY acp_registry ./acp_registry
+COPY scripts ./scripts
+COPY README.md LICENSE NOTICE ./
+
+RUN pnpm run build:binary:linux-x64
+
+FROM debian:bookworm-slim AS runtime
+
+ENV HOME=/home/estacoda
+ENV ESTACODA_HOME=/home/estacoda/.estacoda
+
+RUN groupadd --system estacoda \
+  && useradd --system --create-home --gid estacoda --home-dir /home/estacoda estacoda \
+  && mkdir -p /home/estacoda/.estacoda \
+  && chown -R estacoda:estacoda /home/estacoda
+
+COPY --from=build --chown=estacoda:estacoda /app/dist-bin/release/linux-x64/ /opt/estacoda/
+
+RUN chmod +x /opt/estacoda/estacoda \
+  && ln -s /opt/estacoda/estacoda /usr/local/bin/estacoda
+
+USER estacoda
+
+VOLUME ["/home/estacoda/.estacoda"]
+
+ENTRYPOINT ["/opt/estacoda/estacoda"]

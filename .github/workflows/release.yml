@@ -1,0 +1,96 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-binaries-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22.18.0"
+
+jobs:
+  build-binary:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: node22-linux-x64
+            os: ubuntu-latest
+            artifact: estacoda-linux-x64.tar.gz
+          - target: node22-linux-arm64
+            os: ubuntu-latest
+            artifact: estacoda-linux-arm64.tar.gz
+          - target: node22-macos-x64
+            os: macos-13
+            artifact: estacoda-macos-x64.tar.gz
+          - target: node22-macos-arm64
+            os: macos-latest
+            artifact: estacoda-macos-arm64.tar.gz
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build binary
+        run: pnpm run build:binary:${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist-bin/${{ matrix.artifact }}
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build-binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-bin
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-bin/estacoda-linux-x64/estacoda-linux-x64.tar.gz
+            dist-bin/estacoda-linux-arm64/estacoda-linux-arm64.tar.gz
+            dist-bin/estacoda-macos-x64/estacoda-macos-x64.tar.gz
+            dist-bin/estacoda-macos-arm64/estacoda-macos-arm64.tar.gz
+          draft: true
+          generate_release_notes: true
