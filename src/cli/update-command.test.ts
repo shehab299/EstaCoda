@@ -35,6 +35,7 @@ function installInfo(method: InstallMethod, overrides: Partial<InstallMethodInfo
     docker: "docker pull ghcr.io/sifr01-labs/estacoda:latest",
     "npm-global": "npm install -g estacoda@latest",
     "pnpm-global": "pnpm add -g estacoda@latest",
+    binary: "estacoda update",
     unknown: "reinstall using documented install path"
   };
 

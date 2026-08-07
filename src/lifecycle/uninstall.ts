@@ -107,6 +107,14 @@ export async function runUninstall(options: UninstallOptions = {}): Promise<Unin
     lines.push(...await cleanupPathEntries(homeDir));
     await rm(effectiveMethod.installDir, { recursive: true, force: true });
     lines.push(`Removed managed install directory: ${effectiveMethod.installDir}`);
+  } else if (effectiveMethod.method === "binary") {
+    const wrapperReport = await removeSourceWrappers(wrapperPaths(homeDir, env, options.wrapperPaths));
+    lines.push(...wrapperReport);
+    lines.push(...await cleanupPathEntries(homeDir));
+    if (installMethod.installDir !== undefined) {
+      await rm(installMethod.installDir, { recursive: true, force: true });
+      lines.push(`Removed binary install directory: ${installMethod.installDir}`);
+    }
   } else if (effectiveMethod.method === "manual-source" || effectiveMethod.method === "unknown") {
     const wrapperReport = await removeSourceWrappers(wrapperPaths(homeDir, env, options.wrapperPaths));
     lines.push(...wrapperReport);
@@ -381,6 +389,8 @@ function packageManagerGuidance(method: Exclude<InstallMethodInfo["method"], "ma
         "Run: docker pull ghcr.io/sifr01-labs/estacoda:latest for updates, or remove containers/images manually when safe.",
         "Named or bind-mounted state volumes are preserved by default."
       ];
+    case "binary":
+      return [];
   }
 }
 

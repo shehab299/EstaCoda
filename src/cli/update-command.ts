@@ -3,6 +3,7 @@ import {
   prepareUpdateInfo,
   canApplyUpdate,
   applyUpdate,
+  applyBinaryUpdate,
   applyManagedSourceUpdate,
   type UpdateApplyResult,
   type UpdateCheckResult
@@ -52,6 +53,7 @@ export type UpdateOptions = {
   checkGitUpdate?: (info: InstallMethodInfo, options: { mutateRemoteRefs: boolean }) => Promise<GitUpdateResolverResult>;
   canApplyUpdate?: typeof canApplyUpdate;
   applyUpdate?: typeof applyUpdate;
+  applyBinaryUpdate?: typeof applyBinaryUpdate;
   applyManagedSourceUpdate?: typeof applyManagedSourceUpdate;
   runUpdateWithResilience?: typeof runManagedSourceUpdateWithResilience;
   restartGatewayService?: (options: GatewayRestartHandoffOptions) => Promise<GatewayRestartHandoffResult>;
@@ -149,6 +151,60 @@ export async function runUpdateCommand(options: UpdateOptions): Promise<UpdateRe
     }
 
     return appendGatewayGuidance(await runSourceUpdateCheck(installMethod, options, false), options);
+  }
+
+  if (installMethod.method === "binary") {
+    const check = await (options.checkForUpdate ?? (() => checkForUpdate({ homeDir })))();
+
+    if (check.kind === "error") {
+      return {
+        exitCode: 1,
+        output: withGatewayRestartInstruction(`Update check failed: ${check.message}`, options)
+      };
+    }
+
+    if (check.kind === "up-to-date" && (options.check || options.dryRun)) {
+      return {
+        exitCode: 2,
+        output: withGatewayRestartInstruction(`You are on the latest version (${check.current}).`, options)
+      };
+    }
+
+    if (check.kind === "up-to-date") {
+      return {
+        exitCode: 0,
+        output: withGatewayRestartInstruction(`You are on the latest version (${check.current}).`, options)
+      };
+    }
+
+    const summary = prepareUpdateInfo(check.info);
+
+    if (!options.apply) {
+      return {
+        exitCode: 0,
+        output: withGatewayRestartInstruction([
+          summary,
+          "",
+          "This was a dry run. No files were modified."
+        ].join("\n"), options)
+      };
+    }
+
+    const result = await (options.applyBinaryUpdate ?? applyBinaryUpdate)({
+      installMethod,
+      homeDir,
+      workspaceRoot: options.workspaceRoot,
+      version: check.info.latest
+    });
+
+    return {
+      exitCode: result.kind === "success" ? 0 : 1,
+      output: withGatewayRestartInstruction([
+        summary,
+        "",
+        result.message
+      ].join("\n"), options)
+    };
   }
 
   if (!installMethod.canSelfUpdate) {
@@ -519,5 +575,7 @@ function renderMethodAdvice(info: InstallMethodInfo): string {
       return `Unknown install method. Run: ${info.recommendedUpdateCommand}`;
     case "managed-source":
       return `Managed source install detected. Run: ${info.recommendedUpdateCommand}`;
+    case "binary":
+      return `Prebuilt binary install detected. Run: ${info.recommendedUpdateCommand}`;
   }
 }

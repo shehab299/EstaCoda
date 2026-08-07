@@ -233,6 +233,139 @@ export async function applyUpdate(options: {
   }
 }
 
+export type BinaryUpdateOptions = {
+  installMethod: InstallMethodInfo;
+  homeDir: string;
+  workspaceRoot?: string;
+  version?: string;
+  platform?: string;
+  fetchFn?: typeof fetch;
+  backupState?: typeof backupState;
+};
+
+const GITHUB_BIN_REPO = "sifr01-labs/EstaCoda";
+
+function detectBinaryPlatform(platform?: string): string {
+  if (platform && platform.length > 0) return platform;
+  const os = process.platform;
+  const arch = process.arch;
+  const osName = os === "darwin" ? "macos" : os === "linux" ? "linux" : "";
+  if (!osName) {
+    throw new Error(`Unsupported platform for binary update: ${os}`);
+  }
+  if (arch !== "x64" && arch !== "arm64") {
+    throw new Error(`Unsupported architecture for binary update: ${arch}`);
+  }
+  return `${osName}-${arch}`;
+}
+
+export async function applyBinaryUpdate(options: BinaryUpdateOptions): Promise<UpdateApplyResult> {
+  const installDir = options.installMethod.installDir;
+  if (!installDir || installDir.length === 0) {
+    return { kind: "error", message: "Binary update failed: installDir is missing from install method info." };
+  }
+
+  try {
+    const platform = detectBinaryPlatform(options.platform);
+    const fetchLike = options.fetchFn ?? globalThis.fetch;
+    const backupStateFn = options.backupState ?? backupState;
+
+    const backup = await backupStateFn({
+      homeDir: options.homeDir,
+      workspaceRoot: options.workspaceRoot,
+      label: `pre-binary-update-${Date.now()}`
+    });
+
+    if (backup.backedUp.length === 0) {
+      return { kind: "error", message: "Binary update aborted: state backup failed (no paths were backed up)." };
+    }
+
+    let downloadUrl: string;
+
+    if (options.version) {
+      downloadUrl = `https://github.com/${GITHUB_BIN_REPO}/releases/download/${options.version}/estacoda-${platform}.tar.gz`;
+    } else {
+      const apiUrl = `https://api.github.com/repos/${GITHUB_BIN_REPO}/releases/latest`;
+      const response = await fetchLike(apiUrl, { headers: { "User-Agent": "estacoda-binary-updater" } });
+      const status = (response as Response).status;
+      if (status !== 200) {
+        return { kind: "error", message: `Binary update failed: GitHub API returned status ${status}.` };
+      }
+      const data = await (response as Response).json() as { tag_name?: string };
+      const tagName = data.tag_name;
+      if (!tagName) {
+        return { kind: "error", message: "Binary update failed: Could not determine latest release tag." };
+      }
+      downloadUrl = `https://github.com/${GITHUB_BIN_REPO}/releases/download/${tagName}/estacoda-${platform}.tar.gz`;
+    }
+
+    const response = await fetchLike(downloadUrl);
+    const status = (response as Response).status;
+    if (status !== 200) {
+      return { kind: "error", message: `Binary update failed: Download returned status ${status} for ${downloadUrl}` };
+    }
+
+    const tempDir = join(options.homeDir, ".estacoda", ".backups", `binary-update-${Date.now()}`);
+    await mkdir(tempDir, { recursive: true });
+
+    try {
+      const arrayBuffer = await (response as Response).arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      const tarPath = join(tempDir, "estacoda.tar.gz");
+      await writeFile(tarPath, buffer);
+
+      const extractDir = join(tempDir, "extracted");
+      await mkdir(extractDir, { recursive: true });
+
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const execFileAsync = promisify(execFile);
+      await execFileAsync("tar", ["xzf", tarPath, "-C", extractDir]);
+
+      const newBinaryPath = join(extractDir, "estacoda");
+      if (!existsSync(newBinaryPath)) {
+        return { kind: "error", message: "Binary update failed: Extracted tarball does not contain an estacoda binary." };
+      }
+
+      const finalBinaryPath = join(installDir, "estacoda");
+      const stagingPath = join(installDir, "estacoda-new");
+
+      await rename(newBinaryPath, stagingPath);
+      await rename(stagingPath, finalBinaryPath);
+      await access(finalBinaryPath);
+
+      const sidecarDirs = ["skills", "workers", "assets", "scripts", "acp_registry"];
+      for (const dir of sidecarDirs) {
+        const srcDir = join(extractDir, dir);
+        if (!existsSync(srcDir)) continue;
+        const destDir = join(installDir, dir);
+        await rm(destDir, { recursive: true, force: true });
+        const { cp } = await import("node:fs/promises");
+        await cp(srcDir, destDir, { recursive: true });
+      }
+
+      return {
+        kind: "success",
+        changed: true,
+        message: [
+          "Binary update applied.",
+          `Backup: ${backup.backupPath}`,
+          `Binary: ${finalBinaryPath}`,
+          "Run `estacoda verify` to confirm the update."
+        ].join("\n")
+      };
+    } finally {
+      if (existsSync(tempDir)) {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { kind: "error", message: `Binary update failed: ${message}` };
+  }
+}
+
 export async function applyManagedSourceUpdate(options: ManagedSourceUpdateOptions): Promise<UpdateApplyResult> {
   const info = options.installMethod;
   const runner = options.commandRunner ?? runCommand;
