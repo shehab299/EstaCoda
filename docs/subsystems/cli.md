@@ -83,7 +83,7 @@ Packed binary behavior is validated from a tarball installed into a temporary pr
 scripts/verify-package-bin.sh
 ```
 
-The npm package metadata exposes `bin.estacoda` for packed installs. The hosted curl installer is the default public path. `npm install -g estacoda` will work once the package is published.
+The npm package metadata exposes `bin.estacoda` for packed installs. Prebuilt binaries are distributed via GitHub Releases (see `scripts/install-binary.sh`). `npm install -g estacoda` will work once the package is published.
 
 ## Trace Commands
 

@@ -46,28 +46,42 @@ After local manual install, restart your shell or run:
 export PATH="$HOME/.estacoda/bin:$PATH"
 ```
 
-## Planned Launch Installer
+## Prebuilt Binary (Recommended)
 
-The intended launch install direction is the hosted curl installer:
-
-```bash
-curl -fsSL https://www.estacoda.com/install.sh | bash
-```
-
-Do not treat this as a verified public path until the hosted installer is live and release validation has passed.
-
-## Optional Future Npm Path
-
-The package has local installability metadata for tarball validation. `npm install -g estacoda` will work once the package is published.
-
-Do not claim these work until the package is actually published:
+Download a prebuilt binary from GitHub Releases. No Node.js, git, or pnpm is required — the Node.js runtime is embedded.
 
 ```bash
-npm install -g estacoda
-npx estacoda --help
+curl -fsSL https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install-binary.sh | bash
 ```
 
-If npm publication stays in the release strategy, update this document only after `npm publish --dry-run`, real publication, and installed binary validation pass.
+The installer detects your platform, downloads the correct binary, extracts it to `~/.estacoda/bin/`, and adds a wrapper symlink to `~/.local/bin/`. Restart your shell or run:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Options:
+
+```bash
+bash scripts/install-binary.sh --version v0.1.0    # Install a specific release
+bash scripts/install-binary.sh --dir /opt/estacoda # Custom install directory
+bash scripts/install-binary.sh --fhs               # Linux FHS: /usr/local/lib/estacoda + /usr/local/bin
+```
+
+Platforms supported: Linux x64, Linux arm64, macOS x64, macOS arm64.
+
+The install method stamp is written to `<install-dir>/.install-method.json`. The update engine detects this stamp and routes `estacoda update` to download a new binary tarball rather than using pnpm.
+
+### Building from source
+
+If you want to build the binary yourself:
+
+```bash
+pnpm run build:binary          # Build for host platform
+pnpm run build:binary:linux-x64  # Build for a specific target
+```
+
+Output: `dist-bin/release/<platform>/estacoda` and `dist-bin/estacoda-<platform>.tar.gz`.
 
 ## Post-Install
 
@@ -108,4 +122,4 @@ estacoda update --apply  # Apply update (requires ESTACODA_UPDATE_ARTIFACT)
 
 **pnpm not found**: Run `corepack enable`, then retry.
 
-**No prebuilt binary**: The current local installer builds `dist/` from the local checkout and installs a Node-backed wrapper. This is expected until release artifacts are published.
+**No prebuilt binary**: The prebuilt binary is the recommended install path. If the binary is not available for your platform, use the [local developer path](#local-developer-path) or [build from source](#building-from-source).
