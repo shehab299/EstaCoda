@@ -1,12 +1,12 @@
 import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type { ModelProfile, ProviderId } from "../contracts/provider.js";
 import {
   normalizeProviderIdForEstaCoda,
   type ModelInfo,
   type ModelModality
 } from "./models-dev-registry.js";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 
 export type ModelLifecycle = "available" | "deprecated" | "retired";
 
@@ -343,7 +343,7 @@ function isKnownChatModelName(modelText: string): boolean {
 }
 
 function defaultBundledOverridesPath(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "../../assets/model-catalog-overrides.json");
+  return join(resolveAssetRoot(), "assets/model-catalog-overrides.json");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

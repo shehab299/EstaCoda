@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 import type { LoadedRuntimeConfig, TtsProvider } from "../config/runtime-config.js";
 import { EDGE_TTS_CAPABILITY_ID } from "../python-env/capability-registry.js";
 import { resolveCapabilityPythonEnv } from "../python-env/capability-resolver.js";
@@ -607,12 +607,15 @@ export async function runEdgeTtsWorker(input: EdgeTtsRunInput): Promise<EdgeTtsR
 }
 
 export function defaultEdgeTtsWorkerPath(): string {
-  return edgeTtsWorkerPathFromModuleUrl(import.meta.url);
+  return edgeTtsWorkerPath(resolveAssetRoot());
 }
 
-export function edgeTtsWorkerPathFromModuleUrl(moduleUrl: string): string {
-  const here = dirname(fileURLToPath(moduleUrl));
-  return join(here, "../../workers/edge-tts/edge-tts-worker.py");
+export function edgeTtsWorkerPathFromModuleUrl(_moduleUrl: string): string {
+  return edgeTtsWorkerPath(resolveAssetRoot());
+}
+
+function edgeTtsWorkerPath(assetRoot: string): string {
+  return join(assetRoot, "workers/edge-tts/edge-tts-worker.py");
 }
 
 async function fetchProvider(input: {

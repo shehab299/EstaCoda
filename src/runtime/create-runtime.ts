@@ -15,6 +15,7 @@ import { createSupervisedLocalCdpBrowserBackend } from "../browser/supervised-lo
 import { BrowserSessionLifecycle, registerEmergencyCleanup } from "../browser/session-lifecycle.js";
 import type { ResolvedTokens, TokenBranding } from "../contracts/ui-tokens.js";
 import { resolveGlobalStateHome, resolveProfileStateHome } from "../config/profile-home.js";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 import { normalizeMemoryConfig } from "../config/memory-config.js";
 import { ContextReferenceExpander } from "../context/context-reference-expander.js";
 import { ProjectContextLoader, renderProjectContext } from "../context/project-context-loader.js";
@@ -536,7 +537,7 @@ export async function createRuntime(options: RuntimeOptions): Promise<Runtime> {
     modelId: options.model.id
   });
 
-  const bundledSkillsDir = new URL("../../skills/official", import.meta.url).pathname;
+  const bundledSkillsDir = join(resolveAssetRoot(), "skills/official");
   const skillLoadWarnings: string[] = [];
   const effectiveMcpServers = options.workspaceTrusted === true ? (options.mcpServers ?? {}) : {};
   const loadedMcpServers = await loadMcpServers({

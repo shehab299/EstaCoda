@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { execFile } from "node:child_process";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 
 export type VersionInfo = {
   current: string;
@@ -43,8 +43,7 @@ export async function getLocalVersion(options: {
   packagePath?: string;
   gitRunner?: GitCommandRunner;
 } = {}): Promise<string> {
-  const modulePath = fileURLToPath(import.meta.url);
-  const projectRoot = join(dirname(modulePath), "..", "..");
+  const projectRoot = resolveAssetRoot();
 
   try {
     const packagePath = options.packagePath ?? join(projectRoot, "package.json");

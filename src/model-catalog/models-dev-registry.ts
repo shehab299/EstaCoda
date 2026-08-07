@@ -1,9 +1,9 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { resolveHomeDir } from "../config/home-dir.js";
 import type { ModelProfile, ProviderId } from "../contracts/provider.js";
 import { estimateTokenUsageCost } from "../providers/provider-usage-estimator.js";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 
 export type ModelModality = "text" | "image" | "pdf" | "audio" | "video";
 export type ModelStatus = "" | "alpha" | "beta" | "deprecated";
@@ -616,7 +616,7 @@ function getCachePath(options: ModelsDevRegistryOptions): string {
 }
 
 function defaultBundledSnapshotPath(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "../../assets/models_dev_snapshot.json");
+  return join(resolveAssetRoot(), "assets/models_dev_snapshot.json");
 }
 
 function getNow(options: ModelsDevRegistryOptions): Date {

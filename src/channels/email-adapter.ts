@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 import type { ArtifactRecord } from "../contracts/artifact.js";
 import type {
   AdapterCapability,
@@ -14,7 +15,6 @@ import type { RuntimeEvent } from "../contracts/runtime-event.js";
 import type { EmailChannelConfig } from "../config/runtime-config.js";
 import { buildAdapterCapability } from "./adapter-capability.js";
 import { renderChannelProgressLabel, type ActivityLabelLocale } from "./activity-labels.js";
-import { fileURLToPath } from "node:url";
 
 export type EmailAdapterOptions = {
   imapHost: string;
@@ -555,8 +555,7 @@ export class EmailAdapter implements ChannelAdapter {
 }
 
 function defaultWorkerPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  return join(here, "../../workers/email/email_worker.py");
+  return join(resolveAssetRoot(), "workers/email/email_worker.py");
 }
 
 function sanitizePathPart(value: string): string {

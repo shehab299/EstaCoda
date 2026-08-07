@@ -4,7 +4,7 @@ import { access, chmod, mkdir, open, readFile, rm, writeFile } from "node:fs/pro
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 import {
   HttpWhatsAppBridgeClient,
   type WhatsAppBridgeChatInfo,
@@ -332,7 +332,7 @@ export class ManagedWhatsAppBridgeClient implements WhatsAppBridgeClient {
 }
 
 export function defaultWhatsAppBridgeDir(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "scripts", "whatsapp-bridge");
+  return join(resolveAssetRoot(), "scripts/whatsapp-bridge");
 }
 
 export async function getWhatsAppBridgeDependencyStatus(

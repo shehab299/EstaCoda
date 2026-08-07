@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { ToolResult } from "../contracts/tool.js";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 
 export type PythonWorkerRequest = {
   tool: string;
@@ -93,8 +93,7 @@ function parseWorkerResult(stdout: string, stderr: string, tool: string): ToolRe
 }
 
 function defaultRunnerPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  return join(here, "../../workers/python/runner.py");
+  return join(resolveAssetRoot(), "workers/python/runner.py");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

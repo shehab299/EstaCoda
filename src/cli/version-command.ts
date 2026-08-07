@@ -1,11 +1,10 @@
 import { readFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 
 export async function getPackageVersion(): Promise<string> {
   try {
-    const modulePath = fileURLToPath(import.meta.url);
-    const packagePath = join(dirname(modulePath), "..", "..", "package.json");
+    const packagePath = join(resolveAssetRoot(), "package.json");
     const raw = await readFile(packagePath, "utf8");
     const parsed = JSON.parse(raw) as { version?: string };
     return parsed.version ?? "unknown";

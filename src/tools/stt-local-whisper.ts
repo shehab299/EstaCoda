@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { resolveAssetRoot } from "../utils/asset-resolver.js";
 
 export type FasterWhisperPreset =
   | "tiny"
@@ -339,8 +339,7 @@ export class FasterWhisperWorkerClient {
 }
 
 export function defaultFasterWhisperWorkerPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  return join(here, "../../workers/faster-whisper/faster-whisper-worker.py");
+  return join(resolveAssetRoot(), "workers/faster-whisper/faster-whisper-worker.py");
 }
 
 function isCudaOrDeviceFailure(response: FasterWhisperWorkerResponse): boolean {
