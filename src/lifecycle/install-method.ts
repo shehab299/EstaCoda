@@ -10,6 +10,7 @@ export type InstallMethod =
   | "docker"
   | "npm-global"
   | "pnpm-global"
+  | "binary"
   | "unknown";
 
 export type InstallMethodInfo = {
@@ -40,7 +41,7 @@ export type DetectInstallMethodOptions = {
 };
 
 type SourceStamp = {
-  method: "managed-source" | "manual-source";
+  method: "managed-source" | "manual-source" | "binary";
   sourceUrl?: string;
   branch?: string;
   expectedBranch?: string;
@@ -60,14 +61,23 @@ const DEFAULT_DOCKER_COMMAND = "docker pull ghcr.io/sifr01-labs/estacoda:latest"
 const DEFAULT_NPM_COMMAND = "npm install -g estacoda@latest";
 const DEFAULT_PNPM_COMMAND = "pnpm add -g estacoda@latest";
 const DEFAULT_UNKNOWN_COMMAND = "reinstall using documented install path";
+const DEFAULT_BINARY_COMMAND = "estacoda update";
 
 export async function detectInstallMethod(options: DetectInstallMethodOptions = {}): Promise<InstallMethodInfo> {
   const hints = collectPathHints(options);
   const roots = collectCandidateRoots(options, hints);
   const stamp = await readFirstStamp(roots);
+  const includeBinaryRuntime = options.includeRuntimeHints !== false;
 
   if (stamp.kind === "valid") {
     return infoForStamp(stamp);
+  }
+
+  if (includeBinaryRuntime && isPackagedBinary()) {
+    return infoFor("binary", "path", {
+      installDir: dirname(process.execPath),
+      reason: "EstaCoda is running inside a prebuilt binary."
+    });
   }
 
   if (await isContainer(options.containerProbe)) {
@@ -131,7 +141,7 @@ function infoFor(
     method,
     source,
     recommendedUpdateCommand: recommendedUpdateCommand(method),
-    canSelfUpdate: method === "managed-source",
+    canSelfUpdate: method === "managed-source" || method === "binary",
     reason: details.reason ?? "Install method detected.",
     installDir: details.installDir,
     sourceUrl: details.sourceUrl,
@@ -155,6 +165,8 @@ function recommendedUpdateCommand(method: InstallMethod): string {
       return DEFAULT_NPM_COMMAND;
     case "pnpm-global":
       return DEFAULT_PNPM_COMMAND;
+    case "binary":
+      return DEFAULT_BINARY_COMMAND;
     case "unknown":
       return DEFAULT_UNKNOWN_COMMAND;
   }
@@ -279,7 +291,7 @@ function validateStamp(value: unknown): SourceStamp | undefined {
     return undefined;
   }
 
-  if (value.method !== "managed-source" && value.method !== "manual-source") {
+  if (value.method !== "managed-source" && value.method !== "manual-source" && value.method !== "binary") {
     return undefined;
   }
 
@@ -293,6 +305,10 @@ function validateStamp(value: unknown): SourceStamp | undefined {
   }
 
   if (value.method === "managed-source" && (sourceUrl === undefined || (branch === undefined && expectedBranch === undefined))) {
+    return undefined;
+  }
+
+  if (value.method === "binary" && installDir === undefined) {
     return undefined;
   }
 
@@ -315,6 +331,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isMissingFileError(error: unknown): boolean {
   return isRecord(error) && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
+function isPackagedBinary(): boolean {
+  return typeof process !== "undefined" && "pkg" in process && Boolean((process as { pkg?: unknown }).pkg);
 }
 
 async function isContainer(probe?: DetectInstallMethodOptions["containerProbe"]): Promise<boolean> {
