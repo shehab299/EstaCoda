@@ -73,11 +73,18 @@
     "eval:substrate:bun": "bun scripts/eval-substrate.ts",
     "eval:fixtures": "node --import tsx scripts/run-eval-fixtures.ts",
     "provider:hardening": "node --import tsx scripts/provider-hardening.ts",
-    "provider:hardening:bun": "bun scripts/provider-hardening.ts"
+    "provider:hardening:bun": "bun scripts/provider-hardening.ts",
+    "build:binary": "bash scripts/build-binary.sh",
+    "build:binary:linux-x64": "bash scripts/build-binary.sh node22-linux-x64",
+    "build:binary:linux-arm64": "bash scripts/build-binary.sh node22-linux-arm64",
+    "build:binary:macos-x64": "bash scripts/build-binary.sh node22-macos-x64",
+    "build:binary:macos-arm64": "bash scripts/build-binary.sh node22-macos-arm64",
+    "build:binary:all": "bash scripts/build-binary.sh --all"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.6.0",
+    "@yao-pkg/pkg": "^6.21.0",
     "tsx": "^4.20.6",
     "typescript": "^5.8.0",
     "vitest": "^4.1.5"
@@ -85,5 +92,19 @@
   "dependencies": {
     "better-sqlite3": "^12.10.0",
     "discord.js": "^14.26.4"
+  },
+  "pkg": {
+    "sea": true,
+    "compress": "GZip",
+    "outputPath": "dist-bin",
+    "targets": [
+      "node22-linux-x64",
+      "node22-linux-arm64",
+      "node22-macos-x64",
+      "node22-macos-arm64"
+    ],
+    "assets": [
+      "node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+    ]
   }
 }
