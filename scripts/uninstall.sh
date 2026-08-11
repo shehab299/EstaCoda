@@ -68,8 +68,8 @@ cleanup_path_entries() {
   for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile" "$HOME/.bash_profile"; do
     if [ -f "$rc_file" ]; then
       if grep -q "estacoda" "$rc_file" 2>/dev/null; then
-        if sed -n '/EstaCoda installer/p;/\.estacoda\/bin.*PATH/p;/\.local\/bin.*estacoda/p' "$rc_file" 2>/dev/null | grep -q .; then
-          sed -i '/EstaCoda installer/d;/\.estacoda\/bin.*PATH/d;/\.local\/bin.*estacoda.*PATH/d' "$rc_file"
+        if sed -n '/Added by EstaCoda installer/p' "$rc_file" 2>/dev/null | grep -q .; then
+          sed -i '/Added by EstaCoda installer/d;/estacoda.*PATH/d' "$rc_file"
           echo "Removed PATH entries from: $rc_file"
           removed=$((removed + 1))
         fi

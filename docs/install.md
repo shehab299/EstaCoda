@@ -29,6 +29,7 @@ Platforms supported: Linux x64, Linux arm64, macOS x64, macOS arm64.
 If you want to build the binary yourself:
 
 ```bash
+pnpm install
 pnpm run build:binary          # Build for host platform
 pnpm run build:binary:linux-x64  # Build for a specific target
 ```
