@@ -1,77 +1,41 @@
 # Install EstaCoda
 
-EstaCoda is not published as a public npm package yet. Keep install docs clear about which paths work now and which paths are planned.
+## Prebuilt Binary (Recommended)
 
-## Local Developer Path
-
-Use this inside a source checkout:
+Download a prebuilt binary from GitHub Releases. No Node.js, git, or pnpm is required — the Node.js runtime is embedded.
 
 ```bash
-cd /path/to/EstaCoda
-corepack enable
-pnpm install
-pnpm run build
-node dist/index.js --help
-node dist/index.js --version
+curl -fsSL https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install.sh | bash
 ```
 
-For packaging regression checks:
+The installer detects your platform, downloads the correct binary, extracts it to `~/.estacoda/bin/`, and adds a wrapper symlink to `~/.local/bin/`. Restart your shell or run:
 
 ```bash
-pnpm run verify:local-bin
-scripts/verify-package-bin.sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`scripts/verify-package-bin.sh` builds the project, captures the tarball filename from `npm pack --json`, installs that tarball into a temporary prefix, runs the installed `estacoda` binary, and cleans up after itself.
-
-## Local Manual Installer
-
-Use this from a local checkout when you want an `estacoda` command on your PATH:
+Options:
 
 ```bash
-bash scripts/install.sh
+bash scripts/install.sh --version v0.1.0    # Install a specific release
+bash scripts/install.sh --dir /opt/estacoda # Custom install directory
+bash scripts/install.sh --fhs               # Linux FHS: /usr/local/lib/estacoda + /usr/local/bin
 ```
 
-The script checks Node.js >= 22.18.0 and Corepack, builds `dist/`, writes a Node-backed wrapper to `~/.estacoda/bin/estacoda`, and updates PATH where possible.
+Platforms supported: Linux x64, Linux arm64, macOS x64, macOS arm64.
 
-You can also run the wrapper directly from the checkout:
+### Building from source
+
+If you want to build the binary yourself:
 
 ```bash
-bash scripts/estacoda-wrapper.sh --version
+pnpm run build:binary          # Build for host platform
+pnpm run build:binary:linux-x64  # Build for a specific target
 ```
 
-After local manual install, restart your shell or run:
-
-```bash
-export PATH="$HOME/.estacoda/bin:$PATH"
-```
-
-## Planned Launch Installer
-
-The intended launch install direction is the hosted curl installer:
-
-```bash
-curl -fsSL https://www.estacoda.com/install.sh | bash
-```
-
-Do not treat this as a verified public path until the hosted installer is live and release validation has passed.
-
-## Optional Future Npm Path
-
-The package has local installability metadata for tarball validation. `npm install -g estacoda` will work once the package is published.
-
-Do not claim these work until the package is actually published:
-
-```bash
-npm install -g estacoda
-npx estacoda --help
-```
-
-If npm publication stays in the release strategy, update this document only after `npm publish --dry-run`, real publication, and installed binary validation pass.
+Output: `dist-bin/release/<platform>/estacoda` and `dist-bin/estacoda-<platform>.tar.gz`.
 
 ## Post-Install
-
-For any path that gives you an `estacoda` command:
 
 ```bash
 estacoda                    # Start onboarding on first run; launch a session when ready
@@ -102,10 +66,18 @@ estacoda update          # Dry-run: see what would update
 estacoda update --apply  # Apply update (requires ESTACODA_UPDATE_ARTIFACT)
 ```
 
+## Uninstall
+
+```bash
+bash scripts/uninstall.sh
+```
+
+Removes the binary install directory, wrapper symlinks, and PATH entries. User data (`~/.estacoda`) is preserved by default.
+
 ## Troubleshooting
 
-**Node too old**: Install Node.js >= 22.18.0.
+**Unsupported platform**: Ensure you're on Linux (x64/arm64) or macOS (x64/arm64). Windows is not yet supported.
 
-**pnpm not found**: Run `corepack enable`, then retry.
+**Permission denied**: Try with `sudo` or use `--dir` to install to a user-writable location.
 
-**No prebuilt binary**: The current local installer builds `dist/` from the local checkout and installs a Node-backed wrapper. This is expected until release artifacts are published.
+**Binary not found after install**: Add `~/.local/bin` to your PATH: `export PATH="$HOME/.local/bin:$PATH"`

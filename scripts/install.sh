@@ -1,28 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+#
+# EstaCoda installer.
+#
+# Downloads a platform-appropriate prebuilt binary from GitHub Releases and
+# extracts it to ~/.estacoda/bin/ (or /usr/local/lib/estacoda for FHS).
+# No Node.js, git, or pnpm is required — the Node.js runtime is embedded.
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install.sh | bash
+#   bash scripts/install.sh [--version <tag>] [--dir <path>] [--fhs]
+#
+
 INSTALLER_VERSION="v0.1.0-prerelease"
-DEFAULT_SOURCE_URL="https://github.com/sifr01-labs/EstaCoda.git"
-SOURCE_URL="${ESTACODA_SOURCE_URL:-$DEFAULT_SOURCE_URL}"
-BRANCH="${ESTACODA_BRANCH:-main}"
+GITHUB_REPO="sifr01-labs/EstaCoda"
+VERSION=""
 INSTALL_DIR=""
 FORCE_FHS=0
 
 usage() {
   cat <<'USAGE'
-EstaCoda source installer
+EstaCoda installer
 
 Usage:
-  curl -fsSLO https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install.sh
-  less install.sh
-  bash install.sh
-  bash scripts/install.sh [--branch <branch>] [--dir <path>] [--fhs]
+  curl -fsSL https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install.sh | bash
+  bash scripts/install.sh [--version <tag>] [--dir <path>] [--fhs]
 
 Options:
-  --branch <branch>  Clone or update the managed install from this branch (default: main)
-  --dir <path>       Install into a custom managed source directory
-  --fhs              Use Linux FHS paths: /usr/local/lib/estacoda and /usr/local/bin
-  -h, --help         Show this help without changing files
+  --version <tag>  Download a specific release tag (default: latest)
+  --dir <path>     Install into a custom directory
+  --fhs            Use Linux FHS paths: /usr/local/lib/estacoda and /usr/local/bin
+  -h, --help       Show this help without changing files
 USAGE
 }
 
@@ -37,9 +46,9 @@ command_exists() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --branch)
-      [ "$#" -ge 2 ] || die "--branch requires a value"
-      BRANCH="$2"
+    --version)
+      [ "$#" -ge 2 ] || die "--version requires a value"
+      VERSION="$2"
       shift 2
       ;;
     --dir)
@@ -61,101 +70,34 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -z "$BRANCH" ]; then
-  die "Branch must not be empty"
-fi
-
-resolve_path() {
-  local path="$1"
-  mkdir -p "$(dirname "$path")"
-  (
-    cd "$(dirname "$path")"
-    printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")"
-  )
-}
-
-shell_quote() {
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
-
-is_termux() {
-  [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]
-}
-
+# ---------------------------------------------------------------------------
+# Detect platform
+# ---------------------------------------------------------------------------
 detect_platform() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
 
   case "$arch" in
-    x86_64|amd64|arm64|aarch64) ;;
+    x86_64|amd64) arch="x64" ;;
+    arm64|aarch64) arch="arm64" ;;
     *) die "Unsupported CPU architecture: $arch" ;;
   esac
 
   case "$os" in
-    Darwin)
-      if command_exists sw_vers; then
-        local mac_version mac_major
-        mac_version="$(sw_vers -productVersion)"
-        mac_major="${mac_version%%.*}"
-        if [ "${mac_major:-0}" -lt 11 ]; then
-          die "macOS 11 Big Sur or newer is required. Found: $mac_version"
-        fi
-      fi
-      ;;
-    Linux)
-      if is_termux; then
-        return 0
-      fi
-      if command_exists getconf && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
-        return 0
-      fi
-      if command_exists ldd && ldd --version 2>&1 | head -n 1 | grep -Eiq 'glibc|gnu libc'; then
-        return 0
-      fi
-      die "A modern Linux distribution with glibc is required for the v0.1.0 source installer."
-      ;;
-    *)
-      die "Unsupported operating system: $os"
-      ;;
+    Darwin) PLATFORM="macos-${arch}" ;;
+    Linux)  PLATFORM="linux-${arch}" ;;
+    *) die "Unsupported operating system: $os" ;;
   esac
+
+  echo "Platform: $PLATFORM"
 }
 
-validate_node() {
-  if ! command_exists node; then
-    die "Node.js >= 22.18.0 is required but was not found on PATH."
-  fi
-  local node_version
-  node_version="$(node --version 2>/dev/null || true)"
-  if ! node -e 'const [major, minor, patch] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && (minor > 18 || (minor === 18 && patch >= 0))) ? 0 : 1);' >/dev/null 2>&1; then
-    die "Node.js >= 22.18.0 is required. Found: ${node_version:-unknown}"
-  fi
-  echo "Node: $node_version"
-}
-
-ensure_pnpm() {
-  if command_exists corepack; then
-    if ! corepack enable >/dev/null 2>&1; then
-      echo "Warning: corepack enable failed; checking for pnpm on PATH." >&2
-    fi
-  else
-    echo "Warning: Corepack was not found; checking for pnpm on PATH." >&2
-  fi
-
-  if ! command_exists pnpm; then
-    die "pnpm is required. Install a Node.js distribution with Corepack or install pnpm manually."
-  fi
-  local pnpm_version
-  if ! pnpm_version="$(pnpm --version 2>/dev/null)"; then
-    die "pnpm is present but could not run. Check Corepack/pnpm installation and network access for package-manager activation."
-  fi
-  echo "pnpm: $pnpm_version"
-}
-
-require_git() {
-  if ! command_exists git; then
-    die "git is required for source installation."
-  fi
+# ---------------------------------------------------------------------------
+# Choose install paths
+# ---------------------------------------------------------------------------
+is_termux() {
+  [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"/com.termux/"* ]]
 }
 
 choose_paths() {
@@ -163,13 +105,14 @@ choose_paths() {
   os="$(uname -s)"
 
   if [ -n "$INSTALL_DIR" ]; then
-    INSTALL_DIR="$(resolve_path "$INSTALL_DIR")"
+    INSTALL_DIR="$(cd "$(dirname "$INSTALL_DIR")" && pwd)/$(basename "$INSTALL_DIR")"
+    mkdir -p "$(dirname "$INSTALL_DIR")"
   elif [ "$FORCE_FHS" -eq 1 ] || { [ "${EUID:-$(id -u)}" -eq 0 ] && [ "$os" = "Linux" ] && ! is_termux; }; then
     INSTALL_DIR="/usr/local/lib/estacoda"
     FORCE_FHS=1
   else
     [ -n "${HOME:-}" ] || die "HOME is not set. Use --dir to choose an install directory."
-    INSTALL_DIR="$HOME/.estacoda/estacoda"
+    INSTALL_DIR="$HOME/.estacoda/bin"
   fi
 
   if [ "$FORCE_FHS" -eq 1 ]; then
@@ -183,135 +126,144 @@ choose_paths() {
   fi
 }
 
-stamp_matches_managed_install() {
-  local stamp_path="$1"
-  [ -f "$stamp_path" ] || return 1
-  node --input-type=module - "$stamp_path" "$SOURCE_URL" "$BRANCH" <<'NODE'
-import { readFileSync } from "node:fs";
-
-const [stampPath, sourceUrl, branch] = process.argv.slice(2);
-const stamp = JSON.parse(readFileSync(stampPath, "utf8"));
-if (
-  stamp.method === "managed-source" &&
-  stamp.sourceUrl === sourceUrl &&
-  stamp.branch === branch
-) {
-  process.exit(0);
-}
-process.exit(1);
-NODE
-}
-
-clone_or_update_managed_source() {
-  local stamp_path="$INSTALL_DIR/.install-method.json"
-
-  if [ -d "$INSTALL_DIR/.git" ]; then
-    if ! stamp_matches_managed_install "$stamp_path"; then
-      die "Refusing to update $INSTALL_DIR because it is not stamped as this managed-source install."
+# ---------------------------------------------------------------------------
+# Determine download URL
+# ---------------------------------------------------------------------------
+resolve_url() {
+  if [ -n "$VERSION" ]; then
+    TARBALL_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/estacoda-${PLATFORM}.tar.gz"
+  else
+    # Use GitHub API to find latest release tag
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    if command_exists curl; then
+      VERSION="$(curl -fsSL -H "User-Agent: estacoda-installer" "$api_url" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    elif command_exists wget; then
+      VERSION="$(wget -qO- --header="User-Agent: estacoda-installer" "$api_url" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    else
+      die "Neither curl nor wget was found. Install one to download EstaCoda."
     fi
-    echo "Updating existing managed source install: $INSTALL_DIR"
-    (
-      cd "$INSTALL_DIR"
-      git fetch origin "$BRANCH"
-      git checkout "$BRANCH"
-      git pull --ff-only origin "$BRANCH"
-    )
-    return 0
-  fi
 
-  if [ -e "$INSTALL_DIR" ] && [ "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')" != "0" ]; then
-    die "Refusing to overwrite non-empty unmanaged directory: $INSTALL_DIR"
-  fi
-
-  mkdir -p "$(dirname "$INSTALL_DIR")"
-  echo "Cloning EstaCoda $BRANCH into $INSTALL_DIR"
-  git clone --branch "$BRANCH" "$SOURCE_URL" "$INSTALL_DIR"
-}
-
-build_source() {
-  echo "Installing dependencies and building dist/"
-  (
-    cd "$INSTALL_DIR"
-    CI=true pnpm install --frozen-lockfile
-    pnpm run build
-  )
-}
-
-write_wrapper() {
-  local wrapper="$BIN_DIR/estacoda"
-  local quoted_root
-  quoted_root="$(shell_quote "$INSTALL_DIR")"
-  mkdir -p "$BIN_DIR"
-
-  if [ -e "$wrapper" ] || [ -L "$wrapper" ]; then
-    if ! grep -Eq "Generated by scripts/(install|setup-estacoda)\\.sh|EstaCoda Node/dist wrapper|EstaCoda dist entrypoint" "$wrapper" 2>/dev/null; then
-      die "Refusing to overwrite existing non-EstaCoda command: $wrapper"
+    if [ -z "$VERSION" ]; then
+      die "Could not determine the latest release tag from GitHub."
     fi
+
+    TARBALL_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/estacoda-${PLATFORM}.tar.gz"
   fi
 
-  if [ -d "$wrapper" ]; then
-    die "Refusing to overwrite existing non-EstaCoda command: $wrapper"
-  fi
-
-  cat > "$wrapper" <<WRAPPER
-#!/usr/bin/env bash
-set -euo pipefail
-# EstaCoda source wrapper. Generated by scripts/install.sh.
-REPO_ROOT=$quoted_root
-ENTRYPOINT="\$REPO_ROOT/dist/index.js"
-if [ ! -f "\$ENTRYPOINT" ]; then
-  echo "EstaCoda dist entrypoint not found: \$ENTRYPOINT" >&2
-  echo "Run: cd \"\$REPO_ROOT\" && corepack enable && pnpm install --frozen-lockfile && pnpm run build" >&2
-  exit 1
-fi
-exec node "\$ENTRYPOINT" "\$@"
-WRAPPER
-  chmod +x "$wrapper"
+  echo "Version: $VERSION"
+  echo "Download: $TARBALL_URL"
 }
 
+# ---------------------------------------------------------------------------
+# Download and extract
+# ---------------------------------------------------------------------------
+download_and_extract() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+
+  local tarball="$tmpdir/estacoda.tar.gz"
+
+  echo "Downloading..."
+  if command_exists curl; then
+    curl -fsSL -o "$tarball" "$TARBALL_URL" || die "Download failed: $TARBALL_URL"
+  elif command_exists wget; then
+    wget -qO "$tarball" "$TARBALL_URL" || die "Download failed: $TARBALL_URL"
+  else
+    die "Neither curl nor wget was found."
+  fi
+
+  echo "Extracting to $INSTALL_DIR..."
+  mkdir -p "$INSTALL_DIR"
+  tar -xzf "$tarball" -C "$INSTALL_DIR"
+  chmod +x "$INSTALL_DIR/estacoda"
+
+  # Verify the binary runs
+  if [ -x "$INSTALL_DIR/estacoda" ]; then
+    "$INSTALL_DIR/estacoda" --version >/dev/null 2>&1 || echo "Warning: binary did not respond to --version. It may need additional dependencies."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Write install-method stamp
+# ---------------------------------------------------------------------------
 write_stamp() {
   local stamp_path="$INSTALL_DIR/.install-method.json"
-  node --input-type=module - "$stamp_path" "managed-source" "$SOURCE_URL" "$BRANCH" "$INSTALL_DIR" "$INSTALLER_VERSION" <<'NODE'
-import { writeFileSync } from "node:fs";
-
-const [stampPath, method, sourceUrl, branch, installDir, installerVersion] = process.argv.slice(2);
-const stamp = {
-  method,
-  sourceUrl,
-  branch,
-  installDir,
-  installedAt: new Date().toISOString(),
-  installerVersion
-};
-writeFileSync(stampPath, `${JSON.stringify(stamp, null, 2)}\n`);
-NODE
+  cat > "$stamp_path" <<STAMP
+{
+  "method": "binary",
+  "installDir": "$INSTALL_DIR",
+  "installedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "installerVersion": "$INSTALLER_VERSION"
+}
+STAMP
 }
 
-echo "EstaCoda source installer"
+# ---------------------------------------------------------------------------
+# Create wrapper symlink
+# ---------------------------------------------------------------------------
+write_wrapper() {
+  local wrapper="$BIN_DIR/estacoda"
+  mkdir -p "$BIN_DIR"
+
+  # Remove existing wrapper if it's ours or a symlink
+  if [ -L "$wrapper" ] || [ -e "$wrapper" ]; then
+    if [ -L "$wrapper" ]; then
+      rm -f "$wrapper"
+    elif grep -Eq "Generated by scripts/(install|setup-estacoda|install-binary)\\.sh|EstaCoda" "$wrapper" 2>/dev/null; then
+      rm -f "$wrapper"
+    else
+      echo "Warning: refusing to overwrite existing non-EstaCoda command: $wrapper" >&2
+      echo "Binary installed at: $INSTALL_DIR/estacoda" >&2
+      return 0
+    fi
+  fi
+
+  ln -s "$INSTALL_DIR/estacoda" "$wrapper"
+  echo "Wrapper: $wrapper -> $INSTALL_DIR/estacoda"
+}
+
+# ---------------------------------------------------------------------------
+# Add to PATH if needed
+# ---------------------------------------------------------------------------
+ensure_path() {
+  if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    local rc_file
+    for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile" "$HOME/.bash_profile"; do
+      [ -f "$rc_file" ] || continue
+      if ! grep -qF "$BIN_DIR" "$rc_file" 2>/dev/null; then
+        echo "" >> "$rc_file"
+        echo "# Added by EstaCoda installer" >> "$rc_file"
+        echo "export PATH=\"$BIN_DIR:\$PATH\"" >> "$rc_file"
+        echo "Added PATH entry to $rc_file"
+      fi
+    done
+
+    echo ""
+    echo "Add to PATH for this session: export PATH=\"$BIN_DIR:\$PATH\""
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+echo "EstaCoda installer"
 detect_platform
-validate_node
-require_git
-ensure_pnpm
 choose_paths
-
-echo "Source: $SOURCE_URL"
-echo "Branch: $BRANCH"
-echo "Install dir: $INSTALL_DIR"
-echo "Bin dir: $BIN_DIR"
-
-clone_or_update_managed_source
-build_source
+resolve_url
+download_and_extract
 write_stamp
 write_wrapper
+ensure_path
 
 echo ""
-echo "EstaCoda installed."
+echo "EstaCoda $VERSION installed."
 echo "Command: $BIN_DIR/estacoda"
 echo ""
 echo "Next steps:"
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
+  echo "  1. Run: estacoda"
+else
   echo "  1. Add to PATH: export PATH=\"$BIN_DIR:\$PATH\""
   echo "  2. Run: estacoda"
-else
-  echo "  1. Run: estacoda"
 fi
