@@ -7,22 +7,29 @@ SOURCE_URL="${ESTACODA_SOURCE_URL:-$DEFAULT_SOURCE_URL}"
 BRANCH="${ESTACODA_BRANCH:-main}"
 INSTALL_DIR=""
 FORCE_FHS=0
+INSTALL_METHOD="source"
 
 usage() {
   cat <<'USAGE'
-EstaCoda source installer
+EstaCoda installer
 
 Usage:
   curl -fsSLO https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install.sh
   less install.sh
-  bash install.sh
-  bash scripts/install.sh [--branch <branch>] [--dir <path>] [--fhs]
+  bash install.sh                     # Install prebuilt binary (recommended)
+  bash install.sh --source            # Install from source (requires Node.js + pnpm)
+  bash install.sh --binary            # Install prebuilt binary (alias)
+  bash install.sh --branch main       # Source install from a specific branch
+  bash install.sh --dir /opt/estacoda # Custom install directory
+  bash install.sh --fhs               # Linux FHS paths: /usr/local/lib/estacoda + /usr/local/bin
 
 Options:
-  --branch <branch>  Clone or update the managed install from this branch (default: main)
-  --dir <path>       Install into a custom managed source directory
-  --fhs              Use Linux FHS paths: /usr/local/lib/estacoda and /usr/local/bin
-  -h, --help         Show this help without changing files
+  --source            Install from source (requires Node.js >= 22.18.0, git, pnpm)
+  --binary            Install prebuilt binary (no dependencies required)
+  --branch <branch>   Clone or update the managed install from this branch (default: main)
+  --dir <path>        Install into a custom directory
+  --fhs               Use Linux FHS paths: /usr/local/lib/estacoda and /usr/local/bin
+  -h, --help          Show this help without changing files
 USAGE
 }
 
@@ -37,6 +44,14 @@ command_exists() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --source)
+      INSTALL_METHOD="source"
+      shift
+      ;;
+    --binary)
+      INSTALL_METHOD="binary"
+      shift
+      ;;
     --branch)
       [ "$#" -ge 2 ] || die "--branch requires a value"
       BRANCH="$2"
@@ -60,6 +75,27 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# Redirect to binary installer if --binary (default)
+# ---------------------------------------------------------------------------
+if [ "$INSTALL_METHOD" = "binary" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  BINARY_INSTALLER="$SCRIPT_DIR/install-binary.sh"
+  if [ -f "$BINARY_INSTALLER" ]; then
+    exec bash "$BINARY_INSTALLER" ${INSTALL_DIR:+--dir "$INSTALL_DIR"} ${FORCE_FHS:+--fhs}
+  fi
+  # Fallback: download and run the binary installer
+  echo "Downloading binary installer..."
+  if command_exists curl; then
+    curl -fsSL https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install-binary.sh | bash
+  elif command_exists wget; then
+    wget -qO- https://raw.githubusercontent.com/sifr01-labs/EstaCoda/main/scripts/install-binary.sh | bash
+  else
+    die "Neither curl nor wget was found. Install one or use --source for source installation."
+  fi
+  exit $?
+fi
 
 if [ -z "$BRANCH" ]; then
   die "Branch must not be empty"
@@ -305,7 +341,11 @@ write_stamp
 write_wrapper
 
 echo ""
-echo "EstaCoda installed."
+if [ "$INSTALL_METHOD" = "source" ]; then
+  echo "EstaCoda source install complete."
+else
+  echo "EstaCoda installed."
+fi
 echo "Command: $BIN_DIR/estacoda"
 echo ""
 echo "Next steps:"
