@@ -87,6 +87,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist-bin
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
